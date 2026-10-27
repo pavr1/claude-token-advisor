@@ -1,0 +1,272 @@
+{
+  "name": "claude-budget-advisor",
+  "displayName": "Claude Budget Advisor & Token Improver",
+  "description": "Tracks Claude Code project token pacing and monthly budget health, and runs a local optimizing proxy that prunes outgoing Anthropic Messages API traffic.",
+  "version": "0.2.51",
+  "publisher": "pablo-villalobos",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeBudgetAdvisor.showMenu",
+        "title": "Claude: Show Dashboard"
+      },
+      {
+        "command": "claudeBudgetAdvisor.showSummary",
+        "title": "Claude: Show Dashboard (Budget tab)"
+      },
+      {
+        "command": "claudeBudgetAdvisor.refresh",
+        "title": "Claude Budget Advisor: Refresh"
+      },
+      {
+        "command": "claudeTokenImprover.showAnalytics",
+        "title": "Claude: Show Dashboard (Token Improver tab)"
+      },
+      {
+        "command": "claudeTokenImprover.startProxy",
+        "title": "Claude Token Improver: Start Proxy"
+      },
+      {
+        "command": "claudeTokenImprover.stopProxy",
+        "title": "Claude Token Improver: Stop Proxy"
+      },
+      {
+        "command": "claudeTokenImprover.copyBaseUrl",
+        "title": "Claude Token Improver: Copy Proxy Base URL"
+      },
+      {
+        "command": "claudeTokenImprover.openLedger",
+        "title": "Claude Token Improver: Open Telemetry Ledger"
+      }
+    ],
+    "configuration": [
+      {
+        "title": "Claude Budget Advisor",
+        "properties": {
+          "claudeBudgetAdvisor.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Show budget pacing (status bar percentage/$ and dashboard). Turn off to hide it entirely — e.g. while no real spend-limit source is available yet — without affecting the Token Improver proxy, which keeps running independently."
+          },
+          "claudeBudgetAdvisor.scope": {
+            "type": "string",
+            "enum": [
+              "all",
+              "project"
+            ],
+            "default": "all",
+            "description": "Report usage across all Claude projects, or only the project matching the current workspace."
+          },
+          "claudeBudgetAdvisor.budget": {
+            "type": "number",
+            "default": 0,
+            "description": "Monthly token budget. Leave at 0 to infer it automatically from your own usage history."
+          },
+          "claudeBudgetAdvisor.budgetUsd": {
+            "type": "number",
+            "default": 0,
+            "description": "Monthly budget in USD, taken literally (no token-mix conversion). Takes priority over the token budget above when set — the direct way to enter a real cap you only know in dollars (e.g. an Enterprise/API spend limit from Anthropic's own usage page). Leave at 0 to infer automatically."
+          },
+          "claudeBudgetAdvisor.projectName": {
+            "type": "string",
+            "default": "",
+            "description": "Optional. Only used when scope is 'project'. Leave empty to detect it from the workspace folder."
+          },
+          "claudeBudgetAdvisor.baseDir": {
+            "type": "string",
+            "default": "",
+            "description": "Optional override for the Claude data directory. Leave empty to auto-resolve from CLAUDE_CONFIG_DIR, your home folder, or the claude CLI on PATH."
+          },
+          "claudeBudgetAdvisor.spendSource": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "mock",
+              "file",
+              "api",
+              "none"
+            ],
+            "default": "auto",
+            "description": "Where spend figures come from. 'auto' calls the Admin API when ANTHROPIC_ADMIN_KEY is set, otherwise uses the local estimate. 'mock' previews the layout with sample data."
+          },
+          "claudeBudgetAdvisor.spendLimitFile": {
+            "type": "string",
+            "default": "",
+            "description": "Optional path to a JSON payload from the spend limits endpoint. When set, its totals replace the local estimate."
+          },
+          "claudeBudgetAdvisor.refreshIntervalMinutes": {
+            "type": "number",
+            "default": 15,
+            "minimum": 0,
+            "description": "How often to refresh the budget and dashboard automatically, in minutes. Also refreshes right after a completed turn (throttled to once a minute). Set to 0 to disable automatic refresh — only activation and the Refresh command will update it."
+          }
+        }
+      },
+      {
+        "title": "Claude Token Improver",
+        "properties": {
+          "claudeTokenImprover.autoStart": {
+            "type": "boolean",
+            "default": true,
+            "description": "Start the optimizing proxy automatically when the extension activates."
+          },
+          "claudeTokenImprover.autoConfigureTerminals": {
+            "type": "boolean",
+            "default": true,
+            "description": "Automatically set ANTHROPIC_BASE_URL in new VS Code integrated terminals so Claude clients route through the proxy. Cached by VS Code so terminals restored at startup get it too; removed when the proxy is stopped on purpose or fails to start. Terminals that were already open the first time are not affected until they are reopened. Does not affect terminals outside VS Code or the Claude Code panel."
+          },
+          "claudeTokenImprover.port": {
+            "type": "number",
+            "default": 4000,
+            "description": "Loopback port the proxy listens on. The proxy binds to 127.0.0.1 only."
+          },
+          "claudeTokenImprover.upstreamBaseUrl": {
+            "type": "string",
+            "default": "https://api.anthropic.com",
+            "description": "Origin the proxy forwards optimized traffic to. Change this only to target a gateway or a mock server."
+          },
+          "claudeTokenImprover.stage1Normalization": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 1. Trim text and convert CRLF to LF so cache prefixes match byte-for-byte."
+          },
+          "claudeTokenImprover.stage2Compaction": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 2. Strip greeting fluff, and summarize old history into a manifest once the sliding threshold is crossed. Summarization rewrites conversation history and costs one extra Haiku call per compaction."
+          },
+          "claudeTokenImprover.stage3ModelRouting": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 3. Route short, mechanical turns to claude-haiku-4-5 instead of the requested model."
+          },
+          "claudeTokenImprover.stage4CacheAnchor": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 4. Strip cache_control from the message history and place a single ephemeral anchor on the last assistant turn. Breakpoints on system and tools are left untouched."
+          },
+          "claudeTokenImprover.forceFiveMinuteCache": {
+            "type": "boolean",
+            "default": true,
+            "description": "Remove the 1 hour ttl from every cache breakpoint so all cache writes use the 5 minute cache. A 1 hour write bills 2x base input instead of 1.25x; reads cost the same. Turn off to leave the client's own ttl untouched."
+          },
+          "claudeTokenImprover.startupSonnetDefault": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 0. Claude Code defaults new sessions to Opus; if the first request the proxy sees after it starts is on Opus, route it to claude-sonnet-5 instead. One-time only — every later request, and any model you pick yourself with /model (including switching back to Opus), passes through untouched."
+          },
+          "claudeTokenImprover.slidingThresholdTokens": {
+            "type": "number",
+            "default": 15000,
+            "description": "Cumulative history size, in tokens, that triggers a Cache Reset Optimization."
+          },
+          "claudeTokenImprover.compactionFraction": {
+            "type": "number",
+            "default": 0.75,
+            "minimum": 0.1,
+            "maximum": 0.95,
+            "description": "Fraction of the oldest history replaced by the compaction manifest."
+          },
+          "claudeTokenImprover.expectedRequestsAfterCompaction": {
+            "type": "number",
+            "default": 10,
+            "minimum": 1,
+            "description": "Requests assumed to follow a compaction when deciding whether it pays for itself. Compaction is skipped when the expected saving does not exceed the Haiku call plus cache rewrite."
+          },
+          "claudeTokenImprover.exactTokenCounting": {
+            "type": "boolean",
+            "default": false,
+            "description": "Measure the pre-optimization baseline with the count_tokens endpoint instead of the local estimate. More accurate, but adds a round trip to every turn."
+          },
+          "claudeTokenImprover.pricingUrl": {
+            "type": "string",
+            "default": "",
+            "description": "Optional override for the pricing feed, as a self-hosted mirror of the same LiteLLM JSON shape (https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json). Leave empty to fetch that public feed directly, cached for 7 days."
+          }
+        }
+      }
+    ],
+    "icons": {
+      "claude-budget-gauge": {
+        "description": "Budget gauge shown in the status bar",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E001"
+        }
+      },
+      "claude-budget-gauge-1": {
+        "description": "Budget gauge animation frame 1 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E002"
+        }
+      },
+      "claude-budget-gauge-2": {
+        "description": "Budget gauge animation frame 2 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E003"
+        }
+      },
+      "claude-budget-gauge-3": {
+        "description": "Budget gauge animation frame 3 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E004"
+        }
+      },
+      "claude-budget-gauge-4": {
+        "description": "Budget gauge animation frame 4 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E005"
+        }
+      },
+      "claude-budget-gauge-5": {
+        "description": "Budget gauge animation frame 5 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E006"
+        }
+      },
+      "claude-budget-gauge-6": {
+        "description": "Budget gauge animation frame 6 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E007"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run test:all",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test \"out/tests/*.test.js\"",
+    "test:py": "python -m pytest -q tests",
+    "test:coverage": "npm run compile && node --test --experimental-test-coverage --test-coverage-include=\"out/**/*.js\" --test-coverage-exclude=\"out/tests/**\" --test-coverage-lines=96 --test-coverage-branches=90 --test-coverage-functions=88 \"out/tests/*.test.js\"",
+    "test:all": "npm run test:coverage && npm run test:py",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/node": "^22.7.5",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.6.0",
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "undici": "7.29.1"
+  }
+}

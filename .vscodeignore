@@ -1,0 +1,16 @@
+# node_modules is intentionally NOT excluded: vsce prunes devDependencies and
+# ships only production deps (express), which the proxy requires at runtime.
+.vscode
+*.vsix
+.pytest_cache
+__pycache__
+**/__pycache__
+tests
+out/tests
+src/tests
+
+# Working notes and the demo deck are not part of the extension.
+.demo-deck
+.claude
+latest
+findings.md

@@ -1,0 +1,9 @@
+node_modules
+out
+*.vsix
+__pycache__
+.pytest_cache
+.claude
+.demo-deck
+latest
+findings.md
