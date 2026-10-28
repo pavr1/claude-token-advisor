@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 2. **Time: store UTC, show local.** Never show UTC to the user (ledger timestamps included: convert before quoting them); never persist local time. Day/month groupings are local.
 3. **Compare costs in billed units** (tokens x multiplier: read 0.10x, write 1.25x), never raw token counts, for any highlight, sort or "which is bigger" decision.
 4. **Reuse the existing UI surface** (one status bar item, the existing panels); do not add a parallel one. Budget thresholds own the status bar colour.
-5. **Cache TTL is 5 minutes from the very first request** once the proxy is installed: `forceFiveMinuteCache` defaults to true, and nothing may leave the proxy with a 1 h `ttl`. The 1 h option is only for deliberate measurement.
+5. **Cache TTL is 5 minutes from the very first request** once the proxy is installed: the `cacheTtl` setting (`5m` | `1h`, default `5m`) is the single source for every cache decision, and nothing may leave the proxy with a 1 h `ttl` unless it is set to `1h`. The 1 h option is only for deliberate measurement.
 6. **No dollars in presented savings:** use tokens, units and percentages. The conservative defensible figure is ~34 % (see `latest/findings.md`, F-03).
 7. **Panel labels:** `u` = units and `t` = tokens in table cells, always as `<abbr>` with the full word as tooltip; billed cells show units, percentages go in tooltips.
 8. **Priority: the tool first.** Presentation (deck) and documentation (F-05, F-29) are the last steps, only once the tool is 100 % functional; do not work on them before.

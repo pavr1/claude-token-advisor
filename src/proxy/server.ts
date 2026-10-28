@@ -400,24 +400,18 @@ class StreamUsageParser {
 
 export class TokenImproverProxy {
   /**
-   * Validates the cache lifetime from the response itself: any tokens written to the
-   * 1 hour cache bill at 2x instead of 1.25x. Warns, and forces 5 minutes on every
-   * later request even if the setting was off or the client re-added a `ttl`.
+   * Validates the cache lifetime from the response itself: tokens written to the 1 hour
+   * cache bill at 2x instead of 1.25x, which is only expected when `cacheTtl` is '1h'.
    */
   private checkCacheLifetime(usage: ApiUsage | undefined): void {
     const written1h = usage?.cache_creation?.ephemeral_1h_input_tokens ?? 0;
-    if (written1h <= 0) {
+    if (written1h <= 0 || this.config.optimizer.cacheTtl === '1h') {
       return;
     }
     this.log(
-      `WARNING: ${written1h} tokens were written to the 1 hour cache (2x instead of 1.25x). ` +
-        (this.config.optimizer.forceFiveMinuteCache && !this.forceFiveMinuteCacheOverride
-          ? 'forceFiveMinuteCache was on, so a breakpoint kept its ttl; forcing 5 minutes from now on.'
-          : this.forceFiveMinuteCacheOverride
-            ? 'Still seen after forcing 5 minutes: the ttl is being set somewhere the proxy does not rewrite.'
-            : 'Forcing 5 minutes from now on.')
+      `WARNING: ${written1h} tokens were written to the 1 hour cache (2x instead of 1.25x) although cacheTtl is 5m: ` +
+        'the ttl is being set somewhere the proxy does not rewrite.'
     );
-    this.forceFiveMinuteCacheOverride = true;
   }
 
   private readonly app: Express;
@@ -446,8 +440,6 @@ export class TokenImproverProxy {
   private readonly summaryStore: SummaryStore;
   /** Previous request size per conversation, to model the client's own caching in the baseline. */
   private readonly baselineMemory: BaselineMemory;
-  /** Set once Anthropic reports a 1 hour cache write: from then on every request is forced to 5 minutes. */
-  private forceFiveMinuteCacheOverride = false;
   /** Logged once: `claude_code.cost.usage` reported as DELTA temporality, which `RealCostTracker` has to sum instead of tracking as a running total. */
   private loggedDeltaCostTemporality = false;
 
@@ -651,10 +643,7 @@ export class TokenImproverProxy {
       exactRawTokens = counted ?? undefined;
     }
 
-    const optimizerConfig = this.forceFiveMinuteCacheOverride
-      ? { ...this.config.optimizer, forceFiveMinuteCache: true }
-      : this.config.optimizer;
-    const { payload, telemetry } = await optimizePayload(original, optimizerConfig, {
+    const { payload, telemetry } = await optimizePayload(original, this.config.optimizer, {
       exactRawTokens,
       isStartupRequest,
       summaryStore: this.summaryStore,

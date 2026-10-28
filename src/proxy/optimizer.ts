@@ -194,13 +194,15 @@ const COMPLEX_TASK_PATTERNS: RegExp[] = [
 /** Above this many characters the latest turn is never treated as trivial. */
 const SIMPLE_TASK_MAX_CHARS = 400;
 
+export type CacheTtl = '5m' | '1h';
+
 export interface OptimizerConfig {
   enableNormalization: boolean;
   enableCompaction: boolean;
   enableModelRouting: boolean;
   enableCacheAnchor: boolean;
-  /** Drop `ttl` from every `cache_control`, so all writes use the 5 minute cache (1.25x, not 2x for 1 hour). */
-  forceFiveMinuteCache: boolean;
+  /** Cache lifetime set on every `cache_control`: '5m' (writes 1.25x) or '1h' (writes 2x). The single source for all cache decisions. */
+  cacheTtl: CacheTtl;
   /** Stage 0. See `applyStartupModelDefault`. */
   enableStartupSonnetDefault: boolean;
   /** Cumulative history size that triggers a Cache Reset Optimization. */
@@ -216,7 +218,7 @@ export const DEFAULT_OPTIMIZER_CONFIG: OptimizerConfig = {
   enableCompaction: true,
   enableModelRouting: true,
   enableCacheAnchor: true,
-  forceFiveMinuteCache: true,
+  cacheTtl: '5m',
   enableStartupSonnetDefault: true,
   slidingThresholdTokens: 15_000,
   compactionFraction: 0.75,
@@ -292,7 +294,7 @@ export interface OptimizationTelemetry {
    * anything for caching, or when no memory was supplied.
    */
   baselineCachedTokens?: number;
-  /** Cache lifetime the client's own breakpoints asked for (5 min or 1 h). */
+  /** Cache lifetime in force for this turn (the `cacheTtl` setting). */
   clientCacheTtlMs?: number;
   /**
    * Tokens the client would have read from cache with the longest-lived cache there is:
@@ -657,38 +659,15 @@ export function hasClientCacheControl(payload: MessagesPayload): boolean {
 export const CACHE_TTL_5M_MS = 5 * 60 * 1000;
 export const CACHE_TTL_1H_MS = 60 * 60 * 1000;
 
-/**
- * The cache lifetime the client asked for: 1 hour when any of its `cache_control`
- * breakpoints carries `ttl: "1h"` (Claude Code does this for its system prompt and
- * tools), otherwise the 5 minute default. Assuming 5 minutes for a 1 hour cache made
- * every pause look cold, so the proxy compacted early and the baseline overcharged.
- */
-export function clientCacheTtlMs(payload: MessagesPayload): number {
-  const longLived = (value: unknown): boolean => {
-    if (Array.isArray(value)) {
-      return value.some(longLived);
-    }
-    if (value && typeof value === 'object') {
-      const record = value as Record<string, unknown>;
-      const control = record['cache_control'];
-      if (control && typeof control === 'object' && (control as Record<string, unknown>)['ttl'] === '1h') {
-        return true;
-      }
-      return Object.values(record).some(longLived);
-    }
-    return false;
-  };
-  return longLived(payload.system) || longLived(payload.tools) || longLived(payload.messages)
-    ? CACHE_TTL_1H_MS
-    : CACHE_TTL_5M_MS;
-}
+/** The lifetime in milliseconds of a configured `cacheTtl`. */
+export const cacheTtlMs = (ttl: CacheTtl): number => (ttl === '1h' ? CACHE_TTL_1H_MS : CACHE_TTL_5M_MS);
 
 /**
- * Removes `ttl` from every `cache_control` so the API falls back to its 5 minute
- * default. A 1 hour write bills 2x base input against 1.25x, and pauses over 5 minutes
- * are rare, so the longer lifetime costs more than it saves.
+ * Sets the configured lifetime on every `cache_control`: '5m' removes `ttl` so the API falls
+ * back to its 5 minute default (writes bill 1.25x), '1h' sets `ttl: "1h"` (writes bill 2x).
+ * Breakpoints the client or Stage 4 placed all end up with the same lifetime.
  */
-export function forceFiveMinuteCache(payload: MessagesPayload): MessagesPayload {
+export function applyCacheTtl(payload: MessagesPayload, ttl: CacheTtl): MessagesPayload {
   const visit = (value: unknown): unknown => {
     if (Array.isArray(value)) {
       return value.map(visit);
@@ -698,7 +677,7 @@ export function forceFiveMinuteCache(payload: MessagesPayload): MessagesPayload 
       for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
         if (key === 'cache_control' && child && typeof child === 'object') {
           const { ttl: _ttl, ...control } = child as Record<string, unknown>;
-          out[key] = control;
+          out[key] = ttl === '1h' ? { ...control, ttl } : control;
         } else {
           out[key] = visit(child);
         }
@@ -731,7 +710,7 @@ export class BaselineMemory {
    * missing or corrupt file starts empty.
    */
   constructor(
-    private readonly ttlMs = 5 * 60 * 1000,
+    private readonly ttlMs = CACHE_TTL_5M_MS,
     private readonly maxConversations = 200,
     private readonly filePath?: string
   ) {
@@ -1505,7 +1484,7 @@ export async function optimizePayload(
 
   if (options.baselineMemory && hasClientCacheControl(original)) {
     const key = hashMessages((original.messages ?? []).slice(0, 1));
-    telemetry.clientCacheTtlMs = config.forceFiveMinuteCache ? CACHE_TTL_5M_MS : clientCacheTtlMs(original);
+    telemetry.clientCacheTtlMs = cacheTtlMs(config.cacheTtl);
     telemetry.floorCachedTokens = options.baselineMemory.warmCachedTokens(key, rawTokens, Date.now());
     telemetry.baselineCachedTokens = options.baselineMemory.cachedTokens(key, rawTokens, Date.now(), telemetry.clientCacheTtlMs);
   }
@@ -1553,9 +1532,7 @@ export async function optimizePayload(
     payload = applyCacheAnchor(payload, telemetry);
   }
 
-  if (config.forceFiveMinuteCache) {
-    payload = forceFiveMinuteCache(payload);
-  }
+  payload = applyCacheTtl(payload, config.cacheTtl);
 
   const conversationKey = hashMessages((original.messages ?? []).slice(0, 1));
   telemetry.clientPrefixChange = trackPrefix(lastClientPrefix, conversationKey, original);

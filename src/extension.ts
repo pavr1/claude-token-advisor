@@ -34,7 +34,7 @@ import { detectPython, MIN_PYTHON, PythonMissingError, PythonRuntime } from './b
 import { BypassMonitor } from './proxy/bypassMonitor';
 import { checkInstall, readFingerprint, readInstallTime } from './proxy/installWatch';
 import { DEFAULT_OPTIMIZER_CONFIG } from './proxy/optimizer';
-import { getPricingTable, loadPricing } from './proxy/pricing';
+import { getPricingTable, LITELLM_PRICING_URL, loadPricing } from './proxy/pricing';
 import {
   DEFAULT_PROXY_PORT,
   DEFAULT_UPSTREAM_BASE_URL,
@@ -168,7 +168,6 @@ async function getSummary(context: vscode.ExtensionContext): Promise<Summary> {
   const config = vscode.workspace.getConfiguration(BUDGET_SECTION);
   const scope = config.get<string>('scope', 'all') === 'project' ? 'project' : 'all';
   const budget = config.get<number>('budget', 0) ?? 0;
-  const budgetUsd = config.get<number>('budgetUsd', 0) ?? 0;
 
   // --month/--day come from the local clock; usage is bucketed in local time too
   // (timestamps are stored in UTC and always displayed in local time).
@@ -197,16 +196,6 @@ async function getSummary(context: vscode.ExtensionContext): Promise<Summary> {
   if (budget > 0) {
     args.push('--budget', String(budget));
   }
-  if (budgetUsd > 0) {
-    args.push('--budget-usd', String(budgetUsd));
-  }
-
-  const spendLimitFile = (config.get<string>('spendLimitFile', '') ?? '').trim();
-  if (spendLimitFile) {
-    args.push('--spend-limit-file', spendLimitFile);
-  }
-
-  args.push('--spend-source', config.get<string>('spendSource', 'auto'));
 
   // Ground the Python-side budget math in Anthropic's own reported cost when the
   // local OTel receiver already has it for the current day/month. Omitted entirely
@@ -356,7 +345,7 @@ function readProxyConfig(): ProxyConfig {
       enableCompaction: config.get<boolean>('stage2Compaction', true) ?? true,
       enableModelRouting: config.get<boolean>('stage3ModelRouting', true) ?? true,
       enableCacheAnchor: config.get<boolean>('stage4CacheAnchor', true) ?? true,
-      forceFiveMinuteCache: config.get<boolean>('forceFiveMinuteCache', true) ?? true,
+      cacheTtl: config.get<string>('cacheTtl', '5m') === '1h' ? '1h' : '5m',
       enableStartupSonnetDefault: config.get<boolean>('startupSonnetDefault', true) ?? true,
       slidingThresholdTokens:
         config.get<number>('slidingThresholdTokens', DEFAULT_OPTIMIZER_CONFIG.slidingThresholdTokens) ??
@@ -869,9 +858,9 @@ function onTurnCompleted(record: TurnRecord): void {
       `cacheRead=${entry.cacheReadTokens} saved=${entry.savingsPercent.toFixed(1)}% status=${record.status}`
   );
 
-  if (cost.cacheWrite1hTokens > 0) {
+  if (cost.cacheWrite1hTokens > 0 && vscode.workspace.getConfiguration(IMPROVER_SECTION).get<string>('cacheTtl', '5m') !== '1h') {
     output.appendLine(
-      `  WARNING: ${cost.cacheWrite1hTokens} cache-write tokens went to the 1 hour cache (billed 2x, not 1.25x); the proxy now forces the 5 minute cache.`
+      `  WARNING: ${cost.cacheWrite1hTokens} cache-write tokens went to the 1 hour cache (billed 2x, not 1.25x) although cacheTtl is 5m.`
     );
   }
   if (record.telemetry.compactionError) {
@@ -1229,7 +1218,9 @@ function clearTerminalEnv(): void {
  * automatically," not "skip fetching and use a hand-guessed table."
  */
 async function applyPricingConfig(storageDir: string): Promise<void> {
-  const customUrl = (vscode.workspace.getConfiguration(IMPROVER_SECTION).get<string>('pricingUrl', '') ?? '').trim();
+  const configuredUrl = (vscode.workspace.getConfiguration(IMPROVER_SECTION).get<string>('pricingUrl', '') ?? '').trim();
+  // The default is the public feed itself, not a mirror the user chose.
+  const customUrl = configuredUrl === LITELLM_PRICING_URL ? '' : configuredUrl;
   const result = await loadPricing(storageDir, customUrl || undefined);
   output.appendLine(`pricing: ${result.detail} (source: ${getPricingTable().source})`);
   // A custom mirror the user configured failing is worth surfacing; the public

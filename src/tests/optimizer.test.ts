@@ -16,8 +16,8 @@ import {
   HAIKU_MODEL_ID,
   SUMMARIZER_CHUNK_CHARS,
   manifestSystemPrompt,
-  clientCacheTtlMs,
-  forceFiveMinuteCache,
+  applyCacheTtl,
+  cacheTtlMs,
   CACHE_TTL_1H_MS,
   CACHE_TTL_5M_MS,
   manifestTargetTokens,
@@ -1005,11 +1005,10 @@ test('the economics gate prices a bigger manifest on a bigger segment', () => {
   assert.ok(large.haikuCost > small.haikuCost * 9, 'output grows with the segment, not only the input');
 });
 
-test('clientCacheTtlMs reads a 1h breakpoint and defaults to 5 minutes', () => {
-  const plain = { model: 'm', messages: [{ role: 'user', content: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }] }] };
-  const longLived = { model: 'm', system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral', ttl: '1h' } }], messages: [] };
-  assert.equal(clientCacheTtlMs(plain), CACHE_TTL_5M_MS);
-  assert.equal(clientCacheTtlMs(longLived), CACHE_TTL_1H_MS);
+test('cacheTtlMs maps the setting to its lifetime and defaults to 5 minutes', () => {
+  assert.equal(cacheTtlMs('5m'), CACHE_TTL_5M_MS);
+  assert.equal(cacheTtlMs('1h'), CACHE_TTL_1H_MS);
+  assert.equal(DEFAULT_OPTIMIZER_CONFIG.cacheTtl, '5m');
 });
 
 test('BaselineMemory judges the cache by the TTL the previous request was written with', () => {
@@ -1020,19 +1019,22 @@ test('BaselineMemory judges the cache by the TTL the previous request was writte
   assert.equal(memory.cachedTokens('c', 70_000, t0 + 30 * 60_000 + 10 * 60_000, CACHE_TTL_5M_MS), 0, '10 min after a 5m write is cold');
 });
 
-test('forceFiveMinuteCache drops ttl from every breakpoint and leaves the rest intact', () => {
+test('applyCacheTtl sets the configured lifetime on every breakpoint and leaves the rest intact', () => {
   const payload = {
     model: 'm',
     system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral', ttl: '1h' } }],
     tools: [{ name: 't', cache_control: { type: 'ephemeral', ttl: '1h' } }],
     messages: [{ role: 'user', content: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }] }],
   };
-  const out = forceFiveMinuteCache(payload as never) as typeof payload;
-  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral' });
-  assert.deepEqual(out.tools[0].cache_control, { type: 'ephemeral' });
-  assert.equal(out.messages[0].content[0].text, 'x');
-  assert.equal(clientCacheTtlMs(out as never), CACHE_TTL_5M_MS);
+  const five = applyCacheTtl(payload as never, '5m') as typeof payload;
+  assert.deepEqual(five.system[0].cache_control, { type: 'ephemeral' });
+  assert.deepEqual(five.tools[0].cache_control, { type: 'ephemeral' });
+  assert.equal(five.messages[0].content[0].text, 'x');
   assert.equal((payload.system[0].cache_control as { ttl?: string }).ttl, '1h', 'input is not mutated');
+
+  const hour = applyCacheTtl(payload as never, '1h') as typeof payload;
+  assert.deepEqual(hour.system[0].cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.deepEqual(hour.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' });
 });
 
 test('telemetry flags whether rawTokens is the exact count_tokens figure or the local estimate', async () => {

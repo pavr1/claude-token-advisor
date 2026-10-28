@@ -554,20 +554,13 @@ def derive_budget(summary: dict, month: str | None, day: int | None = None) -> t
 
 
 def resolve_budget(
-    summary: dict, budget_tokens: int, budget_usd: float, month: str | None, day: int | None = None
+    summary: dict, budget_tokens: int, month: str | None, day: int | None = None
 ) -> tuple[float, str]:
     """Pick the monthly budget (in weighted-USD units) and where it came from.
 
-    `budget_usd` is the most literal figure a user can supply — the real cap for a
-    dollar-native plan (Enterprise, API) usually only exists as a USD number on
-    Anthropic's own usage page, never as a token count — so it takes priority over
-    a token budget when both are given, with no token-mix conversion to distort it.
-    Falls back to the token budget (converted at this month's own weighted-cost
-    mix) and finally to `derive_budget()`'s own inference from history.
+    Uses the token budget (converted at this month's own weighted-cost mix) when
+    given, otherwise `derive_budget()`'s own inference from history.
     """
-    if budget_usd and budget_usd > 0:
-        return float(budget_usd), "user"
-
     if budget_tokens and budget_tokens > 0:
         total_tokens = float(summary.get("total_tokens_used", 0) or 0)
         total_weighted = float(summary.get("total_weighted", 0) or 0)
@@ -1306,12 +1299,6 @@ def main() -> None:
     parser.add_argument("--project", "--project-name", "--repo-name", dest="project", default=None, help="Optional project or repo name under <claude>/projects.")
     parser.add_argument("--month", default=today.strftime("%Y-%m"), help="Month to inspect as YYYY-MM. Defaults to the current month in the --day-grouping basis.")
     parser.add_argument("--budget", type=int, default=0, help="Monthly token budget. When omitted or 0, it is inferred from your own usage history.")
-    parser.add_argument(
-        "--budget-usd",
-        type=float,
-        default=0.0,
-        help="Monthly budget in USD, taken literally with no token-mix conversion. Takes priority over --budget when both are given.",
-    )
     parser.add_argument("--day", type=int, default=today.day, help="Current day of the month. Defaults to today in the --day-grouping basis.")
     parser.add_argument("--day-grouping", choices=("utc", "local"), default="local", help="Bucket usage by day/month in UTC to match claude.ai's usage page, or in local time to match your own clock. Default: local.")
     parser.add_argument("--pricing-file", default=None, help="Optional JSON file of per-token model rates, overriding the published feed.")
@@ -1353,7 +1340,7 @@ def main() -> None:
 
     summary["claude_root"] = str(claude_root)
 
-    budget, budget_source = resolve_budget(summary, args.budget, args.budget_usd, args.month, args.day)
+    budget, budget_source = resolve_budget(summary, args.budget, args.month, args.day)
 
     snapshot = build_budget_snapshot(
         summary,

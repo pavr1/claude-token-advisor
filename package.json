@@ -2,7 +2,7 @@
   "name": "claude-budget-advisor",
   "displayName": "Claude Budget Advisor & Token Improver",
   "description": "Tracks Claude Code project token pacing and monthly budget health, and runs a local optimizing proxy that prunes outgoing Anthropic Messages API traffic.",
-  "version": "0.2.57",
+  "version": "0.2.61",
   "publisher": "pablo-villalobos",
   "engines": {
     "vscode": "^1.95.0"
@@ -56,7 +56,7 @@
           "claudeBudgetAdvisor.enabled": {
             "type": "boolean",
             "default": true,
-            "description": "Show budget pacing (status bar percentage/$ and dashboard). Turn off to hide it entirely — e.g. while no real spend-limit source is available yet — without affecting the Token Improver proxy, which keeps running independently."
+            "description": "Show budget pacing in the status bar and dashboard."
           },
           "claudeBudgetAdvisor.scope": {
             "type": "string",
@@ -65,17 +65,12 @@
               "project"
             ],
             "default": "all",
-            "description": "Report usage across all Claude projects, or only the project matching the current workspace."
+            "description": "Count usage from all Claude projects, or only the project of the open workspace."
           },
           "claudeBudgetAdvisor.budget": {
             "type": "number",
             "default": 0,
-            "description": "Monthly token budget. Leave at 0 to infer it automatically from your own usage history."
-          },
-          "claudeBudgetAdvisor.budgetUsd": {
-            "type": "number",
-            "default": 0,
-            "description": "Monthly budget in USD, taken literally (no token-mix conversion). Takes priority over the token budget above when set — the direct way to enter a real cap you only know in dollars (e.g. an Enterprise/API spend limit from Anthropic's own usage page). Leave at 0 to infer automatically."
+            "description": "Monthly token budget. 0 infers it from your usage history."
           },
           "claudeBudgetAdvisor.projectName": {
             "type": "string",
@@ -85,7 +80,7 @@
           "claudeBudgetAdvisor.baseDir": {
             "type": "string",
             "default": "",
-            "description": "Optional override for the Claude data directory. Leave empty to auto-resolve from CLAUDE_CONFIG_DIR, your home folder, or the claude CLI on PATH."
+            "description": "Folder where Claude Code stores its sessions (read for monthly usage). Empty detects it from CLAUDE_CONFIG_DIR, your home folder or the claude CLI."
           },
           "claudeBudgetAdvisor.spendSource": {
             "type": "string",
@@ -108,7 +103,7 @@
             "type": "number",
             "default": 15,
             "minimum": 0,
-            "description": "How often to refresh the budget and dashboard automatically, in minutes. Also refreshes right after a completed turn (throttled to once a minute). Set to 0 to disable automatic refresh — only activation and the Refresh command will update it."
+            "description": "Minutes between automatic refreshes of the budget and dashboard. 0 disables them. It also refreshes after each completed turn, at most once a minute."
           }
         }
       },
@@ -118,80 +113,88 @@
           "claudeTokenImprover.autoStart": {
             "type": "boolean",
             "default": true,
-            "description": "Start the optimizing proxy automatically when the extension activates."
+            "description": "Start the proxy when the extension activates."
           },
           "claudeTokenImprover.autoConfigureTerminals": {
             "type": "boolean",
             "default": true,
-            "description": "Automatically set ANTHROPIC_BASE_URL in new VS Code integrated terminals so Claude clients route through the proxy. Cached by VS Code so terminals restored at startup get it too; removed when the proxy is stopped on purpose or fails to start. Terminals that were already open the first time are not affected until they are reopened. Does not affect terminals outside VS Code or the Claude Code panel."
+            "description": "Set ANTHROPIC_BASE_URL in new VS Code terminals so Claude Code goes through the proxy. Terminals already open must be reopened."
           },
           "claudeTokenImprover.port": {
             "type": "number",
             "default": 4000,
-            "description": "Loopback port the proxy listens on. The proxy binds to 127.0.0.1 only."
+            "description": "Local port the proxy listens on (127.0.0.1 only)."
           },
           "claudeTokenImprover.upstreamBaseUrl": {
             "type": "string",
             "default": "https://api.anthropic.com",
-            "description": "Origin the proxy forwards optimized traffic to. Change this only to target a gateway or a mock server."
+            "description": "Server the proxy forwards requests to. Change only for a gateway or test server."
           },
           "claudeTokenImprover.stage1Normalization": {
             "type": "boolean",
             "default": true,
-            "description": "Stage 1. Trim text and convert CRLF to LF so cache prefixes match byte-for-byte."
+            "description": "Stage 1. Trim whitespace and normalize line endings so cache prefixes match byte for byte."
           },
           "claudeTokenImprover.stage2Compaction": {
             "type": "boolean",
             "default": true,
-            "description": "Stage 2. Strip greeting fluff, and summarize old history into a manifest once the sliding threshold is crossed. Summarization rewrites conversation history and costs one extra Haiku call per compaction."
+            "description": "Stage 2. Remove greeting filler and, past the sliding threshold, replace the oldest history with a Haiku summary (one extra Haiku call each time)."
           },
           "claudeTokenImprover.stage3ModelRouting": {
             "type": "boolean",
             "default": true,
-            "description": "Stage 3. Route short, mechanical turns to claude-haiku-4-5 instead of the requested model."
+            "description": "Stage 3. Send short, mechanical turns to Haiku instead of the requested model."
           },
           "claudeTokenImprover.stage4CacheAnchor": {
             "type": "boolean",
             "default": true,
-            "description": "Stage 4. Strip cache_control from the message history and place a single ephemeral anchor on the last assistant turn. Breakpoints on system and tools are left untouched."
+            "description": "Stage 4. Keep a single cache anchor on the last assistant turn; system and tools breakpoints are untouched."
           },
-          "claudeTokenImprover.forceFiveMinuteCache": {
-            "type": "boolean",
-            "default": true,
-            "description": "Remove the 1 hour ttl from every cache breakpoint so all cache writes use the 5 minute cache. A 1 hour write bills 2x base input instead of 1.25x; reads cost the same. Turn off to leave the client's own ttl untouched."
+          "claudeTokenImprover.cacheTtl": {
+            "type": "string",
+            "enum": [
+              "5m",
+              "1h"
+            ],
+            "default": "5m",
+            "enumDescriptions": [
+              "Writes cost 1.25x; the cache expires after 5 minutes without a request.",
+              "Writes cost 2x; the cache lasts 1 hour."
+            ],
+            "description": "Cache lifetime the proxy sets on every request. 1 h costs more per write but survives longer pauses."
           },
           "claudeTokenImprover.startupSonnetDefault": {
             "type": "boolean",
             "default": true,
-            "description": "Stage 0. Claude Code defaults new sessions to Opus; if the first request the proxy sees after it starts is on Opus, route it to claude-sonnet-5 instead. One-time only — every later request, and any model you pick yourself with /model (including switching back to Opus), passes through untouched."
+            "description": "Stage 0. If the first request after the proxy starts is Opus, send it to Sonnet. Later requests and models chosen with /model are not changed."
           },
           "claudeTokenImprover.slidingThresholdTokens": {
             "type": "number",
             "default": 15000,
-            "description": "Cumulative history size, in tokens, that triggers a Cache Reset Optimization."
+            "description": "History size, in tokens, that triggers a summary."
           },
           "claudeTokenImprover.compactionFraction": {
             "type": "number",
             "default": 0.75,
             "minimum": 0.1,
             "maximum": 0.95,
-            "description": "Fraction of the oldest history replaced by the compaction manifest."
+            "description": "The newest (1 - value) x threshold tokens of history stay verbatim; everything older is summarized. At 0.75 with a 15,000 threshold, the newest ~3,750 tokens are kept."
           },
           "claudeTokenImprover.expectedRequestsAfterCompaction": {
             "type": "number",
             "default": 10,
             "minimum": 1,
-            "description": "Requests assumed to follow a compaction when deciding whether it pays for itself. Compaction is skipped when the expected saving does not exceed the Haiku call plus cache rewrite."
+            "description": "Requests expected after a summary, used to decide if it pays for itself. A summary is skipped when its expected saving is below the Haiku call plus the cache rewrite."
           },
           "claudeTokenImprover.exactTokenCounting": {
             "type": "boolean",
             "default": false,
-            "description": "Measure the pre-optimization baseline with the count_tokens endpoint instead of the local estimate. More accurate, but adds a round trip to every turn."
+            "description": "Measure the size before optimization with Anthropic's count_tokens instead of a local estimate. More exact, but adds one call per turn."
           },
           "claudeTokenImprover.pricingUrl": {
             "type": "string",
-            "default": "",
-            "description": "Optional override for the pricing feed, as a self-hosted mirror of the same LiteLLM JSON shape (https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json). Leave empty to fetch that public feed directly, cached for 7 days."
+            "default": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+            "description": "Model price feed (LiteLLM JSON). Change only to use a mirror."
           }
         }
       }

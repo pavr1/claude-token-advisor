@@ -193,23 +193,27 @@ test('exact token counting asks count_tokens for the raw size and falls back to 
   assert.ok(logs.some((l) => l.includes('HTTP 500')), logs.join('\n'));
 });
 
-test('a 1 hour cache write is flagged, and the proxy then forces 5 minutes', async () => {
-  const fake = await upstream((_seen, res) =>
-    jsonReply(res, { usage: { input_tokens: 5, output_tokens: 1, cache_creation_input_tokens: 900, cache_creation: { ephemeral_1h_input_tokens: 900 } } })
-  );
-  const { logs, url } = await startProxy(fake.url, { optimizer: { forceFiveMinuteCache: false } });
+test('a 1 hour cache write is flagged only when cacheTtl is 5m', async () => {
+  const reply = (_seen: unknown, res: Parameters<Parameters<typeof upstream>[0]>[1]) =>
+    jsonReply(res, { usage: { input_tokens: 5, output_tokens: 1, cache_creation_input_tokens: 900, cache_creation: { ephemeral_1h_input_tokens: 900 } } });
+  const five = await startProxy((await upstream(reply)).url);
+  await post(five.url, simple);
+  assert.ok(five.logs.some((l) => l.includes('900 tokens were written to the 1 hour cache') && l.includes('cacheTtl is 5m')), five.logs.join('\n'));
 
-  await post(url, simple);
-  assert.ok(logs.some((l) => l.includes('900 tokens were written to the 1 hour cache') && l.includes('Forcing 5 minutes from now on')), logs.join('\n'));
+  const hour = await startProxy((await upstream(reply)).url, { optimizer: { cacheTtl: '1h' } });
+  await post(hour.url, simple);
+  assert.equal(hour.logs.some((l) => l.includes('1 hour cache')), false, 'expected when the setting asks for 1h');
+});
 
-  // Now forced: the next request goes out with every ttl removed, and a repeat is reported as unfixable.
-  await post(url, {
-    ...simple,
-    system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }],
-  });
-  const second = JSON.parse(fake.seen[1].body) as { system: Array<{ cache_control: Record<string, unknown> }> };
-  assert.equal('ttl' in second.system[0].cache_control, false);
-  assert.ok(logs.some((l) => l.includes('Still seen after forcing 5 minutes')), logs.join('\n'));
+test('cacheTtl decides the ttl every request leaves the proxy with', async () => {
+  const withTtl = { ...simple, system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral' } }] };
+  for (const [ttl, expected] of [['5m', false], ['1h', true]] as const) {
+    const fake = await upstream((_seen, res) => jsonReply(res, { usage: { input_tokens: 1, output_tokens: 1 } }));
+    const { url } = await startProxy(fake.url, { optimizer: { cacheTtl: ttl } });
+    await post(url, withTtl);
+    const sent = JSON.parse(fake.seen[0].body) as { system: Array<{ cache_control: Record<string, unknown> }> };
+    assert.equal('ttl' in sent.system[0].cache_control, expected, ttl);
+  }
 });
 
 test('an upstream error status is logged with its body and its usage-less answer still settles the turn', async () => {

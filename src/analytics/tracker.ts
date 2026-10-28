@@ -796,6 +796,10 @@ export interface AggregateStats {
   /** Billed units per kind of input, model-weighted; see `inputUnits`. */
   cacheReadUnits: number;
   cacheWriteUnits: number;
+  /** What the cache reads saved against paying full price for those tokens. */
+  cacheReadSavedUnits: number;
+  /** What the cache writes cost over full price for those tokens (the 0.25x premium of a 5 minute write). */
+  cacheWritePremiumUnits: number;
   regularInputUnits: number;
   outputUnits: number;
   /** Models whose cache rate was not in the pricing table, per kind of token; those tokens are counted in t but add no u. */
@@ -836,6 +840,8 @@ export function emptyStats(): AggregateStats {
     summarizerUnitCost: 0,
     cacheReadUnits: 0,
     cacheWriteUnits: 0,
+    cacheReadSavedUnits: 0,
+    cacheWritePremiumUnits: 0,
     regularInputUnits: 0,
     outputUnits: 0,
     unpriced: { read: [], write: [] },
@@ -891,6 +897,11 @@ export function aggregate(entries: readonly LedgerEntry[]): AggregateStats {
     const units = entryUnits(entry);
     stats.cacheReadUnits += units.read;
     stats.cacheWriteUnits += units.write;
+    // Full price per token of this hit's model, recovered from the no-cache figure it was recorded with.
+    const cachedTokens = (entry.cacheReadTokens ?? 0) + (entry.cacheWriteTokens ?? 0);
+    const fullPrice = cachedTokens > 0 ? entry.cacheNoCacheUnitCost / cachedTokens : 0;
+    stats.cacheReadSavedUnits += (entry.cacheReadTokens ?? 0) * fullPrice - units.read;
+    stats.cacheWritePremiumUnits += units.write - (entry.cacheWriteTokens ?? 0) * fullPrice;
     stats.regularInputUnits += units.regular;
     stats.outputUnits += units.output;
     for (const kind of unpricedKinds(entry)) {

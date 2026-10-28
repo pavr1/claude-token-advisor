@@ -168,10 +168,7 @@ py claude_budget_advisor.py --project current --month 2026-09 --budget 500000 --
 | --- | --- | --- |
 | `scope` | `all` | `all` Claude projects, or only the `project` matching the workspace. |
 | `budget` | `0` | Monthly token budget. `0` infers it from your own usage history. |
-| `projectName` | empty | Used only with `scope: project`. Empty detects it from the workspace folder. |
 | `baseDir` | empty | Override for the Claude data directory. Empty resolves it from `CLAUDE_CONFIG_DIR` or your home folder. |
-| `spendSource` | `auto` | Where spend figures come from: `auto` (Admin API when `ANTHROPIC_ADMIN_KEY` is set, else the local estimate), `mock`, `file`, `api`, `none`. |
-| `spendLimitFile` | empty | Path to a JSON payload from the spend limits endpoint; its totals replace the local estimate. |
 
 `ANTHROPIC_ADMIN_KEY` must be an Admin API key with `read:spend_limits`. Set it in the environment VS Code is launched from; it is never stored by the extension.
 

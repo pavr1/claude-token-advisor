@@ -342,30 +342,10 @@ def test_derive_budget_projection_uses_the_given_day_not_datetime_now():
     assert budget_day_10 > budget_day_20
 
 
-def test_resolve_budget_usd_is_taken_literally_with_no_token_mix_conversion():
-    # 1000 total tokens costing $5 weighted (a 1:200 ratio) would turn a token
-    # budget into a tiny weighted figure — budget_usd must bypass that entirely.
+def test_resolve_budget_uses_the_token_budget_at_the_months_cost_mix():
     summary = {"total_tokens_used": 1000, "total_weighted": 5.0}
 
-    budget, source = resolve_budget(summary, 0, 250.0, "2026-09", day=15)
-
-    assert budget == 250.0
-    assert source == "user"
-
-
-def test_resolve_budget_usd_takes_priority_over_token_budget():
-    summary = {"total_tokens_used": 1000, "total_weighted": 5.0}
-
-    budget, source = resolve_budget(summary, 10_000, 250.0, "2026-09", day=15)
-
-    assert budget == 250.0
-    assert source == "user"
-
-
-def test_resolve_budget_falls_back_to_token_budget_when_no_usd_given():
-    summary = {"total_tokens_used": 1000, "total_weighted": 5.0}
-
-    budget, source = resolve_budget(summary, 10_000, 0, "2026-09", day=15)
+    budget, source = resolve_budget(summary, 10_000, "2026-09", day=15)
 
     assert source == "user"
     assert budget == 50.0  # 10,000 tokens * (5.0 / 1000) ratio
@@ -374,7 +354,7 @@ def test_resolve_budget_falls_back_to_token_budget_when_no_usd_given():
 def test_resolve_budget_falls_back_to_derive_budget_when_nothing_supplied():
     summary = {"by_month_weighted": {"2026-08": 228.0}}
 
-    budget, source = resolve_budget(summary, 0, 0, "2026-09", day=15)
+    budget, source = resolve_budget(summary, 0, "2026-09", day=15)
 
     assert source == "auto_history"
     assert budget == 228.0

@@ -133,10 +133,19 @@ test('the Cached cell is tinted green when reads outweigh writes and red when wr
   assert.doesNotMatch(cold, /(Reads|Writes) (>|&gt;) (writes|reads)/);
 });
 
-test('tokens can be healthy while units are red, because a written token costs 12.5x a read one', () => {
+test('the units row is judged by what the cache did: green when reads saved more than writes cost over full price', () => {
+  // 30K read vs 20K written: writes outweigh reads in raw units, yet reading saves 0.9x per token and writing costs 0.25x extra.
   const html = render([row({ read: 30_000, write: 20_000 })]);
-  assert.doesNotMatch(html, /(Reads|Writes) (>|&gt;) (writes|reads)/);
-  assert.doesNotMatch(html, /(Reads|Writes) (>|&gt;) (writes|reads)/);
+  assert.match(html, /CR: \d+% CW: \d+%/);
+  const [cr, cw] = /CR: (\d+)% CW: (\d+)%/.exec(html)!.slice(1).map(Number);
+  assert.equal(cr + cw, 100);
+  assert.deepEqual([cr, cw], [60, 40], 'share of the cached tokens that were read and written');
+  assert.ok(html.includes('title="CR: ') && /<div class="cache-val" style="background:rgba\(63,185,80,0\.16\)" title="CR: [^"]*CR: \d+% CW: \d+%/.test(html));
+
+  // Only a cold write: the cache cost more than not using it, so the units row is red.
+  const cold = render([row({ write: 90_000 })]);
+  assert.match(cold, /CR: 0% CW: 100%/);
+  assert.match(cold, /<div class="cache-val" style="background:rgba\(229,83,75,0\.16\)" title="CW: [^"]*CR: 0% CW: 100%/);
 });
 
 test('the project filter narrows the table, and an unknown project falls back to all repos', () => {

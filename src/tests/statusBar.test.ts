@@ -380,11 +380,11 @@ test('an Enterprise plan with a real spend limit shows dollars against the limit
   assert.equal(color(), 'statusBarItem.errorForeground');
 });
 
-test('Enterprise without a spend limit shows this month raw vs billed and never tints the bar', () => {
+test('Enterprise without a spend limit shows the reduction for today and for all repos this month and never tints the bar', () => {
   const { bar, text, tip, color, bg } = make();
   bar.setBudget(tokensSummary({ plan: enterprisePlan, percent_used: 99 }));
   assert.equal(text(), '$(claude-budget-gauge) No data');
-  assert.match(tip(), /\| Usage \| No data yet \|/);
+  assert.match(tip(), /\| All repos, this month \| No data yet \|/);
   assert.equal(color(), undefined);
   assert.equal(bg(), undefined);
 
@@ -394,12 +394,11 @@ test('Enterprise without a spend limit shows this month raw vs billed and never 
   assert.equal(text(), `$(claude-budget-gauge) ${compact(month.rawTokens)}/${compact(billed)}`);
   assert.equal(color(), undefined, 'there is no real limit to warn about');
   const t = tip();
-  assert.ok(t.includes(`| Raw request | ${compact(month.rawTokens)} tokens |`));
-  assert.ok(t.includes(`| Billed input | ${compact(billed)} units |`));
   const reduction = ((month.rawTokens - billed) / month.rawTokens) * 100;
-  assert.ok(t.includes(`| Reduction | ${reduction.toFixed(1)}% |`));
-  assert.match(t, /No account spend limit on file, so there is no % used/);
-  // The note must not quote fixed cache multipliers.
+  assert.ok(t.includes(`| All repos, this month | ${reduction.toFixed(1)}% — ${compact(month.rawTokens)} → ${compact(billed)} u |`));
+  assert.match(t, /\| Today \| No data yet \|/);
+  assert.doesNotMatch(t, /Raw request|Billed input|No account spend limit/);
+  // No fixed cache multipliers quoted.
   assert.doesNotMatch(t, /0\.10x|1\.25x/);
 });
 
@@ -407,7 +406,7 @@ test('with zero raw tokens the reduction is 0.0% rather than a division by zero'
   const { bar, tip } = make();
   bar.setBudget(tokensSummary({ plan: enterprisePlan }));
   bar.restoreHistory(undefined, undefined, stats({ rawTokens: 0 }), 'm');
-  assert.ok(tip().includes('| Reduction | 0.0% |'));
+  assert.match(tip(), /\| All repos, this month \| 0\.0% — 0 → /);
 });
 
 test('dispose releases the item', () => {

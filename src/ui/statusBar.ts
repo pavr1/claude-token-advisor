@@ -510,22 +510,20 @@ export class StatusBar {
     md.appendMarkdown('| Budget | |\n| --- | --- |\n');
 
     if (mode === 'dollar' && usesMonthUsageView(plan, summary)) {
-      // No account spend limit on file, so no % — show what this month actually moved.
-      const month = this.monthStats;
-      if (month) {
-        const billed = billedUnits(month);
-        const reduction = month.rawTokens > 0 ? ((month.rawTokens - billed) / month.rawTokens) * 100 : 0;
-        md.appendMarkdown(`| Raw request | ${compact(month.rawTokens)} tokens |\n`);
-        md.appendMarkdown(`| Billed input | ${compact(billed)} units |\n`);
-        md.appendMarkdown(`| Reduction | ${reduction.toFixed(1)}% |\n`);
-      } else {
-        md.appendMarkdown('| Usage | No data yet |\n');
-      }
-      // No spend limit can be read without an admin key (docs: latest/admin-key.md), so nothing
-      // dollar-denominated is shown here: tokens and billed units only.
-      md.appendMarkdown(
-        '\n_Raw request is what the client would have sent; Billed input is what Anthropic charged after cleanup, compression and caching (each cache kind at its own rate). No account spend limit on file, so there is no % used._\n\n'
-      );
+      // No account spend limit on file, so no % — show how much the proxy reduced today and across
+      // every repo this month: reduction, then the raw tokens and the billed units behind it.
+      // Nothing dollar-denominated can be shown without an admin key (docs: latest/admin-key.md).
+      const row = (label: string, stats: AggregateStats | undefined): string => {
+        if (!stats) {
+          return `| ${label} | No data yet |\n`;
+        }
+        const billed = billedUnits(stats);
+        const reduction = stats.rawTokens > 0 ? ((stats.rawTokens - billed) / stats.rawTokens) * 100 : 0;
+        return `| ${label} | ${reduction.toFixed(1)}% — ${compact(stats.rawTokens)} → ${compact(billed)} u |\n`;
+      };
+      md.appendMarkdown(row('Today', this.todayStats));
+      md.appendMarkdown(row('All repos, this month', this.monthStats));
+      md.appendMarkdown('\n');
     } else if (mode === 'dollar') {
       // 3.5: real $ figures for Enterprise/API. Prefers the authoritative spend-limit
       // API/file result when one is configured, falls back to this tool's own

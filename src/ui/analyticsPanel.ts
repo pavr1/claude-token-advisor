@@ -440,11 +440,16 @@ function flowCells(
   // A row is tinted on its own basis: tokens say whether the cache worked (was the prefix reused?),
   // units say what it cost (a written token is 12.5x a read one), so the two can disagree.
   const tokensBalance = cacheBalanceStyle(s.cacheReadTokens, s.cacheWriteTokens, 't');
-  const unitsBalance = cacheBalanceStyle(readUnits, writeUnits, 'u');
+  // Units are judged by what the cache did: green when the reads saved more than the writes cost over full price.
+  const unitsBalance = cacheBalanceStyle(s.cacheReadSavedUnits, s.cacheWritePremiumUnits, 'u');
+  // Of the cached tokens, how many were read and how many written.
+  const cached = s.cacheReadTokens + s.cacheWriteTokens;
+  const effectNote = cached > 0 ? `CR: ${Math.round((s.cacheReadTokens / cached) * 100)}% CW: ${Math.round((s.cacheWriteTokens / cached) * 100)}%` : '';
   const cacheCell = (abbr: string, tokens: number, units: number, unpriced: readonly string[] = []): string => {
+    const note = abbr === 'RI' ? '' : effectNote;
     const rate = effectiveRate(units, tokens);
     const tokensTitle = `${abbr}: ${compact(tokens)} t`;
-    const unitsTitle = `${abbr}: ${compact(tokens)} t × ${rate} = ${compact(units)} u. ${unpricedNote(unpriced)}`.replace(/\s+/g, ' ').trim();
+    const unitsTitle = `${abbr}: ${compact(tokens)} t × ${rate} = ${compact(units)} u. ${note} ${unpricedNote(unpriced)}`.replace(/\s+/g, ' ').trim();
     return `<td class="cache-col"><div class="cache-val"${tokensBalance.style} title="${escapeHtml(tokensTitle)}">${compact(tokens)} ${TOKENS_ABBR}</div><div class="cache-val"${unitsBalance.style} title="${escapeHtml(unitsTitle)}">${compact(units)} ${UNITS_ABBR}</div></td>`;
   };
   const receivedTitle = 'RI + CW + CR, as Anthropic reported it';
@@ -460,10 +465,10 @@ function flowCells(
 }
 
 /**
- * Light red when the cache was written more than read, light green when read more than written, on
- * the given basis. The tokens row measures whether the cache worked (was the prefix reused?); the
- * units row measures what it cost, where a written token is 12.5x a read one. The two can disagree:
- * a healthy turn with a large new prefix is green in tokens and red in units.
+ * Light red when the writes outweigh the reads, light green when the reads outweigh the writes, on
+ * the given basis. Tokens: was the prefix reused? Units: what the cache did, so the reads are what
+ * they saved against full price and the writes are what they cost over full price. Raw units would
+ * flag a healthy cache red, because a written token costs 25x a read one on Sonnet 5.5.
  */
 function cacheBalanceStyle(reads: number, writes: number, basis: string): { style: string; note: string } {
   if (writes > reads) {
@@ -619,7 +624,8 @@ function compactionSection(entries: readonly LedgerEntry[]): string {
     config.get<number>('compactionFraction', DEFAULT_OPTIMIZER_CONFIG.compactionFraction) ??
     DEFAULT_OPTIMIZER_CONFIG.compactionFraction;
 
-  const configLine = `<div class="stat-sub">Fires only on a cold cache (over 5 minutes since the last request), once session history reaches ${thresholdTokens.toLocaleString()} tokens (and at least 4 messages), and only once per conversation until it is rebuilt; replaces the oldest ${(
+  const cacheTtl = config.get<string>('cacheTtl', DEFAULT_OPTIMIZER_CONFIG.cacheTtl) === '1h' ? '1 hour' : '5 minute';
+  const configLine = `<div class="stat-sub">Fires only on a cold cache (longer than the ${cacheTtl} cache lifetime since the last request), once session history reaches ${thresholdTokens.toLocaleString()} tokens (and at least 4 messages), and only once per conversation until it is rebuilt; replaces the oldest ${(
     fraction * 100
   ).toFixed(0)}% of it with a Haiku-written summary.</div>`;
 
