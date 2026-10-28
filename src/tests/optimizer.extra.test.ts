@@ -11,6 +11,7 @@ import {
   CACHE_TTL_1H_MS,
   classifyRouting,
   DEFAULT_OPTIMIZER_CONFIG,
+  describePrefixChange,
   describeTail,
   estimateCompactionEconomics,
   hasToolResults,
@@ -228,4 +229,31 @@ test('the cache anchor tolerates an empty history, odd content shapes and manife
   // A last block that is not an object cannot carry a breakpoint.
   const odd = await run({ model: 'claude-sonnet-5', messages: [{ role: 'user', content: [null] }] });
   assert.equal((odd['messages'] as Array<{ content: unknown[] }>)[0].content[0], null);
+});
+
+test('describePrefixChange names the first part of the cacheable prefix that moved', () => {
+  const base = { model: 'm', tools: 't', system: 's', messages: ['a', 'b'] };
+  assert.equal(describePrefixChange(undefined, base), 'first');
+  assert.equal(describePrefixChange(base, { ...base, messages: ['a', 'b', 'c'] }), 'none');
+  assert.equal(describePrefixChange(base, { ...base, messages: ['a'] }), 'shrunk');
+  assert.equal(describePrefixChange(base, { ...base, messages: ['a', 'x'] }), 'msg[1]');
+  assert.equal(describePrefixChange(base, { ...base, system: 'z', messages: ['q'] }), 'system');
+  assert.equal(describePrefixChange(base, { ...base, tools: 'z' }), 'tools');
+  assert.equal(describePrefixChange(base, { ...base, model: 'n' }), 'model');
+});
+
+test('optimizePayload reports prefix changes per conversation and ignores cache_control moves', async () => {
+  const turn = (extra: unknown[], control: boolean) =>
+    ({
+      model: 'claude-sonnet-5-5',
+      system: [{ type: 'text', text: 'sys' }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'prefix-test-unique-start', ...(control ? { cache_control: { type: 'ephemeral' } } : {}) }] }, ...extra],
+    }) as unknown as MessagesPayload;
+  const run = (p: MessagesPayload) => optimizePayload(p, { ...DEFAULT_OPTIMIZER_CONFIG }, {});
+  const first = await run(turn([], true));
+  assert.equal(first.telemetry.clientPrefixChange, 'first');
+  const reply = { role: 'assistant', content: [{ type: 'text', text: 'ok' }] };
+  const second = await run(turn([reply], false));
+  assert.equal(second.telemetry.clientPrefixChange, 'none');
+  assert.equal(second.telemetry.sentPrefixChange, 'none');
 });

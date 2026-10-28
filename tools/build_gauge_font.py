@@ -2,7 +2,7 @@
 
 A status bar glyph normally takes the item's text colour; COLR layers with a fixed
 palette entry keep their own colour instead. E001 is the resting gauge, E002..E007
-are needle positions 1..6 (left to right) used by the sweep animation.
+are needle positions 1..FRAMES (left to right) used by the sweep animation.
 
 Needs: pip install fonttools brotli
 """
@@ -29,7 +29,8 @@ PALETTE = ["#14212e", "#8a9bad", "#3fe0c5", "#ffd166", "#ff7a59", "#000000", "#f
 BG, TRACK, TEAL, AMBER, CORAL, NEEDLE, HUB = range(7)
 
 # Needle angle per frame (degrees, 180 = far left, 0 = far right); rest is option D's.
-FRAME_ANGLES = [165, 135, 105, 75, 45, 15]
+FRAMES = 19  # many small steps so the needle reads as continuous motion
+FRAME_ANGLES = [165 - i * 150 / (FRAMES - 1) for i in range(FRAMES)]
 REST_ANGLE = math.degrees(math.atan2(26, -20))
 NEEDLE_LEN = 32.8
 
@@ -119,7 +120,7 @@ def build() -> None:
     angles = [REST_ANGLE] + FRAME_ANGLES
     needles = {f"l_needle{i}": (needle(a), NEEDLE) for i, a in enumerate(angles)}
     layers = {**shared, **needles}
-    bases = ["claude-budget-gauge"] + [f"claude-budget-gauge-{i}" for i in range(1, 7)]
+    bases = ["claude-budget-gauge"] + [f"claude-budget-gauge-{i}" for i in range(1, FRAMES + 1)]
 
     order = [".notdef"] + list(layers) + bases
     fb = FontBuilder(1000, isTTF=True)

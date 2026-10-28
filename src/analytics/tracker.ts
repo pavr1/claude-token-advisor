@@ -128,6 +128,9 @@ export interface LedgerEntry {
   historyTokens?: number;
   compactionTriggerTokens?: number;
   cacheAnchorPlaced: boolean;
+  /** Where the prefix first differs from the previous request, as sent by the client and as forwarded. Optional: absent on older rows. */
+  clientPrefixChange?: string;
+  sentPrefixChange?: string;
   uncachedInputTokens: number;
   cacheWriteTokens: number;
   /** Part of `cacheWriteTokens` written to the 1 hour cache (billed 2x). Absent before it was recorded. */

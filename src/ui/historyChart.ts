@@ -5,7 +5,20 @@
  */
 
 import { aggregate, LedgerEntry, localDayKey, sentTokens } from '../analytics/tracker';
-import { COLORS, compact, escapeHtml } from './shared';
+import { CHART, compact, escapeHtml } from './shared';
+
+/**
+ * The charts' palette: neutral grey and one blue for the main series, with a muted trio only
+ * where several lines must stay apart. Nothing is saturated, so no series shouts over the rest.
+ */
+const SERIES = {
+  raw: '#7d8794',
+  accent: CHART.accent,
+  sage: '#78a89c',
+  lilac: '#a08cc0',
+  amber: '#c9a35e',
+  copper: '#c98a6a',
+};
 
 /** A range longer than this keeps only its newest days, so every bar stays readable. */
 export const MAX_CHART_DAYS = 62;
@@ -238,7 +251,7 @@ function chartSvg(
   const grid = [0, 1, 2, 3, 4]
     .map((k) => {
       const gy = y((max * k) / 4);
-      const line = k === 0 ? '' : `<line x1="${PAD.left}" y1="${gy.toFixed(1)}" x2="${width - padRight}" y2="${gy.toFixed(1)}" stroke="var(--vscode-widget-border, #444)" stroke-opacity="0.45" stroke-dasharray="3 3"></line>`;
+      const line = k === 0 ? '' : `<line x1="${PAD.left}" y1="${gy.toFixed(1)}" x2="${width - padRight}" y2="${gy.toFixed(1)}" stroke="${CHART.grid}"></line>`;
       // The right axis shares the gridlines, in the colour of the line it measures.
       const right =
         rightLines.length > 0
@@ -263,7 +276,7 @@ function chartSvg(
         const top = y(stackTop + value);
         const barHeight = y(stackTop) - top;
         if (barHeight > 0) {
-          rects += `<rect x="${(centre(i) - barArea / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${barArea.toFixed(1)}" height="${barHeight.toFixed(1)}" fill="${layer.color}" rx="1.5"><title>${escapeHtml(partTip(p, layer))}</title></rect>`;
+          rects += `<rect x="${(centre(i) - barArea / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${barArea.toFixed(1)}" height="${barHeight.toFixed(1)}" fill="${layer.color}" fill-opacity="0.9" rx="2"><title>${escapeHtml(partTip(p, layer))}</title></rect>`;
           // Only a segment tall enough for a line of text carries its figure.
           if (barHeight >= 13) {
             labels += label(value, centre(i), top + barHeight / 2, textOn(layer.color), barArea + 2, undefined, barHeight);
@@ -288,20 +301,20 @@ function chartSvg(
         .map((p, i) => {
           const cx = centre(i).toFixed(1);
           const cy = y(layer.value(p), layer.axis).toFixed(1);
-          return `<g><circle cx="${cx}" cy="${cy}" r="2.5" fill="${layer.color}" stroke="var(--vscode-editor-background, #1e1e1e)" stroke-width="1"></circle><circle cx="${cx}" cy="${cy}" r="8" fill="transparent"><title>${escapeHtml(partTip(p, layer))}</title></circle></g>`;
+          return `<g><circle cx="${cx}" cy="${cy}" r="2.2" fill="${layer.color}" stroke="var(--vscode-editor-background, #1e1e1e)" stroke-width="1.5"></circle><circle cx="${cx}" cy="${cy}" r="8" fill="transparent"><title>${escapeHtml(partTip(p, layer))}</title></circle></g>`;
         })
         .join('');
       // Line figures sit on a pill of the page colour, so they read over any bar behind them.
       const labels = points
         .map((p, i) => label(layer.value(p), centre(i), y(layer.value(p), layer.axis) - 9, `color-mix(in srgb, ${layer.color} 65%, var(--vscode-foreground, #888))`, slot + 12, 'var(--vscode-editor-background, #1e1e1e)'))
         .join('');
-      return `<polyline points="${coords.join(' ')}" fill="none" stroke="${layer.color}" stroke-width="1.8" stroke-linejoin="round" pointer-events="none"></polyline>${dots}<g pointer-events="none">${labels}</g>`;
+      return `<polyline points="${coords.join(' ')}" fill="none" stroke="${layer.color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" pointer-events="none"></polyline>${dots}<g pointer-events="none">${labels}</g>`;
     })
     .join('');
 
   return `<svg viewBox="0 0 ${width} ${height}" class="chart" role="img" aria-label="${escapeHtml(ariaLabel)}">
     ${grid}
-    <line x1="${PAD.left}" y1="${PAD.top + plotH}" x2="${width - padRight}" y2="${PAD.top + plotH}" stroke="var(--vscode-widget-border, #444)"></line>
+    <line x1="${PAD.left}" y1="${PAD.top + plotH}" x2="${width - padRight}" y2="${PAD.top + plotH}" stroke="${CHART.target}" stroke-opacity="0.5"></line>
     ${columns}${overlays}
   </svg>`;
 }
@@ -337,13 +350,13 @@ export function historyChartsHtml(
   const points = singleDay ? series.slice(firstActive) : series;
 
   const flowBars: Layer[] = [
-    { name: 'Raw', unit: 'tokens', color: COLORS.muted, value: (p) => p.raw },
-    { name: 'Received', unit: 'tokens', color: COLORS.info, value: (p) => p.received },
+    { name: 'Raw', unit: 'tokens', color: SERIES.raw, value: (p) => p.raw },
+    { name: 'Received', unit: 'tokens', color: SERIES.accent, value: (p) => p.received },
   ];
   const flowLines: Layer[] = [
-    { name: 'Cleanup removed', unit: 'tokens', color: COLORS.teal, value: (p) => p.cleaned },
-    { name: 'Summarized removed', unit: 'tokens', color: COLORS.accent, value: (p) => p.summarized },
-    { name: 'Billed', unit: 'units', color: COLORS.warn, value: (p) => p.billed, axis: 'right' },
+    { name: 'Cleanup removed', unit: 'tokens', color: SERIES.sage, value: (p) => p.cleaned },
+    { name: 'Summarized removed', unit: 'tokens', color: SERIES.lilac, value: (p) => p.summarized },
+    { name: 'Billed', unit: 'units', color: SERIES.amber, value: (p) => p.billed, axis: 'right' },
   ];
   const flow = chartSvg(points, flowBars, 'Raw and received tokens per period, with removals and billed units as lines', FLOW_WIDTH, 260, flowLines);
   // Units are tokens × the model's price for that kind of token, so the tooltip shows the average rate.
@@ -355,16 +368,16 @@ export function historyChartsHtml(
     chartSvg(
       points,
       [
-        { name: 'CR', unit, color: COLORS.good, value: read, note: unit === 'units' ? avgRate((p) => p.readUnits, (p) => p.readTokens) : undefined, warning: unit === 'units' ? unpricedWarning('CR', (p) => p.unpricedRead) : undefined },
-        { name: 'CW', unit, color: COLORS.bad, value: write, note: unit === 'units' ? avgRate((p) => p.writeUnits, (p) => p.writeTokens) : undefined, warning: unit === 'units' ? unpricedWarning('CW', (p) => p.unpricedWrite) : undefined },
+        { name: 'CR', unit, color: SERIES.accent, value: read, note: unit === 'units' ? avgRate((p) => p.readUnits, (p) => p.readTokens) : undefined, warning: unit === 'units' ? unpricedWarning('CR', (p) => p.unpricedRead) : undefined },
+        { name: 'CW', unit, color: SERIES.copper, value: write, note: unit === 'units' ? avgRate((p) => p.writeUnits, (p) => p.writeTokens) : undefined, warning: unit === 'units' ? unpricedWarning('CW', (p) => p.unpricedWrite) : undefined },
       ],
       `CR versus CW ${unit === 'tokens' ? 't' : 'u'} per period`,
       HALF_WIDTH,
       240
     );
   const cacheLegend = legend([
-    { name: 'CR', color: COLORS.good },
-    { name: 'CW', color: COLORS.bad },
+    { name: 'CR', color: SERIES.accent },
+    { name: 'CW', color: SERIES.copper },
   ]);
 
   return `<h2>History</h2>
@@ -372,11 +385,11 @@ export function historyChartsHtml(
     <div class="stat-label" style="text-transform:none">Request flow: tokens on the left axis, Billed units on the right</div>
     ${flow}
     ${legend([
-      { name: 'Raw', color: COLORS.muted },
-      { name: 'Received', color: COLORS.info },
-      { name: 'Cleanup removed (line)', color: COLORS.teal },
-      { name: 'Summarized removed (line)', color: COLORS.accent },
-      { name: 'Billed, units (line, right axis)', color: COLORS.warn },
+      { name: 'Raw', color: SERIES.raw },
+      { name: 'Received', color: SERIES.accent },
+      { name: 'Cleanup removed (line)', color: SERIES.sage },
+      { name: 'Summarized removed (line)', color: SERIES.lilac },
+      { name: 'Billed, units (line, right axis)', color: SERIES.amber },
     ])}
   </div>
   <div class="chart-grid" style="margin-top:14px">

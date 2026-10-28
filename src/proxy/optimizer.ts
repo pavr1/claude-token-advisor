@@ -300,6 +300,14 @@ export interface OptimizationTelemetry {
    * best case for the client, so the baseline built on it is a floor on the saving.
    */
   floorCachedTokens?: number;
+  /**
+   * Where the request's cacheable prefix first differs from the previous request of the
+   * same conversation (see `describePrefixChange`), for what the client sent and for what
+   * the proxy forwarded. A change in `sentPrefixChange` with none in `clientPrefixChange`
+   * means the proxy broke the cache. Optional: absent on older rows.
+   */
+  clientPrefixChange?: string;
+  sentPrefixChange?: string;
 }
 
 export interface OptimizationResult {
@@ -807,6 +815,84 @@ export class BaselineMemory {
 function hashMessages(messages: Array<Record<string, unknown>>): string {
   const { messages: stable } = stripMessageCacheControl(messages);
   return createHash('sha256').update(JSON.stringify(stable)).digest('hex');
+}
+
+interface PrefixFingerprint {
+  model: string;
+  tools: string;
+  system: string;
+  messages: string[];
+}
+
+const sha = (value: unknown): string => createHash('sha256').update(JSON.stringify(value ?? null)).digest('hex').slice(0, 16);
+
+/** Drops `cache_control` (client breakpoints move every turn) so only real content is compared. */
+function withoutCacheControl(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(withoutCacheControl);
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (key !== 'cache_control') {
+        out[key] = withoutCacheControl(child);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+function fingerprintPrefix(payload: MessagesPayload): PrefixFingerprint {
+  const record = payload as Record<string, unknown>;
+  return {
+    model: String(record['model'] ?? ''),
+    tools: sha(withoutCacheControl(record['tools'])),
+    system: sha(withoutCacheControl(record['system'])),
+    messages: ((record['messages'] as unknown[] | undefined) ?? []).map((message) => sha(withoutCacheControl(message))),
+  };
+}
+
+/**
+ * First place the cacheable prefix differs from the previous request, in the order the API
+ * builds it (tools, system, messages): 'model', 'tools', 'system', 'msg[i]', 'shrunk' when
+ * the history got shorter, or 'none' when the previous prefix is still intact.
+ */
+export function describePrefixChange(previous: PrefixFingerprint | undefined, current: PrefixFingerprint): string {
+  if (!previous) {
+    return 'first';
+  }
+  if (previous.model !== current.model) {
+    return 'model';
+  }
+  if (previous.tools !== current.tools) {
+    return 'tools';
+  }
+  if (previous.system !== current.system) {
+    return 'system';
+  }
+  const shared = Math.min(previous.messages.length, current.messages.length);
+  for (let i = 0; i < shared; i += 1) {
+    if (previous.messages[i] !== current.messages[i]) {
+      return `msg[${i}]`;
+    }
+  }
+  return current.messages.length < previous.messages.length ? 'shrunk' : 'none';
+}
+
+const MAX_TRACKED_CONVERSATIONS = 64;
+const lastClientPrefix = new Map<string, PrefixFingerprint>();
+const lastSentPrefix = new Map<string, PrefixFingerprint>();
+
+function trackPrefix(store: Map<string, PrefixFingerprint>, key: string, payload: MessagesPayload): string {
+  const current = fingerprintPrefix(payload);
+  const change = describePrefixChange(store.get(key), current);
+  store.delete(key);
+  store.set(key, current);
+  if (store.size > MAX_TRACKED_CONVERSATIONS) {
+    store.delete(store.keys().next().value as string);
+  }
+  return change;
 }
 
 /**
@@ -1470,6 +1556,10 @@ export async function optimizePayload(
   if (config.forceFiveMinuteCache) {
     payload = forceFiveMinuteCache(payload);
   }
+
+  const conversationKey = hashMessages((original.messages ?? []).slice(0, 1));
+  telemetry.clientPrefixChange = trackPrefix(lastClientPrefix, conversationKey, original);
+  telemetry.sentPrefixChange = trackPrefix(lastSentPrefix, conversationKey, payload);
 
   telemetry.optimizedTokens = Math.max(0, rawTokens + estimatePayloadTokens(payload) - estimatedOriginal);
   options.onStage?.({ optimizedTokens: telemetry.optimizedTokens });

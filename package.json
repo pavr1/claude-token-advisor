@@ -2,7 +2,7 @@
   "name": "claude-budget-advisor",
   "displayName": "Claude Budget Advisor & Token Improver",
   "description": "Tracks Claude Code project token pacing and monthly budget health, and runs a local optimizing proxy that prunes outgoing Anthropic Messages API traffic.",
-  "version": "0.2.51",
+  "version": "0.2.57",
   "publisher": "pablo-villalobos",
   "engines": {
     "vscode": "^1.95.0"
@@ -244,6 +244,97 @@
         "default": {
           "fontPath": "./media/budget-icons.woff",
           "fontCharacter": "\\E007"
+        }
+      },
+      "claude-budget-gauge-7": {
+        "description": "Budget gauge animation frame 7 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E008"
+        }
+      },
+      "claude-budget-gauge-8": {
+        "description": "Budget gauge animation frame 8 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E009"
+        }
+      },
+      "claude-budget-gauge-9": {
+        "description": "Budget gauge animation frame 9 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00A"
+        }
+      },
+      "claude-budget-gauge-10": {
+        "description": "Budget gauge animation frame 10 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00B"
+        }
+      },
+      "claude-budget-gauge-11": {
+        "description": "Budget gauge animation frame 11 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00C"
+        }
+      },
+      "claude-budget-gauge-12": {
+        "description": "Budget gauge animation frame 12 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00D"
+        }
+      },
+      "claude-budget-gauge-13": {
+        "description": "Budget gauge animation frame 13 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00E"
+        }
+      },
+      "claude-budget-gauge-14": {
+        "description": "Budget gauge animation frame 14 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00F"
+        }
+      },
+      "claude-budget-gauge-15": {
+        "description": "Budget gauge animation frame 15 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E010"
+        }
+      },
+      "claude-budget-gauge-16": {
+        "description": "Budget gauge animation frame 16 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E011"
+        }
+      },
+      "claude-budget-gauge-17": {
+        "description": "Budget gauge animation frame 17 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E012"
+        }
+      },
+      "claude-budget-gauge-18": {
+        "description": "Budget gauge animation frame 18 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E013"
+        }
+      },
+      "claude-budget-gauge-19": {
+        "description": "Budget gauge animation frame 19 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E014"
         }
       }
     }

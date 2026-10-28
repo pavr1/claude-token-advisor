@@ -139,7 +139,7 @@ test('a turn in flight spins the leading icon, overlapping turns keep it up, and
   bar.beginRequest();
   bar.beginRequest();
   assert.equal(bar.isBusy, true);
-  assert.equal(text(), '$(claude-budget-gauge-6) 42.50% $(pass-filled)');
+  assert.equal(text(), '$(claude-budget-gauge-19) 42.50% $(pass-filled)');
   bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
   assert.equal(bar.isBusy, true, 'one request still running');
   bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
@@ -151,29 +151,33 @@ test('a turn in flight spins the leading icon, overlapping turns keep it up, and
   assert.equal(bar.isBusy, true);
 });
 
-test('the gauge needle oscillates between its frames while busy without snapping back, and rests when the last turn lands', (t) => {
+test('the gauge needle wanders randomly while busy and sinks to rest step by step when the last turn lands', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { bar, text } = make();
   bar.setBudget(tokensSummary());
   bar.beginRequest();
   bar.beginRequest(); // overlapping request must not start a second timer
-  const seen: string[] = [text()];
-  const dwell = [260, 150, 90, 70, 120, 300, 130];
-  for (const ms of dwell) {
-    t.mock.timers.tick(ms - 1);
-    assert.equal(text(), seen[seen.length - 1], 'holds its frame until the dwell elapses');
-    t.mock.timers.tick(1);
-    seen.push(text());
+  const frameOf = (): number => Number(/gauge-(\d+)/.exec(text())?.[1]);
+  const seen = [frameOf()];
+  for (let i = 0; i < 200; i += 1) {
+    t.mock.timers.tick(55);
+    seen.push(frameOf());
   }
-  assert.deepEqual(
-    seen.map((s) => s.split(' ')[0]),
-    [6, 5, 4, 3, 2, 1, 2, 3].map((n) => `$(claude-budget-gauge-${n})`)
-  );
+  assert.equal(seen[0], 19, 'starts at rest');
+  assert.ok(seen.every((n) => n >= 1 && n <= 19), 'stays on the scale');
+  assert.ok(new Set(seen).size > 6, 'wanders over many positions');
   bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
-  t.mock.timers.tick(80);
+  t.mock.timers.tick(55);
   assert.ok(text().startsWith('$(claude-budget-gauge-'), 'still animating with one request left');
   bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
-  assert.equal(text(), '$(claude-budget-gauge) 42.50% $(pass-filled)');
+  const sinking: number[] = [];
+  for (let i = 0; i < 60 && text().startsWith('$(claude-budget-gauge-'); i += 1) {
+    t.mock.timers.tick(55);
+    sinking.push(frameOf());
+  }
+  const rising = sinking.filter((n) => !Number.isNaN(n));
+  assert.ok(rising.every((n, i) => i === 0 || n >= rising[i - 1]), 'only moves toward rest');
+  assert.equal(text(), '$(claude-budget-gauge) 42.50% $(pass-filled)', 'ends at rest');
   t.mock.timers.tick(1000);
   assert.equal(text(), '$(claude-budget-gauge) 42.50% $(pass-filled)', 'timer stopped');
 });
@@ -201,7 +205,7 @@ test('a proxy error adds a warning while idle, hides while busy, and clears on t
   bar.reportProxyError('upstream down');
   assert.equal(text(), '$(claude-budget-gauge) 42.50% $(pass-filled) · $(warning)');
   bar.beginRequest();
-  assert.equal(text(), '$(claude-budget-gauge-6) 42.50% $(pass-filled)');
+  assert.equal(text(), '$(claude-budget-gauge-19) 42.50% $(pass-filled)');
   bar.reportTurn(stats(), stats(), stats(), 'm');
   assert.equal(text(), '$(claude-budget-gauge) 42.50% $(pass-filled)');
 
@@ -410,4 +414,11 @@ test('dispose releases the item', () => {
   const { bar, item } = make();
   bar.dispose();
   assert.equal(item.disposed, true);
+});
+
+test('the tooltip title shows the extension version when it is known', () => {
+  const bar = new StatusBar({ ...IDLE }, MENU, '9.8.7');
+  bar.setBudget(tokensSummary());
+  const tip = String((fake.statusBarItems[fake.statusBarItems.length - 1].tooltip as { value?: string }).value ?? '');
+  assert.match(tip, /### Claude Budget Advisor v9\.8\.7/);
 });

@@ -272,10 +272,9 @@ test('the daily chart marks today, days over target, and says so when empty', ()
   assert.match(html, /aria-label="Daily token usage"/);
   assert.match(html, /Day 4: 20,000 tokens \(today\)|Day 4: 20.000 tokens \(today\)|Day 4: [\d.,\s  ]+ tokens \(today\)/);
   assert.match(html, /tokens — over target/);
-  assert.match(html, /fill="#3794ff"/);
-  assert.match(html, /fill="#f14c4c"/);
-  assert.match(html, /fill="#3fb950"/);
-  assert.match(html, /opacity="0\.15"/);
+  assert.match(html, /fill="#6b8fc7"/);
+  assert.match(html, /fill="#c96a67"/);
+  assert.match(html, /opacity="0\.12"/);
   assert.ok(html.includes(`daily target ${compact(30_000)}`));
   assert.match(html, /day 4<\/text>/);
   assert.match(buildBudgetSectionHtml(summary()), /No daily usage yet\./);
@@ -283,7 +282,7 @@ test('the daily chart marks today, days over target, and says so when empty', ()
 
 test('the daily chart copes with a zero target and zero usage', () => {
   const html = buildBudgetSectionHtml(summary({ daily_series: [{ day: 1, tokens: 0 }], recommended_daily_tokens: 0 }));
-  assert.match(html, /<svg viewBox="0 0 720 180"/);
+  assert.match(html, /<svg viewBox="0 0 720 190"/);
 });
 
 test('month over month needs two months, marks months above budget, and says so otherwise', () => {
@@ -291,8 +290,8 @@ test('month over month needs two months, marks months above budget, and says so 
     summary({ history: [{ month: '2026-09', tokens: 1_500_000 }, { month: '2026-10', tokens: 400_000 }] })
   );
   assert.match(html, /2026-09/);
-  assert.match(html, /background:#f14c4c"><\/div><\/div>\s*<div class="bar-value">1\.50M/);
-  assert.match(html, /background:#3794ff"><\/div><\/div>\s*<div class="bar-value">400\.00K/);
+  assert.match(html, /background:#c96a67"><\/div><\/div>\s*<div class="bar-value">1\.50M/);
+  assert.match(html, /background:#6b8fc7"><\/div><\/div>\s*<div class="bar-value">400\.00K/);
   assert.match(buildBudgetSectionHtml(summary({ history: [{ month: '2026-09', tokens: 1 }] })), /Not enough history yet to compare months\./);
 });
 

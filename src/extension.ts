@@ -826,6 +826,8 @@ function onTurnCompleted(record: TurnRecord): void {
     rawTokensExact: record.telemetry.rawTokensExact,
     cacheWrite1hTokens: cost.cacheWrite1hTokens,
     cacheAnchorPlaced: record.telemetry.cacheAnchorPlaced,
+    clientPrefixChange: record.telemetry.clientPrefixChange,
+    sentPrefixChange: record.telemetry.sentPrefixChange,
     uncachedInputTokens: cost.uncachedInputTokens,
     cacheWriteTokens: cost.cacheWriteTokens,
     cacheReadTokens: cost.cacheReadTokens,
@@ -1390,7 +1392,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // One status bar item for both features.
   statusBar = new StatusBar(
     { running: false, address: `http://127.0.0.1:${readProxyConfig().port}`, cavemanAvailable: false },
-    `${BUDGET_SECTION}.showMenu`
+    `${BUDGET_SECTION}.showMenu`,
+    context.extension.packageJSON?.version as string | undefined
   );
   context.subscriptions.push(output, { dispose: () => statusBar?.dispose() });
 

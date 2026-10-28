@@ -76,6 +76,23 @@ export const COLORS = {
   teal: '#4ec9b0',
 };
 
+/**
+ * The restrained palette of the dashboard charts: one accent for the data, a muted red
+ * reserved for going over target, and neutral grey for scaffolding. Colour carries
+ * meaning only where something needs attention.
+ */
+export const CHART = {
+  accent: '#6b8fc7',
+  over: '#c96a67',
+  grid: 'rgba(128, 128, 128, 0.18)',
+  target: 'rgba(160, 160, 160, 0.75)',
+};
+
+/** The accent at a given strength (0-100), for ranked series that share one hue. */
+export function accentShade(strength: number): string {
+  return `color-mix(in srgb, ${CHART.accent} ${Math.round(strength)}%, transparent)`;
+}
+
 export const CATEGORICAL_PALETTE = [
   COLORS.info,
   COLORS.good,
@@ -155,15 +172,17 @@ export const BASE_STYLES = `
   .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px 24px; }
   .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.75em; opacity: 0.8; margin-top: 2px; }
   .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+  .chart rect { transition: opacity 0.15s ease; }
+  .chart rect:hover { opacity: 1; }
   .axis { font-size: 10px; fill: var(--vscode-descriptionForeground, #999); }
   .bar-row { display: grid; grid-template-columns: 210px 1fr 150px; align-items: center; gap: 10px; margin-bottom: 8px; }
   .bar-name { font-size: 0.82em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
-  .bar-track { background: var(--vscode-input-background, #2a2a2a); border-radius: 4px; height: 14px; overflow: hidden; border: 1px solid var(--vscode-widget-border, #444); }
-  .bar-fill { height: 100%; }
+  .bar-track { background: rgba(128, 128, 128, 0.14); border-radius: 3px; height: 6px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
   .bar-value { font-size: 0.78em; text-align: right; opacity: 0.85; }
   .tier { font-size: 0.72em; padding: 1px 6px; border-radius: 8px; color: #111; font-weight: 600; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
-  .stacked { display: flex; height: 18px; border-radius: 4px; overflow: hidden; margin-bottom: 14px; border: 1px solid var(--vscode-widget-border, #444); }
+  .dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; flex: 0 0 auto; }
+  .stacked { display: flex; gap: 2px; height: 8px; border-radius: 4px; overflow: hidden; margin-bottom: 16px; }
   .stacked div { height: 100%; }
   .alert { padding: 8px 12px; border-radius: 4px; margin-bottom: 6px; font-size: 0.82em; border-left: 3px solid; }
   .alert.critical { background: rgba(241,76,76,0.12); border-color: #f14c4c; }

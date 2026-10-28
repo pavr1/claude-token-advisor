@@ -38,17 +38,16 @@ export interface ProxyContext {
 }
 
 /**
- * Needle positions in `media/budget-icons.woff` are `claude-budget-gauge-1..6`,
- * right (high) to left (low). The animation oscillates: it starts at the resting
- * position (6), sweeps up to 1 and back down, so the needle never snaps back.
+ * Needle positions in `media/budget-icons.woff` are `claude-budget-gauge-1..19`, from full
+ * scale (1) to rest (19). While busy the needle behaves like a current meter: it picks a
+ * random reading from 0 to 100 %, sometimes a small nudge and sometimes a long jump, eases
+ * toward it, hovers there a moment, then picks another. When the work ends it sinks back to
+ * rest step by step instead of snapping.
  */
-const GAUGE_SWEEP = [6, 5, 4, 3, 2, 1, 2, 3, 4, 5];
-/**
- * How long each `GAUGE_SWEEP` step is held before moving on, in ms. Uneven on purpose:
- * the needle lingers at the ends and snaps through the middle, like an electricity
- * meter's, and the way back is not a mirror of the way out.
- */
-const GAUGE_DWELL_MS = [260, 150, 90, 70, 120, 300, 130, 80, 90, 170];
+const GAUGE_FRAMES = 19;
+const GAUGE_TICK_MS = 55;
+const GAUGE_REST = GAUGE_FRAMES;
+const pctToPos = (pct: number): number => GAUGE_FRAMES - (pct / 100) * (GAUGE_FRAMES - 1);
 
 export class StatusBar {
   private readonly item: vscode.StatusBarItem;
@@ -84,8 +83,11 @@ export class StatusBar {
    */
   private inFlight = 0;
 
-  /** Current step in `GAUGE_SWEEP` (0-based) and the timer stepping it while busy. */
-  private gaugeFrame = 0;
+  /** Needle position (1 = full scale .. 19 = rest), where it is heading, ticks left hovering, and whether it is sinking to rest. */
+  private gaugePos = GAUGE_REST;
+  private gaugeTarget = GAUGE_REST;
+  private gaugeHold = 0;
+  private gaugeReturning = false;
   private gaugeTimer: ReturnType<typeof setTimeout> | undefined;
 
   /** Whether a proxied request from this window is still running. */
@@ -96,7 +98,7 @@ export class StatusBar {
   /** 3b.3: running output token count for the currently-streaming turn, or undefined between turns. */
   private streamProgressTokens: number | undefined;
 
-  constructor(proxy: ProxyContext, menuCommand: string) {
+  constructor(proxy: ProxyContext, menuCommand: string, private readonly version?: string) {
     this.proxy = proxy;
     // The gauge is its own item, one slot left of the text, so the text's colour
     // thresholds never tint the icon.
@@ -175,20 +177,61 @@ export class StatusBar {
    * colour do not depend on the frame.
    */
   private startGaugeAnimation(): void {
+    this.gaugeReturning = false;
     if (this.gaugeTimer) {
       return;
     }
-    this.gaugeFrame = 0;
+    this.gaugePos = GAUGE_REST;
+    this.gaugeTarget = GAUGE_REST;
+    this.gaugeHold = 0;
     this.scheduleGaugeStep();
+  }
+
+  private pickGaugeTarget(): void {
+    const current = ((GAUGE_REST - this.gaugePos) / (GAUGE_FRAMES - 1)) * 100;
+    // Half the time a nudge of 5-25 points, otherwise a jump anywhere on the scale.
+    const pct = Math.random() < 0.5 ? current + (Math.random() < 0.5 ? -1 : 1) * (5 + Math.random() * 20) : Math.random() * 100;
+    this.gaugeTarget = pctToPos(Math.min(100, Math.max(0, pct)));
+    this.gaugeHold = Math.floor(Math.random() * 6);
+  }
+
+  private stepGauge(): void {
+    if (this.gaugeReturning) {
+      this.gaugePos = Math.min(GAUGE_REST, this.gaugePos + Math.max(0.6, (GAUGE_REST - this.gaugePos) * 0.12));
+      return;
+    }
+    const distance = this.gaugeTarget - this.gaugePos;
+    if (Math.abs(distance) > 0.5) {
+      this.gaugePos += Math.sign(distance) * Math.max(0.6, Math.abs(distance) * 0.35);
+    } else if (this.gaugeHold > 0) {
+      this.gaugeHold -= 1;
+      this.gaugePos = Math.min(GAUGE_REST, Math.max(1, this.gaugePos + (Math.random() - 0.5) * 1.2));
+    } else {
+      this.pickGaugeTarget();
+    }
   }
 
   private scheduleGaugeStep(): void {
     this.gaugeTimer = setTimeout(() => {
-      this.gaugeFrame = (this.gaugeFrame + 1) % GAUGE_SWEEP.length;
+      this.gaugeTimer = undefined;
+      this.stepGauge();
+      if (this.gaugeReturning && this.gaugePos >= GAUGE_REST) {
+        this.gaugeReturning = false;
+      } else {
+        this.scheduleGaugeStep();
+      }
       this.gaugeItem.text = this.buildGaugeText();
-      this.scheduleGaugeStep();
-    }, GAUGE_DWELL_MS[this.gaugeFrame]);
+    }, GAUGE_TICK_MS);
     this.gaugeTimer.unref?.();
+  }
+
+  /** The turn ended: let the needle sink to rest on its own timer. */
+  private releaseGauge(): void {
+    if (Math.round(this.gaugePos) >= GAUGE_REST) {
+      this.stopGaugeAnimation();
+    } else if (this.gaugeTimer) {
+      this.gaugeReturning = true;
+    }
   }
 
   private stopGaugeAnimation(): void {
@@ -196,7 +239,8 @@ export class StatusBar {
       clearTimeout(this.gaugeTimer);
       this.gaugeTimer = undefined;
     }
-    this.gaugeFrame = 0;
+    this.gaugeReturning = false;
+    this.gaugePos = GAUGE_REST;
   }
 
   /** 3b.3: the running output token count for a live "↓ tokens" indicator, owner-window-local only. */
@@ -223,7 +267,7 @@ export class StatusBar {
     this.proxyError = undefined;
     if (this.inFlight === 0) {
       this.streamProgressTokens = undefined;
-      this.stopGaugeAnimation();
+      this.releaseGauge();
     }
     this.render();
   }
@@ -296,7 +340,10 @@ export class StatusBar {
   }
 
   private buildGaugeText(): string {
-    return this.inFlight > 0 ? `$(claude-budget-gauge-${GAUGE_SWEEP[this.gaugeFrame]})` : '$(claude-budget-gauge)';
+    if (!this.gaugeTimer) {
+      return this.inFlight > 0 ? `$(claude-budget-gauge-${GAUGE_REST})` : '$(claude-budget-gauge)';
+    }
+    return `$(claude-budget-gauge-${Math.min(GAUGE_FRAMES, Math.max(1, Math.round(this.gaugePos)))})`;
   }
 
   private renderGauge(): void {
@@ -425,7 +472,7 @@ export class StatusBar {
     // session/weekly % (5.3, not yet built) — tokens remain the safe default there.
     const plan = this.budget ? extractPlanInfo(this.budget) : undefined;
     const planSuffix = plan ? ` (${planLabel(plan)})` : '';
-    md.appendMarkdown('### Claude Budget Advisor\n\n');
+    md.appendMarkdown(`### Claude Budget Advisor${this.version ? ` v${this.version}` : ''}\n\n`);
     if (this.currentAccountEmail) {
       md.appendMarkdown(`Account: ${this.currentAccountEmail}${planSuffix}\n\n`);
     }

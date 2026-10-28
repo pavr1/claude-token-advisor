@@ -443,8 +443,8 @@ function flowCells(
   const unitsBalance = cacheBalanceStyle(readUnits, writeUnits, 'u');
   const cacheCell = (abbr: string, tokens: number, units: number, unpriced: readonly string[] = []): string => {
     const rate = effectiveRate(units, tokens);
-    const tokensTitle = `${abbr}: ${compact(tokens)} t, ${share(tokens)} of Received. ${tokensBalance.note}`.trim();
-    const unitsTitle = `${abbr}: ${compact(tokens)} t × ${rate} = ${compact(units)} u. ${unpricedNote(unpriced)} ${unitsBalance.note}`.replace(/\s+/g, ' ').trim();
+    const tokensTitle = `${abbr}: ${compact(tokens)} t`;
+    const unitsTitle = `${abbr}: ${compact(tokens)} t × ${rate} = ${compact(units)} u. ${unpricedNote(unpriced)}`.replace(/\s+/g, ' ').trim();
     return `<td class="cache-col"><div class="cache-val"${tokensBalance.style} title="${escapeHtml(tokensTitle)}">${compact(tokens)} ${TOKENS_ABBR}</div><div class="cache-val"${unitsBalance.style} title="${escapeHtml(unitsTitle)}">${compact(units)} ${UNITS_ABBR}</div></td>`;
   };
   const receivedTitle = 'RI + CW + CR, as Anthropic reported it';

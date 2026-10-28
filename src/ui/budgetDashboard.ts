@@ -7,7 +7,7 @@
  */
 
 import * as vscode from 'vscode';
-import { CATEGORICAL_PALETTE, COLORS, compact, donutChart, escapeHtml } from './shared';
+import { accentShade, CHART, COLORS, compact, donutChart, escapeHtml } from './shared';
 import { extractPlanInfo, formatRateLimitWindow, planLabel, planViewMode, resolveStatusPercent } from './planView';
 import { UnifiedRateLimitSnapshot } from '../proxy/server';
 
@@ -148,34 +148,50 @@ function dailyChart(series: Array<{ day: number; tokens: number }>, target: numb
   }
 
   const width = 720;
-  const height = 180;
-  const padding = 28;
+  const height = 190;
+  const left = 40;
+  const right = 12;
+  const top = 14;
+  const bottom = 26;
+  const plotH = height - top - bottom;
   const maxTokens = Math.max(target, ...series.map((point) => point.tokens)) || 1;
-  const slot = (width - padding * 2) / series.length;
-  const barWidth = Math.max(slot - 3, 2);
+  const slot = (width - left - right) / series.length;
+  const barWidth = Math.max(slot * 0.62, 2);
+  const yOf = (tokens: number): number => top + plotH - (tokens / maxTokens) * plotH;
 
-  const bars = series
-    .map((point, index) => {
-      const barHeight = (point.tokens / maxTokens) * (height - padding * 2);
-      const x = padding + index * slot;
-      const y = height - padding - barHeight;
-      const fill = point.day === today ? COLORS.info : point.tokens > target ? COLORS.bad : COLORS.good;
-      const tooltip = escapeHtml(
-        `Day ${point.day}: ${point.tokens.toLocaleString()} tokens${point.day === today ? ' (today)' : point.tokens > target ? ' — over target' : ''}`
-      );
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${Math.max(barHeight, 0).toFixed(1)}" rx="2" fill="${fill}" opacity="${point.tokens ? 0.95 : 0.15}" data-tooltip="${tooltip}"></rect>`;
+  const grid = [0, 0.5, 1]
+    .map((fraction) => {
+      const y = yOf(maxTokens * fraction).toFixed(1);
+      return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}" stroke="${CHART.grid}" stroke-width="1"></line>
+    <text x="${left - 8}" y="${(Number(y) + 3).toFixed(1)}" text-anchor="end" class="axis">${compact(maxTokens * fraction)}</text>`;
     })
     .join('');
 
-  const targetY = height - padding - (target / maxTokens) * (height - padding * 2);
+  const bars = series
+    .map((point, index) => {
+      const barHeight = (point.tokens / maxTokens) * plotH;
+      const x = left + index * slot + (slot - barWidth) / 2;
+      const y = top + plotH - barHeight;
+      const isToday = point.day === today;
+      const over = point.tokens > target;
+      const fill = over ? CHART.over : CHART.accent;
+      const opacity = !point.tokens ? 0.12 : isToday ? 1 : over ? 0.85 : 0.55;
+      const tooltip = escapeHtml(
+        `Day ${point.day}: ${point.tokens.toLocaleString()} tokens${isToday ? ' (today)' : over ? ' — over target' : ''}`
+      );
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${Math.max(barHeight, 0).toFixed(1)}" rx="2" fill="${fill}" opacity="${opacity}" data-tooltip="${tooltip}"></rect>`;
+    })
+    .join('');
+
+  const targetY = yOf(target).toFixed(1);
 
   return `<svg viewBox="0 0 ${width} ${height}" class="chart" role="img" aria-label="Daily token usage">
-    <line x1="${padding}" y1="${height - padding}" x2="${width - padding}" y2="${height - padding}" stroke="var(--vscode-widget-border, #444)" stroke-width="1"></line>
-    <line x1="${padding}" y1="${targetY.toFixed(1)}" x2="${width - padding}" y2="${targetY.toFixed(1)}" stroke="${COLORS.warn}" stroke-width="1.5" stroke-dasharray="6 4"></line>
-    <text x="${width - padding}" y="${(targetY - 6).toFixed(1)}" text-anchor="end" class="axis">daily target ${compact(target)}</text>
+    ${grid}
+    <line x1="${left}" y1="${targetY}" x2="${width - right}" y2="${targetY}" stroke="${CHART.target}" stroke-width="1" stroke-dasharray="4 4"></line>
+    <text x="${width - right}" y="${(Number(targetY) - 5).toFixed(1)}" text-anchor="end" class="axis">daily target ${compact(target)}</text>
     ${bars}
-    <text x="${padding}" y="${height - 8}" class="axis">day 1</text>
-    <text x="${width - padding}" y="${height - 8}" text-anchor="end" class="axis">day ${series.length}</text>
+    <text x="${left}" y="${height - 8}" class="axis">day 1</text>
+    <text x="${width - right}" y="${height - 8}" text-anchor="end" class="axis">day ${series.length}</text>
   </svg>`;
 }
 
@@ -191,7 +207,7 @@ function historyChart(history: Array<{ month: string; tokens: number }>, budget:
         item.month,
         compact(item.tokens),
         (item.tokens / maxTokens) * 100,
-        item.tokens > budget ? COLORS.bad : COLORS.info,
+        item.tokens > budget ? CHART.over : CHART.accent,
         `${item.month}: ${item.tokens.toLocaleString()} tokens vs a budget of ${compact(budget)}`
       )
     )
@@ -211,7 +227,7 @@ function projectChart(projects: Array<Record<string, unknown>>): string {
       const name = String(item['project'] ?? 'unknown');
       const tokens = Number(item['tokens'] ?? 0);
       const percent = Number(item['percent'] ?? 0);
-      const color = CATEGORICAL_PALETTE[index % CATEGORICAL_PALETTE.length];
+      const color = accentShade(Math.max(100 - index * 14, 28));
       return dashboardBarRow(
         name,
         `${compact(tokens)} · ${percent.toFixed(2)}%`,
@@ -227,7 +243,7 @@ function projectChart(projects: Array<Record<string, unknown>>): string {
       const name = String(item['project'] ?? 'unknown');
       const tokens = Number(item['tokens'] ?? 0);
       const percent = Number(item['percent'] ?? 0);
-      const color = CATEGORICAL_PALETTE[index % CATEGORICAL_PALETTE.length];
+      const color = accentShade(Math.max(100 - index * 14, 28));
       const tooltip = escapeHtml(`${name}: ${tokens.toLocaleString()} tokens (${percent.toFixed(2)}% of cost)`);
       return `<div style="width:${percent.toFixed(2)}%;background:${color}" data-tooltip="${tooltip}"></div>`;
     })

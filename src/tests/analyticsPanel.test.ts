@@ -101,7 +101,8 @@ test('rows without a floor baseline fall back to the estimated saving and say so
 
 test('the cache cells say their share of Received in t, and the Billed tooltip adds up the units', () => {
   const html = render([row({ read: 80_000, write: 5_000, input: 100, output: 400 })]);
-  assert.match(html, /CR: 80\.00K t, [\d.]+% of Received/);
+  assert.match(html, /title="CR: 80\.00K t"/);
+  assert.doesNotMatch(html, /of Received/);
   assert.match(html, /title="CR [\d.]+K? \+ CW [\d.]+K? \+ RI [\d.]+K? \+ output [\d.]+K? = [\d.]+K? u"/);
 });
 
@@ -125,17 +126,17 @@ test('tooltip multipliers are the effective rate of the hit, not constants', () 
 test('the Cached cell is tinted green when reads outweigh writes and red when writes do', () => {
   const healthy = render([row({ read: 90_000, write: 1_000 })]);
   assert.match(healthy, /rgba\(63,185,80,0\.16\)/);
-  assert.match(healthy, /Reads (>|&gt;) writes \(t\)/);
+  assert.doesNotMatch(healthy, /(Reads|Writes) (>|&gt;) (writes|reads)/);
 
   const cold = render([row({ read: 1_000, write: 90_000 })]);
   assert.match(cold, /rgba\(229,83,75,0\.16\)/);
-  assert.match(cold, /Writes (>|&gt;) reads \(t\)/);
+  assert.doesNotMatch(cold, /(Reads|Writes) (>|&gt;) (writes|reads)/);
 });
 
 test('tokens can be healthy while units are red, because a written token costs 12.5x a read one', () => {
   const html = render([row({ read: 30_000, write: 20_000 })]);
-  assert.match(html, /Reads (>|&gt;) writes \(t\)/);
-  assert.match(html, /Writes (>|&gt;) reads \(u\)/);
+  assert.doesNotMatch(html, /(Reads|Writes) (>|&gt;) (writes|reads)/);
+  assert.doesNotMatch(html, /(Reads|Writes) (>|&gt;) (writes|reads)/);
 });
 
 test('the project filter narrows the table, and an unknown project falls back to all repos', () => {
