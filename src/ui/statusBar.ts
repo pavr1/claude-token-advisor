@@ -61,6 +61,8 @@ export class StatusBar {
   private pythonMissing = false;
   /** Aggregate over every proxy hit belonging to the most recently completed user turn. */
   private lastTurn: AggregateStats | undefined;
+  /** Summaries are waiting for the user's `/clear`: the tooltip asks for it and explains nothing is lost. */
+  private clearHint = false;
   private todayStats: AggregateStats | undefined;
   private monthStats: AggregateStats | undefined;
   /** Anthropic's own reported cost for today/this month, from the local OTel sink. Undefined until it lands. */
@@ -82,6 +84,9 @@ export class StatusBar {
    * and the spinner must stay up until the last one lands, not the first.
    */
   private inFlight = 0;
+  /** The last hit asked for local tools: nothing is in flight, but the turn goes on, so the needle keeps moving. */
+  private toolsRunning = false;
+  private toolsTimer: ReturnType<typeof setTimeout> | undefined;
 
   /** Needle position (1 = full scale .. 19 = rest), where it is heading, ticks left hovering, and whether it is sinking to rest. */
   private gaugePos = GAUGE_REST;
@@ -92,7 +97,30 @@ export class StatusBar {
 
   /** Whether a proxied request from this window is still running. */
   get isBusy(): boolean {
-    return this.inFlight > 0;
+    return this.inFlight > 0 || this.toolsRunning;
+  }
+
+  /**
+   * Whether the turn is between hits, running local tools. Set just before `reportTurn`; a new
+   * request clears it. A turn interrupted mid-tools sends no signal, so it lapses on its own.
+   */
+  setToolsRunning(running: boolean, expiryMs = 10 * 60_000): void {
+    this.toolsRunning = running;
+    if (this.toolsTimer) {
+      clearTimeout(this.toolsTimer);
+      this.toolsTimer = undefined;
+    }
+    if (running) {
+      this.toolsTimer = setTimeout(() => {
+        this.toolsTimer = undefined;
+        this.toolsRunning = false;
+        if (this.inFlight === 0) {
+          this.releaseGauge();
+        }
+        this.render();
+      }, expiryMs);
+      this.toolsTimer.unref?.();
+    }
   }
 
   /** 3b.3: running output token count for the currently-streaming turn, or undefined between turns. */
@@ -164,6 +192,7 @@ export class StatusBar {
       this.streamProgressTokens = undefined;
     }
     this.inFlight += 1;
+    this.setToolsRunning(false);
     this.startGaugeAnimation();
     this.render();
   }
@@ -267,7 +296,11 @@ export class StatusBar {
     this.proxyError = undefined;
     if (this.inFlight === 0) {
       this.streamProgressTokens = undefined;
-      this.releaseGauge();
+      if (this.toolsRunning) {
+        this.startGaugeAnimation();
+      } else {
+        this.releaseGauge();
+      }
     }
     this.render();
   }
@@ -292,6 +325,11 @@ export class StatusBar {
     this.monthStats = monthStats;
     this.currentAgent = servedModel;
     this.render();
+  }
+
+  /** Call before `reportTurn`, which renders. */
+  setClearHint(value: boolean): void {
+    this.clearHint = value;
   }
 
   reportProxyError(message: string): void {
@@ -341,7 +379,7 @@ export class StatusBar {
 
   private buildGaugeText(): string {
     if (!this.gaugeTimer) {
-      return this.inFlight > 0 ? `$(claude-budget-gauge-${GAUGE_REST})` : '$(claude-budget-gauge)';
+      return this.isBusy ? `$(claude-budget-gauge-${GAUGE_REST})` : '$(claude-budget-gauge)';
     }
     return `$(claude-budget-gauge-${Math.min(GAUGE_FRAMES, Math.max(1, Math.round(this.gaugePos)))})`;
   }
@@ -361,7 +399,7 @@ export class StatusBar {
 
   private buildText(): string {
     const segments: string[] = [];
-    const busy = this.inFlight > 0;
+    const busy = this.isBusy;
 
     // Whether the leading icon is already showing the spinner. When it is, the
     // improver segment must not add a second one.
@@ -462,6 +500,12 @@ export class StatusBar {
     md.supportThemeIcons = true;
 
     this.appendBudgetSection(md);
+    if (this.clearHint) {
+      md.appendMarkdown(
+        "\n**New day:** the proxy summarized yesterday's history and saved it. Run `/clear` and send your next message: " +
+          'the summary is added to the new chat automatically, so nothing is lost and Claude Code stops resending the old history.\n'
+      );
+    }
     md.appendMarkdown('\nClick for dashboards (savings breakdown is in the Token Improver tab).');
     return md;
   }

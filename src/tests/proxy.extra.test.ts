@@ -65,7 +65,7 @@ async function startProxy(
   const logs: string[] = [];
   const port = await freePort();
   const proxy = new TokenImproverProxy(
-    { ...DEFAULT_PROXY_CONFIG, port, upstreamBaseUrl, optimizer: { ...DEFAULT_OPTIMIZER_CONFIG, ...options.optimizer }, ...options.proxy },
+    { ...DEFAULT_PROXY_CONFIG, port, upstreamBaseUrl, optimizer: { ...DEFAULT_OPTIMIZER_CONFIG, ...options.optimizer }, lookupLatestModels: false, ...options.proxy },
     { onTurnComplete: (record) => void turns.push(record) },
     (line) => void logs.push(line)
   );

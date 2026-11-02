@@ -60,11 +60,38 @@ function classifyModel(modelId: string): keyof typeof FALLBACK_TIER_RATES {
 }
 
 /**
+ * A 1 hour cache write costs 2x the model's input price. Checked against Anthropic's pricing page
+ * (platform.claude.com/docs/en/about-claude/pricing, 2026-11-02): 2x on every model with a 1 hour
+ * column (Fable 5.1 $20 on $10, Opus 5.5 $8 on $4, Sonnet 5.5 $4 on $2, Haiku 5.5 $0.20 on $0.10,
+ * Haiku 4.5 $2 on $1). Used only when the feed publishes no 1 hour rate, which it does not today.
+ */
+export const CACHE_WRITE_1H_OVER_INPUT = 2;
+
+/**
+ * Models priced by prompt length. Claude Haiku 5.5 charges more for a request whose prompt is over
+ * 100,000 tokens; the prompt length counts every input token, cache reads and writes included, and
+ * each request is priced on its own (same page, "Long context pricing"). Every rate of the long tier
+ * (input, output, 5 minute write, 1 hour write, read) is exactly 5x the short tier, so the cache
+ * multipliers over input do not change and only the model's weight does. The feed publishes the
+ * short tier alone, so the factor lives here. Update it when Anthropic changes the tier or the model.
+ */
+export const LONG_PROMPT_THRESHOLD_TOKENS = 100_000;
+const LONG_PROMPT_TIERS: ReadonlyArray<{ prefix: string; factor: number }> = [{ prefix: 'claude-haiku-5-5', factor: 5 }];
+
+/** How many times the base rates apply to a request of `promptTokens` on this model: 1 unless it is over the model's long-prompt threshold. */
+export function longPromptFactor(modelId: string | undefined, promptTokens: number | undefined): number {
+  if (!modelId || promptTokens === undefined || !(promptTokens > LONG_PROMPT_THRESHOLD_TOKENS)) {
+    return 1;
+  }
+  const lowered = modelId.toLowerCase();
+  return LONG_PROMPT_TIERS.find((tier) => lowered.startsWith(tier.prefix))?.factor ?? 1;
+}
+
+/**
  * Cache multipliers (cache rate over the model's input rate) for the model that served a hit,
  * read from the pricing table, so a repricing or a model with its own cache rates shows up
- * without a code change. Only when the table has no usable rate for a kind (an old cache file, a
- * model the feed omits) does that kind fall back to Anthropic's published rule: 0.10x read,
- * 1.25x 5 minute write, 2x 1 hour write.
+ * without a code change. A kind the table has no rate for stays unpriced (multiplier 0, nothing
+ * guessed), except the 1 hour write, which is the published 2x input (`CACHE_WRITE_1H_OVER_INPUT`).
  */
 /** The kinds of cache token that carry their own price. */
 export type CacheKind = 'read' | 'write' | 'write1h';
@@ -94,7 +121,7 @@ export function cacheMultipliers(modelId: string | undefined): CacheMultipliers 
   const multipliers: CacheMultipliers = {
     read: ratio('read', rates.cacheRead),
     write: ratio('write', rates.cacheWrite),
-    write1h: ratio('write1h', rates.cacheWrite1h),
+    write1h: ratio('write1h', rates.cacheWrite1h || rates.input * CACHE_WRITE_1H_OVER_INPUT),
   };
   return unpriced.length > 0 ? { ...multipliers, unpriced } : multipliers;
 }
@@ -120,8 +147,13 @@ export function getPricingTable(): PricingTable {
  * a generic family lookup (e.g. `'claude-sonnet'`) does against real fetched data.
  */
 function resolveRates(modelId: string | undefined): ModelRates {
+  return resolveTableRates(modelId) ?? (modelId ? FALLBACK_TIER_RATES[classifyModel(modelId)] : FALLBACK_TIER_RATES.unknown);
+}
+
+/** The loaded table's rates for this model (exact id, else the longest prefix match), or undefined when the table has none. */
+function resolveTableRates(modelId: string | undefined): ModelRates | undefined {
   if (!modelId) {
-    return FALLBACK_TIER_RATES.unknown;
+    return undefined;
   }
   const lowered = modelId.toLowerCase();
   const exact = activeTable.rates[lowered];
@@ -135,11 +167,16 @@ function resolveRates(modelId: string | undefined): ModelRates {
       bestMatch = key;
     }
   }
-  if (bestMatch) {
-    return activeTable.rates[bestMatch];
-  }
+  return bestMatch ? activeTable.rates[bestMatch] : undefined;
+}
 
-  return FALLBACK_TIER_RATES[classifyModel(modelId)];
+/**
+ * The long-prompt tier scales the model's own published rates, so it applies only to rates that came
+ * from the table. The built-in family fallback (Haiku 4.5's $1 for any Haiku) is not Haiku 5.5's base
+ * price, and 5x of it would match no real price.
+ */
+function tierFactor(modelId: string | undefined, promptTokens: number | undefined): number {
+  return resolveTableRates(modelId) ? longPromptFactor(modelId, promptTokens) : 1;
 }
 
 /**
@@ -164,13 +201,17 @@ function sonnetInputUsdPerToken(): number {
   return resolveRates('claude-sonnet-5').input;
 }
 
-export function modelWeight(modelId: string | undefined): number {
-  return resolveRates(modelId).input / sonnetInputUsdPerToken();
+/**
+ * A model's input weight. `promptTokens` is the length of the request's whole prompt (regular input
+ * + cache writes + cache reads); over a long-prompt model's threshold the weight is the long tier's.
+ */
+export function modelWeight(modelId: string | undefined, promptTokens?: number): number {
+  return (resolveRates(modelId).input * tierFactor(modelId, promptTokens)) / sonnetInputUsdPerToken();
 }
 
-/** A model's output-token weight, in the same NCU scale as `modelWeight` (input). */
-export function modelOutputWeight(modelId: string | undefined): number {
-  return resolveRates(modelId).output / sonnetInputUsdPerToken();
+/** A model's output-token weight, in the same NCU scale as `modelWeight` (input), with the same prompt-length tier. */
+export function modelOutputWeight(modelId: string | undefined, promptTokens?: number): number {
+  return (resolveRates(modelId).output * tierFactor(modelId, promptTokens)) / sonnetInputUsdPerToken();
 }
 
 /** One Normalized Cost Unit, in dollars. Dynamic: reflects whatever Sonnet's real, currently-resolved rate is. */

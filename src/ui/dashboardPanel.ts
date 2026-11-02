@@ -11,9 +11,9 @@ import { AnalyticsTracker } from '../analytics/tracker';
 import { RealCostTracker } from '../analytics/realCostTracker';
 import { buildAccountHeaderHtml, buildBudgetSectionHtml, Summary } from './budgetDashboard';
 import { UnifiedRateLimitSnapshot } from '../proxy/server';
-import { ALL, AnalyticsFilters, buildAnalyticsSectionHtml, TURN_SETTLE_MS } from './analyticsPanel';
+import { ALL, AnalyticsFilters, CHATS_PAGE, buildAnalyticsSectionHtml, TURN_SETTLE_MS } from './analyticsPanel';
 import { extractPlanInfo, showsBudgetTab } from './planView';
-import { HOVER_TOOLTIP_SCRIPT, htmlDocument, makeNonce } from './shared';
+import { CHART_HIGHLIGHT_SCRIPT, HOVER_TOOLTIP_SCRIPT, htmlDocument, makeNonce, processingIcon, TIPS_ICON } from './shared';
 
 export type DashboardTab = 'budget' | 'improver';
 
@@ -25,6 +25,8 @@ export class DashboardPanel {
   private readonly tracker: AnalyticsTracker;
   private readonly realCostTracker: RealCostTracker | undefined;
   private summary: Summary | undefined;
+  /** Nothing to show yet (no budget summary, and none failed): the page is a blank with the moving gauge. */
+  private loading = true;
   private rateLimit: UnifiedRateLimitSnapshot | undefined;
   private filters: AnalyticsFilters;
   private activeTab: DashboardTab;
@@ -41,6 +43,7 @@ export class DashboardPanel {
 
     // 2.1: a split editor pane beside whatever the user is already looking at,
     // inside this same VS Code window — not `workbench.action.moveEditorToNewWindow`.
+    this.loading = this.summary === undefined;
     this.panel = vscode.window.createWebviewPanel(
       'claudeDashboard',
       'Claude Dashboard',
@@ -49,11 +52,15 @@ export class DashboardPanel {
     );
 
     this.panel.webview.onDidReceiveMessage(
-      (message: { type?: string; project?: string; range?: string; from?: string; to?: string; tab?: string }) => {
-        if (message?.type === 'filter') {
+      (message: { type?: string; project?: string; status?: string; range?: string; from?: string; to?: string; tab?: string; more?: boolean }) => {
+        if (message?.type === 'more') {
+          this.filters = { ...this.filters, chats: (this.filters.chats ?? CHATS_PAGE) + CHATS_PAGE };
+          this.render();
+        } else if (message?.type === 'filter') {
           const range = message.range;
           this.filters = {
             project: message.project ?? this.filters.project,
+            status: message.status ?? this.filters.status,
             range: range === 'today' || range === 'yesterday' || range === '7d' || range === 'month' || range === 'lastMonth' || range === 'custom' ? range : this.filters.range,
             from: message.from ?? this.filters.from,
             to: message.to ?? this.filters.to,
@@ -114,7 +121,16 @@ export class DashboardPanel {
       return;
     }
     DashboardPanel.current.summary = summary;
+    DashboardPanel.current.loading = false;
     DashboardPanel.current.render();
+  }
+
+  /** The first budget fetch ended without a summary (error or disabled): show the page anyway. */
+  static finishLoading(): void {
+    if (DashboardPanel.current?.loading) {
+      DashboardPanel.current.loading = false;
+      DashboardPanel.current.render();
+    }
   }
 
   /** Fresh session/weekly rate-limit reading (Pro/Max/Team). Re-renders in place if the panel is open. */
@@ -158,14 +174,18 @@ export class DashboardPanel {
     const showBudget = plan?.organizationType !== 'claude_enterprise';
     const budgetActive = showBudget && this.activeTab === 'budget';
 
-    return `
+    const loading = this.loading && !this.summary;
+    return `${loading ? `<div class="page-loading"><h1 class="page-welcome">Welcome to Claude Budget Advisor</h1>${processingIcon('page')}<div class="page-loading-text">Loading data<span class="dots"></span></div></div>` : ''}
+  <div class="page-content${loading ? ' page-hidden' : ''}">
   ${buildAccountHeaderHtml(this.summary, this.rateLimit)}
   <div class="tabs">
     ${showBudget ? `<button class="tab${budgetActive ? ' active' : ''}" data-tab="budget">Budget</button>` : ''}
     <button class="tab${budgetActive ? '' : ' active'}" data-tab="improver">Token Improver</button>
+    <button type="button" class="tips-btn" data-open-tips title="Tips to save tokens">${TIPS_ICON}Tips</button>
   </div>
   ${showBudget ? `<div class="tab-panel${budgetActive ? ' active' : ''}" data-panel="budget">${budgetBody}</div>` : ''}
-  <div class="tab-panel${budgetActive ? '' : ' active'}" data-panel="improver">${improverBody}</div>`;
+  <div class="tab-panel${budgetActive ? '' : ' active'}" data-panel="improver">${improverBody}</div>
+  </div>`;
   }
 
   private buildHtml(): string {
@@ -173,12 +193,13 @@ export class DashboardPanel {
     const body = `<div id="root">${this.buildBody()}</div>`;
 
     const script = `${HOVER_TOOLTIP_SCRIPT}
+${CHART_HIGHLIGHT_SCRIPT}
 (function () {
   const vscode = acquireVsCodeApi();
   const root = document.getElementById('root');
-  const FILTERS = ['project', 'range', 'from', 'to'];
+  const FILTERS = ['project', 'status', 'range', 'from', 'to'];
   // Classes the page itself toggles (expanded turns, the running flash): an update never takes them off.
-  const CLIENT_CLASSES = ['open-turn', 'open', 'flash'];
+  const CLIENT_CLASSES = ['open-turn', 'open', 'flash', 'tips-open'];
 
   // What the user is doing survives every update: which turns are expanded and where the page and
   // the turns table are scrolled. It also lives in webview state, so a reload restores it.
@@ -186,6 +207,14 @@ export class DashboardPanel {
   const open = {};
   (saved.open || []).forEach(function (k) { open[k] = true; });
   let prevCells = saved.cells;
+
+  // A wide range takes a moment to build: cover the page with the moving gauge until the update lands.
+  const busy = document.createElement('div');
+  busy.className = 'busy-overlay';
+  busy.innerHTML = document.getElementById('busy-tpl').innerHTML;
+  document.body.appendChild(busy);
+  function showBusy() { busy.classList.add('on'); }
+  function hideBusy() { busy.classList.remove('on'); }
 
   function scroller() { return document.querySelector('.turns-main'); }
   // The totals row sticks right under the column labels, so it needs to know how tall they are.
@@ -204,23 +233,51 @@ export class DashboardPanel {
     s.tableTop = sc ? sc.scrollTop : 0;
     vscode.setState(s);
   }
+  function chainOpen(tr) {
+    const chain = [tr.getAttribute('data-parent')].concat((tr.getAttribute('data-ancestors') || '').split(' ').filter(Boolean));
+    return chain.every(function (k) { return !!open[k]; });
+  }
   function applyOpenAll() {
     document.querySelectorAll('tr[data-toggle]').forEach(function (tr) {
       tr.classList.toggle('open-turn', !!open[tr.getAttribute('data-toggle')]);
     });
-    document.querySelectorAll('tr.hit-row').forEach(function (tr) {
-      tr.classList.toggle('open', !!open[tr.getAttribute('data-parent')]);
+    // A row shows only while its parent and every ancestor above it are expanded (chat > turn > hit).
+    document.querySelectorAll('tr.hit-row, tr.turn-child').forEach(function (tr) {
+      tr.classList.toggle('open', chainOpen(tr));
     });
   }
 
   // One set of listeners on the document: the elements underneath are patched, never replaced.
+  function setTips(on) {
+    const modal = document.querySelector('[data-tips-modal]');
+    if (modal) modal.classList.toggle('tips-open', on);
+  }
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape') setTips(false);
+  });
   document.addEventListener('click', function (event) {
+    if (event.target.closest('[data-open-tips]')) {
+      // The tips are about the Token Improver: show that tab first when another one is in front.
+      const improver = document.querySelector('.tab[data-tab="improver"]');
+      if (improver && !improver.classList.contains('active')) improver.click();
+      setTips(true);
+      return;
+    }
+    if (event.target.closest('[data-close-tips]') || event.target.matches('[data-tips-modal]')) {
+      setTips(false);
+      return;
+    }
     const tab = event.target.closest('.tab');
     if (tab) {
       const target = tab.getAttribute('data-tab');
       document.querySelectorAll('.tab').forEach(function (t) { t.classList.toggle('active', t === tab); });
       document.querySelectorAll('.tab-panel').forEach(function (p) { p.classList.toggle('active', p.getAttribute('data-panel') === target); });
       vscode.postMessage({ type: 'tab', tab: target });
+      return;
+    }
+    if (event.target.closest('[data-more]')) {
+      vscode.postMessage({ type: 'more' });
+      showBusy();
       return;
     }
     const tr = event.target.closest('tr[data-toggle]');
@@ -237,6 +294,7 @@ export class DashboardPanel {
       const msg = { type: 'filter' };
       msg[el.id] = el.value;
       vscode.postMessage(msg);
+      showBusy();
     }
   });
   document.addEventListener('scroll', function () { save(); }, true);
@@ -312,7 +370,7 @@ export class DashboardPanel {
       const row = tr.getAttribute('data-row');
       // A hit of a collapsed turn is hidden, so it must not spend its flash while nobody can see it.
       const parent = tr.getAttribute('data-parent');
-      const visible = !parent || open[parent];
+      const visible = !parent || chainOpen(tr);
       // Each changed cell flashes 100 ms after the previous one (capped at 500 ms), so several read as a flow.
       let changed = 0;
       Array.prototype.forEach.call(tr.children, function (td, i) {
@@ -334,6 +392,7 @@ export class DashboardPanel {
 
   /** Apply an update, keeping the row the user is looking at where it is when new turns appear above it. */
   function patch(html) {
+    hideBusy();
     const sc = scroller();
     let anchorKey = null;
     let anchorTop = 0;
@@ -371,7 +430,7 @@ export class DashboardPanel {
   vscode.postMessage({ type: 'ready' });
 })();`;
 
-    return htmlDocument('Claude Dashboard', body, { nonce, script });
+    return htmlDocument('Claude Dashboard', body + `<template id="busy-tpl"><div class="page-loading">${processingIcon('busy')}<div class="page-loading-text">Loading data<span class="dots"></span></div></div></template>`, { nonce, script });
   }
 
   dispose(): void {

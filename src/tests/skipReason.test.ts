@@ -84,7 +84,7 @@ test('the arrow column is wider and centered, and Cached gave up the space', () 
   assert.ok(widths[9] > 3, 'arrow column should be wider than before');
   assert.ok(widths[11] + widths[12] + widths[13] < 23, 'CR, CW and RI together should have given space up');
   assert.ok(widths[0] >= 12, 'Date must fit the time');
-  assert.match(html, /class="turn-arrow">→</);
+  assert.match(html, /class="turn-arrow"><\/td>/);
 });
 
 test('the flow chart nests raw, received and billed in one bar, with cleanup and summary as lines; cache is split in tokens and units', async () => {
@@ -93,16 +93,16 @@ test('the flow chart nests raw, received and billed in one bar, with cleanup and
   const start = new Date(at.getFullYear(), at.getMonth(), at.getDate()).getTime();
   const html = historyChartsHtml([hit(1)], { start, end: start + 86_400_000 }, at);
   assert.equal((html.match(/<polyline /g) ?? []).length, 3);
-  assert.match(html, /CR vs CW, t/);
-  assert.match(html, /CR vs CW, billed u/);
+  assert.match(html, /CR vs CW, Tokens/);
+  assert.match(html, /CR vs CW, Units/);
   // The flow chart is the wide one.
   assert.match(html, /viewBox="0 0 1040 /);
 });
 
-test('the donut tooltips are one short sentence, not an essay', () => {
+test('the trend chart tooltips are one short sentence, not an essay', () => {
   const html = render([hit(1)]);
   const head = html.slice(html.indexOf('<div class="head">'), html.indexOf('<h2>Turns'));
-  const titles = [...head.matchAll(/class="donut-block" title="([^"]*)"/g)].map((m) => m[1]);
+  const titles = [...head.matchAll(/class="trend-block" title="([^"]*)"/g)].map((m) => m[1]);
   assert.equal(titles.length, 2);
   for (const title of titles) {
     assert.ok(title.length <= 140, `tooltip too long: ${title.length}`);

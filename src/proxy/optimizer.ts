@@ -18,14 +18,20 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { cacheMultipliers, modelOutputWeight, modelWeight } from './pricing';
+import { cacheMultipliers, longPromptFactor, modelOutputWeight, modelWeight } from './pricing';
+import { FALLBACK_MODELS, LatestModels } from './modelCatalog';
+import { PendingHistoryStore } from './pendingHistory';
 import { estimatePayloadTokens, MessagesPayload } from './tokenCounter';
 
-/** Current-generation cheap model used for routing downgrades and history summaries. */
-export const HAIKU_MODEL_ID = 'claude-haiku-4-5-20251001';
+/**
+ * The cheap model used for routing downgrades and history summaries, and the default that replaces Opus,
+ * until the proxy has asked Anthropic for the newest ones (`ModelCatalog`). These are only the fallback:
+ * they stand for the family when pricing a summary, and for the model when the lookup has not answered.
+ */
+export const HAIKU_MODEL_ID = FALLBACK_MODELS.haiku;
 
 /** Default model for the one-time startup override (Stage 0) — see `applyStartupModelDefault`. */
-export const SONNET_MODEL_ID = 'claude-sonnet-5';
+export const SONNET_MODEL_ID = FALLBACK_MODELS.sonnet;
 
 /** Haiku 4.5 caps output at 64K and context at 200K; respect both when downgrading. */
 const HAIKU_MAX_OUTPUT_TOKENS = 64_000;
@@ -120,9 +126,11 @@ export function estimateCompactionEconomics(input: {
   const manifestTokens = calls * manifestMaxOutputTokens(input.olderTokens / calls);
   const pruned = Math.max(0, input.olderTokens - manifestTokens);
 
+  // Each chunk is its own request, so the Haiku tier is decided by one chunk's prompt, not by the sum.
+  const chunkPromptTokens = (input.olderTokens * SUMMARIZER_INPUT_INFLATION) / calls;
   const haikuCost =
-    input.olderTokens * SUMMARIZER_INPUT_INFLATION * modelWeight(HAIKU_MODEL_ID) +
-    manifestTokens * modelOutputWeight(HAIKU_MODEL_ID);
+    input.olderTokens * SUMMARIZER_INPUT_INFLATION * modelWeight(HAIKU_MODEL_ID, chunkPromptTokens) +
+    manifestTokens * modelOutputWeight(HAIKU_MODEL_ID, chunkPromptTokens);
 
   // Without the model's cache rates the saving cannot be estimated, and a guess would decide a real
   // spend: do not compact until the pricing table has them.
@@ -246,6 +254,12 @@ export interface OptimizationTelemetry {
   compactionSkippedReason?: string;
   /** Inputs and verdict of the economics gate, set whenever it was evaluated (compacted or skipped). */
   compactionEconomics?: CompactionDecision;
+  /** True when this conversation's previous request was on an earlier local day: its history is yesterday's and gets summarized whole. */
+  dayChange?: boolean;
+  /** True while summaries are waiting in the `PendingHistoryStore` for this project: the UI asks the user to `/clear`, and the next chat gets them. */
+  clearSuggested?: boolean;
+  /** True when this request was the first of a fresh chat and carried the pending summaries from the previous one. */
+  pendingInjected?: boolean;
   originalModel: string;
   effectiveModel: string;
   modelDowngraded: boolean;
@@ -320,6 +334,24 @@ export interface OptimizationResult {
 export interface SummarizerUsage {
   inputTokens: number;
   outputTokens: number;
+  /**
+   * The part of `inputTokens` / `outputTokens` that belongs to calls whose prompt was over the Haiku
+   * long-prompt threshold, which bill at the higher tier. The usage adds up several chunk calls, so
+   * the total alone cannot say which of them crossed it. Absent or 0 when none did.
+   */
+  longPromptInputTokens?: number;
+  longPromptOutputTokens?: number;
+}
+
+/** Adds one summarizer call's usage to the running total, remembering whether that call's prompt was over the long-prompt threshold. */
+export function addSummarizerUsage(total: SummarizerUsage | undefined, call: { inputTokens: number; outputTokens: number }): SummarizerUsage {
+  const long = longPromptFactor(HAIKU_MODEL_ID, call.inputTokens) > 1;
+  return {
+    inputTokens: (total?.inputTokens ?? 0) + call.inputTokens,
+    outputTokens: (total?.outputTokens ?? 0) + call.outputTokens,
+    longPromptInputTokens: (total?.longPromptInputTokens ?? 0) + (long ? call.inputTokens : 0),
+    longPromptOutputTokens: (total?.longPromptOutputTokens ?? 0) + (long ? call.outputTokens : 0),
+  };
 }
 
 /**
@@ -355,14 +387,14 @@ export function manifestSystemPrompt(targetTokens: number): string {
  * set by the caller) — every later request, including one where the user has
  * explicitly picked Opus again via `/model`, passes through untouched.
  */
-function applyStartupModelDefault(payload: MessagesPayload, telemetry: OptimizationTelemetry): MessagesPayload {
+function applyStartupModelDefault(payload: MessagesPayload, telemetry: OptimizationTelemetry, sonnet: string): MessagesPayload {
   const model = String(payload.model ?? '');
   if (!model.includes('opus')) {
     return payload;
   }
   telemetry.startupModelDefaulted = true;
-  telemetry.effectiveModel = SONNET_MODEL_ID;
-  return { ...payload, model: SONNET_MODEL_ID };
+  telemetry.effectiveModel = sonnet;
+  return { ...payload, model: sonnet };
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +785,11 @@ export class BaselineMemory {
     }
   }
 
+  /** Epoch ms of this conversation's previous request, or undefined when none is remembered. Call before `cachedTokens`, which overwrites it. */
+  lastRequestAt(key: string): number | undefined {
+    return this.last.get(key)?.at;
+  }
+
   /**
    * Tokens the best possible client cache would read for this request: the previous prefix,
    * as long as it is at most 1 hour old. No cache lives longer, so this is a true upper bound
@@ -785,6 +822,15 @@ export class BaselineMemory {
     this.save();
     return cached;
   }
+}
+
+/** True when `previousMs` falls on an earlier calendar day than `nowMs`, in the machine's local time zone. */
+export function isEarlierLocalDay(previousMs: number, nowMs: number): boolean {
+  const day = (ms: number): number => {
+    const date = new Date(ms);
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  };
+  return day(previousMs) < day(nowMs);
 }
 
 /**
@@ -932,6 +978,66 @@ function pickCompactionCutoff(messages: Array<Record<string, unknown>>, config: 
 }
 
 /**
+ * True when `message` is the user's own opening message of a chat, not one of Claude Code's
+ * automatic one-message calls. Verified against weeks of ledger rows: the quota check ("quota"),
+ * the session-title call ("<session> ..."), the WebFetch summarizer ("Web page content") and the
+ * Haiku probes never start with a `<system-reminder>` block; the real opening message, which
+ * carries the client's injected context, does. Only one real opening was on record, so a chat
+ * whose opening lacks the block is simply not handed the summaries (they stay pending).
+ */
+export function isUserChatOpening(message: Record<string, unknown> | undefined, model: unknown): boolean {
+  if (!message || message['role'] !== 'user' || /haiku/i.test(String(model ?? ''))) {
+    return false;
+  }
+  const content = message['content'];
+  const first = Array.isArray(content) ? content[0] : undefined;
+  const text = first && typeof first === 'object' ? (first as Record<string, unknown>)['text'] : undefined;
+  return typeof text === 'string' && /^\s*<system-reminder/.test(text);
+}
+
+/**
+ * First request of a fresh chat (one message, typed by the user) in a project with summaries
+ * waiting: prepends them as the manifest and stores them under this chat so every later
+ * request rebuilds the same prefix (and the provider's cache keeps matching it).
+ * Returns undefined when nothing was handed over.
+ */
+function applyPendingHistory(
+  payload: MessagesPayload,
+  telemetry: OptimizationTelemetry,
+  pending: PendingHistoryStore | undefined,
+  store: SummaryStore | undefined,
+  project: string,
+  now: number
+): MessagesPayload | undefined {
+  const messages = payload.messages ?? [];
+  if (!pending || messages.length !== 1 || !telemetry.isNewUserTurn || !isUserChatOpening(messages[0], telemetry.originalModel)) {
+    return undefined;
+  }
+  const summaries = pending.take(project, now);
+  if (!summaries?.length) {
+    return undefined;
+  }
+  // coveredCount 0: the summaries replace no client messages, they precede all of them.
+  store?.set(hashMessages(messages.slice(0, 1)), { coveredCount: 0, prefixHash: hashMessages([]), summaries });
+  telemetry.pendingInjected = true;
+  telemetry.summaryReused = true;
+  return { ...payload, messages: [...buildManifestTurns(summaries), ...messages] };
+}
+
+/**
+ * Where to cut for a new day: everything before the newest fresh user turn is summarized
+ * and only that turn stays verbatim. Returns -1 when there is no usable cut.
+ */
+function pickDayChangeCutoff(messages: Array<Record<string, unknown>>): number {
+  for (let index = messages.length - 1; index >= 2; index -= 1) {
+    if (isFreshUserTurn(messages[index])) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+/**
  * Sliding compaction, in blocks.
  *
  * Once the history that is not yet summarized crosses the sliding threshold, that
@@ -999,9 +1105,11 @@ async function applyCompaction(
 
     const cacheWarm = (telemetry.baselineCachedTokens ?? 0) > 0;
     const unsummarizedTokens = estimatePayloadTokens({ messages: unsummarized });
-    const alreadyResumed = state?.resumed === true && unsummarizedTokens < RESUMED_RESET_TOKENS;
+    // A new local day summarizes the whole earlier history regardless of its size or an earlier resume.
+    const dayChange = telemetry.dayChange === true;
+    const alreadyResumed = !dayChange && state?.resumed === true && unsummarizedTokens < RESUMED_RESET_TOKENS;
     const triggerTokens = config.slidingThresholdTokens;
-    const eligible = historyTokens >= triggerTokens;
+    const eligible = dayChange || historyTokens >= triggerTokens;
     telemetry.historyTokens = historyTokens;
     telemetry.compactionTriggerTokens = cacheWarm ? undefined : triggerTokens;
 
@@ -1016,7 +1124,7 @@ async function applyCompaction(
     }
 
     if (eligible && !cacheWarm && !alreadyResumed && unsummarized.length >= 4) {
-      const cutoff = pickCompactionCutoff(unsummarized, config);
+      const cutoff = dayChange ? pickDayChangeCutoff(unsummarized) : pickCompactionCutoff(unsummarized, config);
       const older = cutoff === -1 ? [] : unsummarized.slice(0, cutoff);
       const olderTokens = cutoff === -1 ? 0 : estimatePayloadTokens({ messages: older });
 
@@ -1235,8 +1343,8 @@ export function classifyRouting(payload: MessagesPayload, estimatedInputTokens: 
  * thinking, so those have to be translated rather than carried over — otherwise the
  * downgrade turns a working request into a 400.
  */
-function applyModelDowngrade(payload: MessagesPayload): MessagesPayload {
-  const next: MessagesPayload = { ...payload, model: HAIKU_MODEL_ID };
+function applyModelDowngrade(payload: MessagesPayload, haiku: string): MessagesPayload {
+  const next: MessagesPayload = { ...payload, model: haiku };
 
   if (next['output_config'] && typeof next['output_config'] === 'object') {
     const outputConfig = { ...(next['output_config'] as Record<string, unknown>) };
@@ -1451,6 +1559,14 @@ export async function optimizePayload(
     baselineMemory?: BaselineMemory;
     exactRawTokens?: number;
     isStartupRequest?: boolean;
+    /** Project of the request (`/w/<project>`); keys the pending summaries. */
+    project?: string;
+    /** Where a new day's summaries wait for the user's `/clear`. */
+    pendingStore?: PendingHistoryStore;
+    /** Clock for the cache and new-day checks (epoch ms); `Date.now` by default. */
+    now?: () => number;
+    /** The newest Sonnet and Haiku (see `ModelCatalog`); the fallback ones when the caller has none. */
+    models?: LatestModels;
     /** Called as each figure becomes known: raw, then cleanup, then compression, then sent. */
     onStage?: (stage: { rawTokens?: number; prunedByNormalization?: number; prunedByCompaction?: number; summaryCreated?: boolean; optimizedTokens?: number }) => void;
   } = {}
@@ -1482,11 +1598,17 @@ export async function optimizePayload(
     newTurnShape: hasToolResults(original) ? undefined : describeTail(original),
   };
 
-  if (options.baselineMemory && hasClientCacheControl(original)) {
+  const now = options.now?.() ?? Date.now();
+  if (options.baselineMemory) {
     const key = hashMessages((original.messages ?? []).slice(0, 1));
-    telemetry.clientCacheTtlMs = cacheTtlMs(config.cacheTtl);
-    telemetry.floorCachedTokens = options.baselineMemory.warmCachedTokens(key, rawTokens, Date.now());
-    telemetry.baselineCachedTokens = options.baselineMemory.cachedTokens(key, rawTokens, Date.now(), telemetry.clientCacheTtlMs);
+    // Read before `cachedTokens` overwrites the previous request's time.
+    const previousAt = options.baselineMemory.lastRequestAt(key);
+    telemetry.dayChange = previousAt !== undefined && isEarlierLocalDay(previousAt, now);
+    if (hasClientCacheControl(original)) {
+      telemetry.clientCacheTtlMs = cacheTtlMs(config.cacheTtl);
+      telemetry.floorCachedTokens = options.baselineMemory.warmCachedTokens(key, rawTokens, now);
+      telemetry.baselineCachedTokens = options.baselineMemory.cachedTokens(key, rawTokens, now, telemetry.clientCacheTtlMs);
+    }
   }
 
   options.onStage?.({ rawTokens });
@@ -1495,7 +1617,7 @@ export async function optimizePayload(
 
   // Stage 0: one-time Opus -> Sonnet default on the first hit since proxy startup.
   if (config.enableStartupSonnetDefault && options.isStartupRequest) {
-    payload = applyStartupModelDefault(payload, telemetry);
+    payload = applyStartupModelDefault(payload, telemetry, (options.models ?? FALLBACK_MODELS).sonnet);
   }
 
   // Stage 1 + the pruning half of Stage 2 both shrink text, so measure them together.
@@ -1510,10 +1632,21 @@ export async function optimizePayload(
   }
   options.onStage?.({ prunedByNormalization: telemetry.prunedByNormalization });
 
-  // Stage 2: sliding compaction.
+  // Stage 2: sliding compaction, or the hand-over of yesterday's summaries to a cleared chat.
+  const projectKey = options.project ?? '';
+  // The SummaryStore is keyed by the first message as normalization left it, not as the client sent it.
+  const compactionKey = hashMessages((payload.messages ?? []).slice(0, 1));
   if (config.enableCompaction) {
-    payload = await applyCompaction(payload, config, options.summarize, telemetry, options.summaryStore);
+    const handedOver = applyPendingHistory(payload, telemetry, options.pendingStore, options.summaryStore, projectKey, now);
+    payload = handedOver ?? (await applyCompaction(payload, config, options.summarize, telemetry, options.summaryStore));
   }
+  if (options.pendingStore && telemetry.dayChange && telemetry.compactionTriggered) {
+    const saved = options.summaryStore?.get(compactionKey);
+    if (saved) {
+      options.pendingStore.set(projectKey, saved.summaries, now);
+    }
+  }
+  telemetry.clearSuggested = options.pendingStore?.has(projectKey, now) === true;
   options.onStage?.({ prunedByCompaction: telemetry.prunedByCompaction, summaryCreated: telemetry.compactionTriggered });
 
   // Stage 3: smart model routing.
@@ -1521,9 +1654,9 @@ export async function optimizePayload(
     const decision = classifyRouting(payload, estimatePayloadTokens(payload));
     telemetry.routingReason = decision.reason;
     if (decision.downgrade) {
-      payload = applyModelDowngrade(payload);
+      payload = applyModelDowngrade(payload, (options.models ?? FALLBACK_MODELS).haiku);
       telemetry.modelDowngraded = true;
-      telemetry.effectiveModel = HAIKU_MODEL_ID;
+      telemetry.effectiveModel = (options.models ?? FALLBACK_MODELS).haiku;
     }
   }
 

@@ -48,9 +48,9 @@ const failure = (minutesAgo: number, status = 0): LedgerEntry =>
 const render = (entries: LedgerEntry[]): string =>
   buildAnalyticsSectionHtml({ getEntries: () => entries } as unknown as AnalyticsTracker, { project: ALL, range: 'today' });
 
-/** The turn row is the first `data-toggle` row; its status cell is the third cell. */
+/** The turn row (inside its chat row) is the first numbered `core-banking#N` row; its status cell is the third cell. */
 function turnStatus(html: string): string {
-  const row = html.slice(html.indexOf('<tr data-row="core-banking#'));
+  const row = html.slice(html.search(/data-row="core-banking#\d/));
   const cells = row.match(/<td[^>]*>[\s\S]*?<\/td>/g) ?? [];
   return cells[2];
 }

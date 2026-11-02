@@ -13,10 +13,12 @@
 
 import * as http from 'http';
 import express, { Express, Request, Response } from 'express';
+import { ModelCatalog } from './modelCatalog';
+import { PendingHistoryStore } from './pendingHistory';
 import { upstreamFetch } from './upstreamClient';
+import { chatKey, sessionIdOf, KeepAlive, KeepAliveSnapshot, PingResult } from './keepAlive';
 import {
   DEFAULT_OPTIMIZER_CONFIG,
-  HAIKU_MODEL_ID,
   hasToolResults,
   isFreshUserTurn,
   manifestMaxOutputTokens,
@@ -25,10 +27,12 @@ import {
   OptimizationTelemetry,
   OptimizerConfig,
   optimizePayload,
+  addSummarizerUsage,
   SummarizerUsage,
   SUMMARIZER_CHUNK_CHARS,
   SummaryStore,
   BaselineMemory,
+  cacheTtlMs,
 } from './optimizer';
 import { countTokensRemote, estimatePayloadTokens, MessagesPayload } from './tokenCounter';
 import { ApiUsage, LedgerEntry } from '../analytics/tracker';
@@ -58,7 +62,7 @@ const PROJECT_PREFIX = /^\/w\/([^/?#]+)(\/[^?#]*)?(\?.*)?$/;
 
 /** Lifecycle events the owning window streams to the windows that joined it. */
 export type ProxyEvent =
-  | { type: 'start'; project: string; newUserTurn?: boolean; id?: string }
+  | { type: 'start'; project: string; newUserTurn?: boolean; id?: string; sessionId?: string }
   | { type: 'optimized'; project: string; preflight: InFlightStage; id?: string }
   | { type: 'turn'; entry: LedgerEntry }
   | { type: 'realCost'; sample: RealCostEvent }
@@ -154,6 +158,16 @@ export interface ProxyConfig {
   summaryStorePath?: string;
   /** Where the last request time per conversation is kept between restarts; in memory only when unset. */
   baselineMemoryPath?: string;
+  /** Where a new day's summaries wait for the user's `/clear`; in memory only when unset. */
+  pendingHistoryPath?: string;
+  /** Minutes after the last real request during which the cache is kept warm with pings; 0 (default) is off. */
+  keepAliveMaxMinutes?: number;
+  /** Test hook: time between pings. */
+  keepAliveIntervalMs?: number;
+  /** Where the newest Sonnet and Haiku found last time are kept; in memory only when unset. */
+  modelCatalogPath?: string;
+  /** Ask Anthropic for the newest Sonnet and Haiku (default); false keeps the built-in ones. */
+  lookupLatestModels?: boolean;
 }
 
 export const DEFAULT_PROXY_CONFIG: ProxyConfig = {
@@ -191,6 +205,14 @@ export interface TurnRecord {
   failure?: string;
   /** Project from the `/w/<project>` prefix, or undefined when the client used the bare address. */
   project: string | undefined;
+  /** Claude Code's chat (`session_id`), when the request carried one. */
+  sessionId?: string;
+  /** When the request reached the proxy (epoch ms); the ledger timestamp is when it finished. */
+  startedAt?: number;
+  /** Why the model stopped: `tool_use` means the client now runs local tools and sends another hit. */
+  stopReason?: string;
+  /** Anthropic's `request-id` response header; the transcript's `requestId` of the same call. */
+  anthropicRequestId?: string;
 }
 
 /**
@@ -253,7 +275,7 @@ export function parseUnifiedRateLimitHeaders(upstream: globalThis.Response): Uni
  */
 export interface ProxyObserver {
   /** A valid Messages request arrived and processing has begun; `newUserTurn` is false for a tool-result continuation. */
-  onRequestStart?: (project: string | undefined, newUserTurn: boolean, id?: string) => void;
+  onRequestStart?: (project: string | undefined, newUserTurn: boolean, id?: string, sessionId?: string) => void;
   /** Optimization finished and the request is about to go upstream: raw → sent is known before the response. */
   onRequestOptimized?: (project: string | undefined, preflight: InFlightStage, id?: string) => void;
   /** The turn ended: upstream responded, failed, or the stream broke. */
@@ -270,6 +292,8 @@ export interface ProxyObserver {
   onStreamProgress?: (outputTokens: number, project: string | undefined) => void;
   /** 5.3: a fresh session/weekly rate-limit reading arrived on a Messages response. */
   onRateLimitUpdate?: (info: UnifiedRateLimitSnapshot) => void;
+  /** A cache keep-alive ping was sent on the user's behalf; `usage` is what it cost. */
+  onKeepAlive?: (ping: { project: string | undefined; sessionId?: string; model: string; usage: ApiUsage | undefined; status: number }) => void;
   /** A window running a newer extension version than any announced so far joined (or this proxy's own window announced). */
   onExtensionVersion?: (version: string) => void;
 }
@@ -277,7 +301,7 @@ export interface ProxyObserver {
 export type LogFn = (message: string) => void;
 
 /** A zeroed telemetry record, for failures that happen before the pipeline runs. */
-function fallbackTelemetry(payload: MessagesPayload): OptimizationTelemetry {
+export function fallbackTelemetry(payload: MessagesPayload): OptimizationTelemetry {
   const model = String(payload?.model ?? 'unknown');
   return {
     rawTokens: 0,
@@ -336,6 +360,7 @@ class StreamUsageParser {
   private carry = '';
   private usage: ApiUsage = {};
   private sawUsage = false;
+  private stop: string | undefined;
 
   /**
    * 3b.3: called with the running output token count on every `message_delta`,
@@ -381,6 +406,10 @@ class StreamUsageParser {
     }
 
     if (event['type'] === 'message_delta') {
+      const stop = (event['delta'] as Record<string, unknown> | undefined)?.['stop_reason'];
+      if (typeof stop === 'string') {
+        this.stop = stop;
+      }
       const usage = event['usage'] as ApiUsage | undefined;
       if (usage) {
         // output_tokens on message_delta is cumulative, so overwrite rather than add.
@@ -396,7 +425,10 @@ class StreamUsageParser {
   result(): ApiUsage | undefined {
     return this.sawUsage ? this.usage : undefined;
   }
-}
+
+  stopReason(): string | undefined {
+    return this.stop;
+  }}
 
 export class TokenImproverProxy {
   /**
@@ -440,13 +472,38 @@ export class TokenImproverProxy {
   private readonly summaryStore: SummaryStore;
   /** Previous request size per conversation, to model the client's own caching in the baseline. */
   private readonly baselineMemory: BaselineMemory;
+  private readonly pendingHistory: PendingHistoryStore;
+  private readonly models: ModelCatalog;
   /** Logged once: `claude_code.cost.usage` reported as DELTA temporality, which `RealCostTracker` has to sum instead of tracking as a running total. */
   private loggedDeltaCostTemporality = false;
+  private readonly keepAlive: KeepAlive;
 
   constructor(config: ProxyConfig, observer: ProxyObserver, log: LogFn) {
     this.config = config;
+    this.keepAlive = new KeepAlive({
+      maxMinutes: config.keepAliveMaxMinutes ?? 0,
+      intervalMs: config.keepAliveIntervalMs,
+      lifetimeMs: () => cacheTtlMs(this.config.optimizer.cacheTtl),
+      log,
+      send: (snapshot, body) => this.sendPing(snapshot, body),
+      onPing: (snapshot, result, count) => {
+        const usage = result.usage as ApiUsage | undefined;
+        log(
+          `keep-alive #${count} [${snapshot.project ?? '-'}]: cacheRead=${usage?.cache_read_input_tokens ?? 0} ` +
+            `cacheWrite=${usage?.cache_creation_input_tokens ?? 0} uncached=${usage?.input_tokens ?? 0}`
+        );
+        this.observer.onKeepAlive?.({ project: snapshot.project, sessionId: snapshot.sessionId, model: result.model ?? '', usage, status: result.status });
+      },
+    });
     this.summaryStore = new SummaryStore(undefined, config.summaryStorePath);
     this.baselineMemory = new BaselineMemory(undefined, undefined, config.baselineMemoryPath);
+    this.pendingHistory = new PendingHistoryStore(config.pendingHistoryPath);
+    this.models = new ModelCatalog({
+      baseUrl: () => this.config.upstreamBaseUrl,
+      fetch: (url, init) => upstreamFetch(url, init),
+      storagePath: config.modelCatalogPath,
+      log,
+    });
     this.observer = observer;
     this.log = log;
     this.app = this.buildApp();
@@ -582,7 +639,9 @@ export class TokenImproverProxy {
     const project = res.locals['project'] as string | undefined;
     const requestId = String(++this.requestSeq);
     res.locals['requestId'] = requestId;
-    this.observer.onRequestStart?.(project, !hasToolResults(original), requestId);
+    const startedAt = Date.now();
+    this.keepAlive.cancel(chatKey(original, project));
+    this.observer.onRequestStart?.(project, !hasToolResults(original), requestId, sessionIdOf(original));
 
     // Exactly one completion per start, whichever path the request takes out.
     let settled = false;
@@ -593,7 +652,7 @@ export class TokenImproverProxy {
       }
       settled = true;
       this.checkCacheLifetime(record.usage);
-      this.observer.onTurnComplete({ ...record, project });
+      this.observer.onTurnComplete({ ...record, project, sessionId: sessionIdOf(original), startedAt, anthropicRequestId: res.locals['anthropicRequestId'] as string | undefined });
     };
 
     try {
@@ -643,11 +702,19 @@ export class TokenImproverProxy {
       exactRawTokens = counted ?? undefined;
     }
 
+    // The newest Sonnet and Haiku, asked with this client's own credentials (the first lookup of a run is awaited briefly).
+    if (this.config.lookupLatestModels !== false) {
+      await this.models.refreshIfStale(credentialHeaders(headers));
+    }
+
     const { payload, telemetry } = await optimizePayload(original, this.config.optimizer, {
       exactRawTokens,
       isStartupRequest,
+      models: this.models.current,
       summaryStore: this.summaryStore,
       baselineMemory: this.baselineMemory,
+      pendingStore: this.pendingHistory,
+      project: res.locals['project'] as string | undefined,
       summarize: (messages) => this.summarizeHistory(messages, credentialHeaders(headers)),
       onStage: (stage) =>
         this.observer.onRequestOptimized?.(res.locals['project'] as string | undefined, stage, res.locals['requestId'] as string),
@@ -660,6 +727,8 @@ export class TokenImproverProxy {
     const isStreaming = payload['stream'] === true;
     const body = JSON.stringify(payload);
 
+    // The cache is used when the request arrives, so the keep-alive counts its 5 minutes from here.
+    const usedAt = Date.now();
     let upstream: globalThis.Response;
     try {
       upstream = await this.fetchWithRetry(`${this.config.upstreamBaseUrl}/v1/messages`, {
@@ -687,14 +756,28 @@ export class TokenImproverProxy {
 
     // Relay the upstream status and headers before any body work begins.
     res.status(upstream.status);
+    res.locals['anthropicRequestId'] = upstream.headers.get('request-id') ?? undefined;
     upstream.headers.forEach((value, name) => {
       if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase()) && name.toLowerCase() !== 'content-encoding') {
         res.setHeader(name, value);
       }
     });
 
+    const rememberForKeepAlive = (): void => {
+      if (upstream.ok) {
+        this.keepAlive.remember(chatKey(original, res.locals['project'] as string | undefined), {
+          body,
+          headers: credentialHeaders(headers),
+          project: res.locals['project'] as string | undefined,
+          sessionId: sessionIdOf(original),
+          usedAt,
+        });
+      }
+    };
+
     if (isStreaming && upstream.body) {
       await this.relayStream(upstream, res, telemetry, settle);
+      rememberForKeepAlive();
       return;
     }
 
@@ -703,14 +786,38 @@ export class TokenImproverProxy {
       this.log(`upstream HTTP ${upstream.status} (${res.locals['project'] ?? 'unknown'}): ${text.slice(0, 300)}`);
     }
     let usage: ApiUsage | undefined;
+    let stopReason: string | undefined;
     try {
-      usage = (JSON.parse(text) as { usage?: ApiUsage }).usage;
+      const parsed = JSON.parse(text) as { usage?: ApiUsage; stop_reason?: unknown };
+      usage = parsed.usage;
+      stopReason = typeof parsed.stop_reason === 'string' ? parsed.stop_reason : undefined;
     } catch {
       usage = undefined;
     }
 
-    settle({ telemetry, usage, status: upstream.status });
+    settle({ telemetry, usage, status: upstream.status, stopReason });
     res.send(text);
+    rememberForKeepAlive();
+  }
+
+  /** Replay the last request with one output token to renew its cache; never touches the client. */
+  private async sendPing(snapshot: KeepAliveSnapshot, body: string): Promise<PingResult> {
+    const response = await upstreamFetch(`${this.config.upstreamBaseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { ...snapshot.headers, 'content-type': 'application/json' },
+      body,
+    });
+    const parsed = (await response.json().catch(() => ({}))) as { usage?: Record<string, unknown>; model?: string };
+    return { status: response.status, usage: parsed.usage, model: parsed.model };
+  }
+
+  /** Stop pings (proxy shutdown) and drop the in-memory credentials. */
+  stopKeepAlive(): void {
+    this.keepAlive.stop();
+  }
+
+  setKeepAliveMaxMinutes(minutes: number): void {
+    this.keepAlive.setMaxMinutes(minutes);
   }
 
   /**
@@ -763,7 +870,7 @@ export class TokenImproverProxy {
       const message = error instanceof Error ? error.message : String(error);
       this.log(`stream relay interrupted: ${message}`);
     } finally {
-      settle({ telemetry, usage: parser.result(), status: upstream.status });
+      settle({ telemetry, usage: parser.result(), status: upstream.status, stopReason: parser.stopReason() });
       res.end();
     }
   }
@@ -843,10 +950,7 @@ export class TokenImproverProxy {
           const result = await this.summarizeChunk(chunk, headers);
           texts.push(result.text);
           if (result.usage) {
-            usage = {
-              inputTokens: (usage?.inputTokens ?? 0) + result.usage.inputTokens,
-              outputTokens: (usage?.outputTokens ?? 0) + result.usage.outputTokens,
-            };
+            usage = addSummarizerUsage(usage, result.usage);
           }
         }
         return { text: texts.filter((t) => t.trim()).join('\n\n'), usage };
@@ -867,7 +971,7 @@ export class TokenImproverProxy {
   ): Promise<{ text: string; usage: SummarizerUsage | undefined }> {
     const chunkTokens = estimatePayloadTokens({ messages });
     const request = {
-      model: HAIKU_MODEL_ID,
+      model: this.models.current.haiku,
       // The prompt only *asks* for the target size; models routinely overshoot
       // a self-reported length target. This enforces it — Haiku's output tokens are
       // priced above Sonnet's input rate, so an unbounded manifest can cost more than
@@ -1017,6 +1121,7 @@ export class TokenImproverProxy {
   }
 
   stop(): Promise<void> {
+    this.keepAlive.stop();
     return new Promise((resolve) => {
       if (!this.server) {
         resolve();

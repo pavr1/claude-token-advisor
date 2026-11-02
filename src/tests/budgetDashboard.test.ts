@@ -63,7 +63,7 @@ test('status helpers map every status to its icon, label and colour, with On Tra
   );
   assert.deepEqual(
     ['over_budget', 'warning', 'watch', 'on_track'].map(statusColor),
-    [COLORS.bad, COLORS.warn, '#d7ba7d', COLORS.good]
+    [COLORS.bad, COLORS.warn, '#ffd166', COLORS.good]
   );
   assert.deepEqual(['over_pace', 'under_pace', 'on_track'].map(paceLabel), ['Above Pace', 'Below Pace', 'On track']);
   assert.deepEqual(['over_pace', 'under_pace', 'on_track'].map(paceColor), [COLORS.bad, COLORS.info, COLORS.good]);
@@ -137,8 +137,8 @@ test('the Budget tab headlines the month, the status pills and the key figures i
     })
   );
   assert.match(html, /Claude Budget Advisor/);
-  assert.match(html, /<span class="pill" style="background:#e2a336">Warning<\/span>/);
-  assert.match(html, /<span class="pill" style="background:#f14c4c">Above Pace<\/span>/);
+  assert.match(html, /<span class="pill" style="background:#f2b84b">Warning<\/span>/);
+  assert.match(html, /<span class="pill" style="background:#f2704f">Above Pace<\/span>/);
   assert.match(html, /Model: claude-sonnet-5/);
   assert.match(html, /2026-10 · day 19 · 12 days left · estimated from local usage · configured budget · 1 projects/);
   assert.ok(html.includes(`${compact(400_000)} / ${compact(1_000_000)}`));
@@ -208,18 +208,18 @@ test('pace delta reads as plain language, not a signed number', () => {
 
 test('the month-over-month card is red when spending rose, green when it fell, and a dash without history', () => {
   const up = buildBudgetSectionHtml(summary({ efficiency_delta_percent: 12.345, previous_month: '2026-09', previous_month_tokens: 300_000 }));
-  assert.match(up, /color:#f14c4c">\+12\.35%/);
+  assert.match(up, /color:#f2704f">\+12\.35%/);
   assert.ok(up.includes(`vs 2026-09 (${compact(300_000)} tokens)`));
   const down = buildBudgetSectionHtml(summary({ efficiency_delta_percent: -4, previous_month: '2026-09' }));
-  assert.match(down, /color:#3fb950">-4\.00%/);
+  assert.match(down, /color:#3fd0b6">-4\.00%/);
   const none = buildBudgetSectionHtml(summary());
-  assert.match(none, /color:#8b8b8b">—/);
+  assert.match(none, /color:#8a9bad">—/);
   assert.match(none, /No previous month to compare/);
 });
 
 test('projected month end turns red above 100% of budget', () => {
-  assert.match(buildBudgetSectionHtml(summary({ projected_percent: 120 })), /Projected month end<\/div>\s*<div class="stat-value" style="color:#f14c4c"/);
-  assert.match(buildBudgetSectionHtml(summary({ projected_percent: 100 })), /Projected month end<\/div>\s*<div class="stat-value" style="color:#3fb950"/);
+  assert.match(buildBudgetSectionHtml(summary({ projected_percent: 120 })), /Projected month end<\/div>\s*<div class="stat-value" style="color:#f2704f"/);
+  assert.match(buildBudgetSectionHtml(summary({ projected_percent: 100 })), /Projected month end<\/div>\s*<div class="stat-value" style="color:#3fd0b6"/);
 });
 
 test('the model bars carry the tier colour and name, scaled to the biggest share', () => {
@@ -234,15 +234,15 @@ test('the model bars carry the tier colour and name, scaled to the biggest share
       ],
     })
   );
-  assert.match(html, /opus<span class="tier" style="background:#f14c4c">premium/);
-  assert.match(html, /sonnet<span class="tier" style="background:#e2a336">balanced/);
-  assert.match(html, /haiku<span class="tier" style="background:#3fb950">economy/);
-  assert.match(html, /mystery<span class="tier" style="background:#8b8b8b">other/);
-  assert.match(html, /width:100\.0%;background:#f14c4c/);
-  assert.match(html, /width:50\.0%;background:#e2a336/);
+  assert.match(html, /opus<span class="tier" style="background:#f2704f">premium/);
+  assert.match(html, /sonnet<span class="tier" style="background:#f2b84b">balanced/);
+  assert.match(html, /haiku<span class="tier" style="background:#3fd0b6">economy/);
+  assert.match(html, /mystery<span class="tier" style="background:#8a9bad">other/);
+  assert.match(html, /width:100\.0%;background:#f2704f/);
+  assert.match(html, /width:50\.0%;background:#f2b84b/);
   // The agent is the model with the most tokens, not the biggest share.
   assert.match(html, /Model: haiku/);
-  assert.match(html, /unknown<span class="tier" style="background:#8b8b8b">unknown/);
+  assert.match(html, /unknown<span class="tier" style="background:#8a9bad">unknown/);
 });
 
 test('with no model usage the tab says so', () => {
@@ -272,8 +272,8 @@ test('the daily chart marks today, days over target, and says so when empty', ()
   assert.match(html, /aria-label="Daily token usage"/);
   assert.match(html, /Day 4: 20,000 tokens \(today\)|Day 4: 20.000 tokens \(today\)|Day 4: [\d.,\s  ]+ tokens \(today\)/);
   assert.match(html, /tokens — over target/);
-  assert.match(html, /fill="#6b8fc7"/);
-  assert.match(html, /fill="#c96a67"/);
+  assert.match(html, /fill="#3fc9b0"/);
+  assert.match(html, /fill="#e8745a"/);
   assert.match(html, /opacity="0\.12"/);
   assert.ok(html.includes(`daily target ${compact(30_000)}`));
   assert.match(html, /day 4<\/text>/);
@@ -290,8 +290,8 @@ test('month over month needs two months, marks months above budget, and says so 
     summary({ history: [{ month: '2026-09', tokens: 1_500_000 }, { month: '2026-10', tokens: 400_000 }] })
   );
   assert.match(html, /2026-09/);
-  assert.match(html, /background:#c96a67"><\/div><\/div>\s*<div class="bar-value">1\.50M/);
-  assert.match(html, /background:#6b8fc7"><\/div><\/div>\s*<div class="bar-value">400\.00K/);
+  assert.match(html, /background:#e8745a"><\/div><\/div>\s*<div class="bar-value">1\.50M/);
+  assert.match(html, /background:#3fc9b0"><\/div><\/div>\s*<div class="bar-value">400\.00K/);
   assert.match(buildBudgetSectionHtml(summary({ history: [{ month: '2026-09', tokens: 1 }] })), /Not enough history yet to compare months\./);
 });
 
@@ -301,14 +301,14 @@ test('a percent-mode plan swaps in the session reading and drops the dollar sect
   assert.match(html, /of session used/);
   assert.match(html, /plan usage as reported by Anthropic \(session \/ weekly\)/);
   // 90% of the session is over budget on the status bar's thresholds, whatever Python scored.
-  assert.match(html, /<span class="pill" style="background:#f14c4c">Over Budget<\/span>/);
+  assert.match(html, /<span class="pill" style="background:#f2704f">Over Budget<\/span>/);
   assert.match(html, /tokens today/);
   assert.doesNotMatch(html, /Recommended daily pace|Daily usage vs target|Month over month|Above Pace|Below Pace/);
 
   // With only the weekly window, that one drives the donut; with none, zero.
   const weekly = buildBudgetSectionHtml(summary({ plan: PRO_PLAN }), { fiveHour: undefined, sevenDay: window(0.6) });
-  assert.match(weekly, /<span class="pill" style="background:#e2a336">Warning<\/span>/);
-  assert.match(buildBudgetSectionHtml(summary({ plan: PRO_PLAN })), /<span class="pill" style="background:#3fb950">On Track<\/span>/);
+  assert.match(weekly, /<span class="pill" style="background:#f2b84b">Warning<\/span>/);
+  assert.match(buildBudgetSectionHtml(summary({ plan: PRO_PLAN })), /<span class="pill" style="background:#3fd0b6">On Track<\/span>/);
 });
 
 test('the real-cost comparison is skipped in percent mode', () => {

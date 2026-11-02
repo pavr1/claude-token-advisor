@@ -601,10 +601,10 @@ test('cache multipliers and the units priced from them follow the pricing table,
 
     const sonnet = cacheMultipliers('claude-sonnet-5');
     assert.ok(Math.abs(sonnet.read - 0.2) < 1e-9 && Math.abs(sonnet.write - 1.5) < 1e-9 && Math.abs(sonnet.write1h - 3) < 1e-9);
-    // No 1h rate published for this model: that kind alone is left unpriced, never guessed.
+    // No 1h rate published for this model: the published 2x input is used, so no kind is left unpriced.
     const haiku = cacheMultipliers('claude-haiku-x');
-    assert.equal(haiku.write1h, 0);
-    assert.deepEqual(haiku.unpriced, ['write1h']);
+    assert.ok(Math.abs(haiku.write1h - 2) < 1e-9);
+    assert.equal(haiku.unpriced, undefined);
 
     const t = telemetry({ originalModel: 'claude-sonnet-5', effectiveModel: 'claude-sonnet-5' });
     const cost = computeTurnCost(t, {
@@ -658,3 +658,67 @@ test('an unreadable month file is skipped instead of failing the tracker', () =>
   assert.deepEqual(entries.map((e) => e.project), ['ok']);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+/** Haiku 5.5 as the feed publishes it (the short tier) next to the Sonnet that anchors the NCU scale. */
+function withHaiku55Table(run: () => void): void {
+  resetPricing();
+  try {
+    const rates = getPricingTable().rates;
+    rates['claude-sonnet-5'] = { input: 2e-6, output: 10e-6, cacheRead: 0.2e-6, cacheWrite: 2.5e-6 };
+    rates['claude-haiku-5-5'] = { input: 0.1e-6, output: 0.5e-6, cacheRead: 0.01e-6, cacheWrite: 0.125e-6 };
+    run();
+  } finally {
+    resetPricing();
+  }
+}
+
+test('a Haiku 5.5 turn whose whole prompt is over 100,000 tokens bills every token at the long tier, cache reads included', () =>
+  withHaiku55Table(() => {
+    const t = telemetry({ originalModel: 'claude-haiku-5-5', effectiveModel: 'claude-haiku-5-5', rawTokens: 150_000 });
+    // 5K new + 10K written + 135K read = 150K prompt: over the threshold although the regular input alone is not.
+    const long = computeTurnCost(t, { input_tokens: 5_000, cache_creation_input_tokens: 10_000, cache_read_input_tokens: 135_000, output_tokens: 1_000 });
+    const w = 0.05 * 5;
+    const m = cacheMultipliers('claude-haiku-5-5');
+    assert.ok(Math.abs(long.regularInputUnits - 5_000 * w) < 1e-6);
+    assert.ok(Math.abs(long.cacheReadUnits - 135_000 * m.read * w) < 1e-6);
+    assert.ok(Math.abs(long.cacheWriteUnits - 10_000 * m.write * w) < 1e-6);
+    assert.ok(Math.abs(long.outputUnits - 1_000 * 0.25 * 5) < 1e-6);
+
+    const short = computeTurnCost(t, { input_tokens: 5_000, cache_creation_input_tokens: 10_000, cache_read_input_tokens: 85_000, output_tokens: 1_000 });
+    assert.ok(Math.abs(short.regularInputUnits - 5_000 * 0.05) < 1e-6, '100,000 exactly is still the short tier');
+  }));
+
+test('the baseline of a Haiku 5.5 turn is tiered by the prompt the client would have sent, not by what was billed', () =>
+  withHaiku55Table(() => {
+    // The client would have sent 150K, the proxy trimmed it to 40K: the baseline pays the long tier, the served turn the short one.
+    const t = telemetry({ originalModel: 'claude-haiku-5-5', effectiveModel: 'claude-haiku-5-5', rawTokens: 150_000 });
+    const cost = computeTurnCost(t, { input_tokens: 40_000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 });
+    assert.ok(Math.abs(cost.baselineUnitCost - 150_000 * 0.05 * 5) < 1e-6);
+    assert.ok(Math.abs(cost.actualUnitCost - 40_000 * 0.05) < 1e-6);
+  }));
+
+test('the summarizer is billed at the long tier only for the calls whose prompt crossed the threshold', () =>
+  withHaiku55Table(() => {
+    const t = telemetry({
+      summarizerUsage: { inputTokens: 160_000, outputTokens: 3_000, longPromptInputTokens: 110_000, longPromptOutputTokens: 2_000 },
+    });
+    const cost = computeTurnCost(t, undefined);
+    const expected = 50_000 * 0.05 + 1_000 * 0.25 + 110_000 * 0.05 * 5 + 2_000 * 0.25 * 5;
+    assert.ok(Math.abs(cost.summarizerUnitCost - expected) < 1e-6);
+    // Usage recorded before the long-prompt fields existed is all short tier.
+    const old = computeTurnCost(telemetry({ summarizerUsage: { inputTokens: 160_000, outputTokens: 3_000 } }), undefined);
+    assert.ok(Math.abs(old.summarizerUnitCost - (160_000 * 0.05 + 3_000 * 0.25)) < 1e-6);
+  }));
+
+test('rows without stored units are rebuilt at the long tier when their prompt was over 100,000 tokens', () =>
+  withHaiku55Table(() => {
+    const m = cacheMultipliers('claude-haiku-5-5');
+    const long = entry({ servedModel: 'claude-haiku-5-5', uncachedInputTokens: 5_000, cacheWriteTokens: 10_000, cacheReadTokens: 100_000 });
+    assert.ok(Math.abs(entryUnits(long).read - 100_000 * m.read * 0.25) < 1e-6);
+    assert.ok(Math.abs(entryUnits(long).regular - 5_000 * 0.25) < 1e-6);
+    const filled = backfillCacheCosts({ ...long, cacheNoCacheUnitCost: undefined, cacheActualUnitCost: undefined } as unknown as LedgerEntry);
+    assert.ok(Math.abs(filled.cacheNoCacheUnitCost - 110_000 * 0.25) < 1e-6);
+
+    const short = entry({ servedModel: 'claude-haiku-5-5', uncachedInputTokens: 5_000, cacheReadTokens: 90_000 });
+    assert.ok(Math.abs(entryUnits(short).read - 90_000 * m.read * 0.05) < 1e-6);
+  }));

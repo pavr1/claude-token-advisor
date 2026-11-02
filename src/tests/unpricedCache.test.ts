@@ -52,9 +52,11 @@ function hit(over: Partial<LedgerEntry> = {}): LedgerEntry {
 test('a rate the table lacks is reported as unpriced, not replaced by a constant', () => {
   priceModelWithoutCacheRates();
   const rates = cacheMultipliers(MODEL);
-  assert.deepEqual(rates.unpriced, ['read', 'write', 'write1h']);
+  // Read and write are never guessed; the 1h write is the published 2x input (an input price is all it needs).
+  assert.deepEqual(rates.unpriced, ['read', 'write']);
   assert.equal(rates.read, 0);
   assert.equal(rates.write, 0);
+  assert.ok(Math.abs(rates.write1h - 2) < 1e-9);
 });
 
 test('a model with every rate has no unpriced list', () => {

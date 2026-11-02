@@ -49,8 +49,8 @@ test('InFlightTracker reports per project counts and whether a new turn is pendi
   tracker.start('a', true, 1001);
   tracker.start('b', false, 1002);
   assert.deepEqual([...tracker.snapshot(2000)], [
-    ['a', { count: 2, preflight: [], newTurn: true, since: 1000 }],
-    ['b', { count: 1, preflight: [], newTurn: false, since: 1002 }],
+    ['a', { count: 2, preflight: [], newTurn: true, since: 1000, sessionId: undefined }],
+    ['b', { count: 1, preflight: [], newTurn: false, since: 1002, sessionId: undefined }],
   ]);
 
   tracker.finish('a');
@@ -152,7 +152,11 @@ test('liveRow has one cell per header column and keeps the arrow column constant
 
   // Time, Repo, Status, Turns, Hits, Raw, Cleanup, Haiku summary, Sent, arrow, Total received, CR, CW, RI, Billed.
   assert.equal(cells.length, 15);
-  assert.equal(cells[9], '<td class="turn-arrow">→</td>');
+  // Optimized and on its way: the arrow flies until the answer replaces the row.
+  assert.match(cells[9], /class="turn-arrow"><span class="arrow-fly"[^>]*>→<\/span>/);
+  // Before the request leaves, the column stays empty.
+  const before = liveRow('repo', { count: 1, newTurn: true, since: 0, preflight: [{ rawTokens: 1000 }] }, 0).split('</tr>')[0];
+  assert.equal((before.match(/<td[\s\S]*?<\/td>/g) ?? [])[9], '<td class="turn-arrow"></td>');
 });
 
 test('liveRow fills Raw request, Cleanup, Haiku summary and Sent one column at a time', () => {
@@ -280,4 +284,28 @@ test('hourlySeries buckets by local hour and stops at the end it is given', () =
   assert.deepEqual(points.map((p) => p.label), ['00:00', '01:00', '02:00', '03:00', '04:00', '05:00', '06:00', '07:00', '08:00', '09:00', '10:00', '11:00']);
   assert.equal(points[9].turns, 1);
   assert.equal(points[10].turns, 1);
+});
+
+test('processing icons move on their own: same row keeps its needle, different rows differ', async () => {
+  const { processingIcon } = await import('../ui/shared');
+  assert.equal(processingIcon('a#1'), processingIcon('a#1'));
+  const styles = new Set(['a#1', 'a#2', 'b#1', 'c#9', 'd#4'].map((k) => processingIcon(k)));
+  assert.ok(styles.size > 1);
+  assert.match(processingIcon('a#1'), /gauge-icon/);
+});
+
+test('a hit that ends in tool_use keeps the project live while local tools run, until the next hit or an end_turn', () => {
+  const t = new InFlightTracker();
+  t.start('p', true, 1000, 'a', 's1');
+  t.finish('p', 'tool_use', 's1', 2000);
+  assert.equal(t.snapshot(3000).get('p')?.count, 0);
+  assert.ok(t.snapshot(3000).has('p'));
+  t.start('p', false, 4000, 'b', 's1');
+  t.finish('p', 'end_turn', 's1', 5000);
+  assert.equal(t.snapshot(6000).has('p'), false);
+  // another chat's side request does not end it; an expired wait drops out
+  t.finish('p', 'tool_use', 's1', 7000);
+  t.finish('p', 'end_turn', 's2', 7100);
+  assert.ok(t.snapshot(8000).has('p'));
+  assert.equal(t.snapshot(7000 + 11 * 60_000).has('p'), false);
 });

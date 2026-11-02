@@ -9,7 +9,7 @@ import test, { afterEach } from 'node:test';
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
 
-import { DEFAULT_OPTIMIZER_CONFIG } from '../proxy/optimizer';
+import { DEFAULT_OPTIMIZER_CONFIG, SONNET_MODEL_ID } from '../proxy/optimizer';
 import { announceVersion, probeProxy, subscribeToEvents } from '../proxy/coordinator';
 import {
   DEFAULT_PROXY_CONFIG,
@@ -17,6 +17,7 @@ import {
   parseUnifiedRateLimitHeaders,
   PROXY_SERVICE_ID,
   ProxyEvent,
+  ProxyConfig,
   ProxyPortInUseError,
   TokenImproverProxy,
   TurnRecord,
@@ -82,7 +83,7 @@ async function startFakeUpstream(
 }
 
 /** Start the proxy on an ephemeral port, collecting the turns it reports. */
-async function startProxy(upstreamBaseUrl: string, optimizer = DEFAULT_OPTIMIZER_CONFIG) {
+async function startProxy(upstreamBaseUrl: string, optimizer = DEFAULT_OPTIMIZER_CONFIG, proxyOverrides: Partial<ProxyConfig> = {}) {
   const turns: TurnRecord[] = [];
   const realCosts: RealCostEvent[] = [];
 
@@ -94,7 +95,8 @@ async function startProxy(upstreamBaseUrl: string, optimizer = DEFAULT_OPTIMIZER
 
   const starts = { count: 0, projects: [] as (string | undefined)[] };
   const proxy = new TokenImproverProxy(
-    { ...DEFAULT_PROXY_CONFIG, port, upstreamBaseUrl, optimizer },
+    // These tests count what reaches the fake upstream, so the lookup of the newest models stays off unless one asks for it.
+    { ...DEFAULT_PROXY_CONFIG, port, upstreamBaseUrl, optimizer, lookupLatestModels: false, ...proxyOverrides },
     {
       onRequestStart: (project) => {
         starts.count += 1;
@@ -844,7 +846,7 @@ test('Stage 0: only the first request since proxy start is defaulted off Opus, a
   await fetch(`${url}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: opusBody });
   await fetch(`${url}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: opusBody });
 
-  assert.equal(JSON.parse(upstream.captures[0].body).model, 'claude-sonnet-5');
+  assert.equal(JSON.parse(upstream.captures[0].body).model, SONNET_MODEL_ID);
   assert.equal(turns[0].telemetry.startupModelDefaulted, true);
 
   // A later request explicitly on Opus (e.g. the user ran `/model opus`) must reach
@@ -1011,4 +1013,27 @@ test('a fetch failure reports its cause, and only broken connections are retried
   assert.equal(isRetryableConnectionError(reset), true);
   assert.equal(isRetryableConnectionError(Object.assign(new Error('x'), { cause: { code: 'UND_ERR_HEADERS_TIMEOUT' } })), false);
   assert.equal(isRetryableConnectionError(new Error('boom')), false);
+});
+
+test("Anthropic's request-id header is recorded on the turn, for plain and streaming replies", async () => {
+  for (const streaming of [false, true]) {
+    const upstream = await startFakeUpstream((_capture, res) => {
+      res.writeHead(200, { 'content-type': streaming ? 'text/event-stream' : 'application/json', 'request-id': 'req_011ABC' });
+      res.end(
+        streaming
+          ? 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+          : JSON.stringify({ id: 'msg_1', type: 'message', content: [], usage: { input_tokens: 1, output_tokens: 1 } })
+      );
+    });
+    const { proxy, turns, url } = await startProxy(upstream.url);
+    const response = await fetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'sk-test', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 64, stream: streaming, messages: [{ role: 'user', content: 'hello there' }] }),
+    });
+    await response.text();
+    assert.equal(turns[0]?.anthropicRequestId, 'req_011ABC', streaming ? 'streaming' : 'plain');
+    await proxy.stop();
+    await upstream.close();
+  }
 });

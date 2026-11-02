@@ -8,16 +8,16 @@ import { aggregate, LedgerEntry, localDayKey, sentTokens } from '../analytics/tr
 import { CHART, compact, escapeHtml } from './shared';
 
 /**
- * The charts' palette: neutral grey and one blue for the main series, with a muted trio only
+ * The charts' palette: slate grey and the icon's teal for the main series, with a muted trio only
  * where several lines must stay apart. Nothing is saturated, so no series shouts over the rest.
  */
 const SERIES = {
-  raw: '#7d8794',
+  raw: '#8a9bad',
   accent: CHART.accent,
-  sage: '#78a89c',
-  lilac: '#a08cc0',
-  amber: '#c9a35e',
-  copper: '#c98a6a',
+  sage: '#6fc4b3',
+  lilac: '#7f9bb8',
+  amber: '#e0b45a',
+  copper: '#e08a6c',
 };
 
 /** A range longer than this keeps only its newest days, so every bar stays readable. */
@@ -276,10 +276,10 @@ function chartSvg(
         const top = y(stackTop + value);
         const barHeight = y(stackTop) - top;
         if (barHeight > 0) {
-          rects += `<rect x="${(centre(i) - barArea / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${barArea.toFixed(1)}" height="${barHeight.toFixed(1)}" fill="${layer.color}" fill-opacity="0.9" rx="2"><title>${escapeHtml(partTip(p, layer))}</title></rect>`;
+          rects += `<rect x="${(centre(i) - barArea / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${barArea.toFixed(1)}" height="${barHeight.toFixed(1)}" fill="${layer.color}" fill-opacity="0.9" rx="2" data-series="${escapeHtml(layer.name)}"><title>${escapeHtml(partTip(p, layer))}</title></rect>`;
           // Only a segment tall enough for a line of text carries its figure.
           if (barHeight >= 13) {
-            labels += label(value, centre(i), top + barHeight / 2, textOn(layer.color), barArea + 2, undefined, barHeight);
+            labels += `<g data-series="${escapeHtml(layer.name)}">${label(value, centre(i), top + barHeight / 2, textOn(layer.color), barArea + 2, undefined, barHeight)}</g>`;
           }
         }
         stackTop += value;
@@ -301,14 +301,15 @@ function chartSvg(
         .map((p, i) => {
           const cx = centre(i).toFixed(1);
           const cy = y(layer.value(p), layer.axis).toFixed(1);
-          return `<g><circle cx="${cx}" cy="${cy}" r="2.2" fill="${layer.color}" stroke="var(--vscode-editor-background, #1e1e1e)" stroke-width="1.5"></circle><circle cx="${cx}" cy="${cy}" r="8" fill="transparent"><title>${escapeHtml(partTip(p, layer))}</title></circle></g>`;
+          return `<g data-series="${escapeHtml(layer.name)}"><circle cx="${cx}" cy="${cy}" r="2.2" fill="${layer.color}" stroke="var(--vscode-editor-background, #1e1e1e)" stroke-width="1.5"></circle><circle cx="${cx}" cy="${cy}" r="8" fill="transparent"><title>${escapeHtml(partTip(p, layer))}</title></circle></g>`;
         })
         .join('');
       // Line figures sit on a pill of the page colour, so they read over any bar behind them.
       const labels = points
         .map((p, i) => label(layer.value(p), centre(i), y(layer.value(p), layer.axis) - 9, `color-mix(in srgb, ${layer.color} 65%, var(--vscode-foreground, #888))`, slot + 12, 'var(--vscode-editor-background, #1e1e1e)'))
         .join('');
-      return `<polyline points="${coords.join(' ')}" fill="none" stroke="${layer.color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" pointer-events="none"></polyline>${dots}<g pointer-events="none">${labels}</g>`;
+      const name = escapeHtml(layer.name);
+      return `<polyline points="${coords.join(' ')}" fill="none" stroke="${layer.color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" pointer-events="stroke" data-series="${name}"></polyline>${dots}<g pointer-events="none" data-series="${name}">${labels}</g>`;
     })
     .join('');
 
@@ -319,9 +320,9 @@ function chartSvg(
   </svg>`;
 }
 
-function legend(items: ReadonlyArray<{ name: string; color: string }>): string {
+function legend(items: ReadonlyArray<{ name: string; color: string; series?: string }>): string {
   return `<div class="legend">${items
-    .map((item) => `<span class="legend-item"><span class="dot" style="background:${item.color}"></span>${escapeHtml(item.name)}</span>`)
+    .map((item) => `<span class="legend-item" data-series="${escapeHtml(item.series ?? item.name)}"><span class="dot" style="background:${item.color}"></span>${escapeHtml(item.name)}</span>`)
     .join('')}</div>`;
 }
 
@@ -358,7 +359,7 @@ export function historyChartsHtml(
     { name: 'Summarized removed', unit: 'tokens', color: SERIES.lilac, value: (p) => p.summarized },
     { name: 'Billed', unit: 'units', color: SERIES.amber, value: (p) => p.billed, axis: 'right' },
   ];
-  const flow = chartSvg(points, flowBars, 'Raw and received tokens per period, with removals and billed units as lines', FLOW_WIDTH, 260, flowLines);
+  const flow = chartSvg(points, flowBars, 'Raw and received tokens per period, with removals and billed units as lines', FLOW_WIDTH, 170, flowLines);
   // Units are tokens × the model's price for that kind of token, so the tooltip shows the average rate.
   const avgRate = (units: (p: DayPoint) => number, tokens: (p: DayPoint) => number) => (p: DayPoint): string =>
     tokens(p) > 0 ? ` (avg × ${Number((units(p) / tokens(p)).toFixed(3))})` : '';
@@ -373,7 +374,7 @@ export function historyChartsHtml(
       ],
       `CR versus CW ${unit === 'tokens' ? 't' : 'u'} per period`,
       HALF_WIDTH,
-      240
+      150
     );
   const cacheLegend = legend([
     { name: 'CR', color: SERIES.accent },
@@ -381,29 +382,225 @@ export function historyChartsHtml(
   ]);
 
   return `<h2>History</h2>
-  <div>
+  <div data-chart-scope>
     <div class="stat-label" style="text-transform:none">Request flow: tokens on the left axis, Billed units on the right</div>
     ${flow}
     ${legend([
       { name: 'Raw', color: SERIES.raw },
       { name: 'Received', color: SERIES.accent },
-      { name: 'Cleanup removed (line)', color: SERIES.sage },
-      { name: 'Summarized removed (line)', color: SERIES.lilac },
-      { name: 'Billed, units (line, right axis)', color: SERIES.amber },
+      { name: 'Cleanup removed (line)', series: 'Cleanup removed', color: SERIES.sage },
+      { name: 'Summarized removed (line)', series: 'Summarized removed', color: SERIES.lilac },
+      { name: 'Billed, units (line, right axis)', series: 'Billed', color: SERIES.amber },
     ])}
   </div>
+  <hr style="border:0;border-top:1px solid var(--vscode-panel-border, rgba(128,128,128,0.4));margin:16px 0 0">
   <div class="chart-grid" style="margin-top:14px">
-    <div>
-      <div class="stat-label" style="text-transform:none">CR vs CW, t</div>
+    <div data-chart-scope>
+      <div class="stat-label" style="text-transform:none">CR vs CW, Tokens</div>
       ${cacheChart('tokens', (p) => p.readTokens, (p) => p.writeTokens)}
       ${cacheLegend}
     </div>
-    <div>
-      <div class="stat-label" style="text-transform:none">CR vs CW, billed u</div>
+    <div data-chart-scope>
+      <div class="stat-label" style="text-transform:none">CR vs CW, Units</div>
       ${cacheChart('units', (p) => p.readUnits, (p) => p.writeUnits)}
       ${cacheLegend}
     </div>
   </div>
   <div style="height:14px"></div>
   <hr style="border:0;border-top:1px solid var(--vscode-panel-border, rgba(128,128,128,0.4));margin:0 0 16px">`;
+}
+
+// ---------------------------------------------------------------------------
+// Saving trend: the percentage the header donuts used to show, over time
+// ---------------------------------------------------------------------------
+
+/** The headline percentage of a set of turns: at least vs. the best client cache, else the estimate. */
+function savingPercentOf(entries: readonly LedgerEntry[]): { percent: number; mark: string } | undefined {
+  if (entries.length === 0) {
+    return undefined;
+  }
+  const stats = aggregate(entries);
+  return stats.floorTurns > 0
+    ? { percent: stats.floorSavingsPercent, mark: '≥ ' }
+    : { percent: stats.savingsPercent, mark: '~' };
+}
+
+/** The headline percentage worked out step by step, so every figure in it can be checked against the table. */
+function savingFormula(entries: readonly LedgerEntry[]): string {
+  if (entries.length === 0) {
+    return 'No requests in this period.';
+  }
+  const stats = aggregate(entries);
+  const n = (value: number): string => Math.round(value).toLocaleString();
+  const floor = stats.floorTurns > 0;
+  const billed = floor ? stats.floorActualUnitCost : stats.actualUnitCost;
+  const without = floor ? stats.floorBaselineUnitCost : stats.baselineUnitCost;
+  const percent = floor ? stats.floorSavingsPercent : stats.savingsPercent;
+  const rows = floor ? entries.filter((e) => e.floorBaselineUnitCost !== undefined) : entries;
+  const sum = (pick: (e: LedgerEntry) => number | undefined): number => rows.reduce((total, e) => total + (pick(e) ?? 0), 0);
+  const exact = rows.filter((e) => e.rawTokensExact === true).length;
+  const cachedKnown = rows.every((e) => e.floorCachedTokens !== undefined);
+  const lines = [
+    'Saving = 1 − Billed ÷ Without proxy',
+    '',
+    `Billed = what Anthropic charged, ${rows.length.toLocaleString()} requests = ${n(billed)} u`,
+    `  regular input ${n(sum((e) => e.regularInputUnits))} + cache read ${n(sum((e) => e.cacheReadUnits))}`,
+    `  + cache write ${n(sum((e) => e.cacheWriteUnits))} + output ${n(sum((e) => e.outputUnits))}`,
+    `  + Haiku summaries ${n(sum((e) => e.summarizerUnitCost))}`,
+    '',
+    `Without proxy = same requests as Claude Code sends them = ${n(without)} u`,
+    '  per request: cached × read rate + (raw − cached) × write rate + output × rate',
+    `  raw (size before the proxy) = ${n(sum((e) => e.rawTokens))} t`,
+    `    exact count on ${exact.toLocaleString()} of ${rows.length.toLocaleString()} requests, rest estimated locally`,
+    cachedKnown
+      ? `  cached (prefix the client cache still holds, ≤ 1 h) = ${n(sum((e) => e.floorCachedTokens))} t`
+      : `  cached (prefix the client cache still holds) is not stored on older requests`,
+    `  output = ${n(sum((e) => e.outputTokens))} t; rates are the original model's price per token`,
+    floor ? '  best-case client cache, so the saving is at least this' : '',
+    '',
+    `1 − ${n(billed)} ÷ ${n(without)} = ${percent.toFixed(2)}%`,
+  ];
+  return lines.filter((line, i) => line !== '' || lines[i - 1] !== '').join(String.fromCharCode(10));
+}
+
+interface TrendPoint {
+  /** Bottom-axis text: the hour (`14:00`) or the day (`10-28`). */
+  label: string;
+  /** Saving of all turns up to the end of this bucket. */
+  percent: number | undefined;
+}
+
+const TREND = { width: 420, height: 96, left: 34, right: 10, top: 10, bottom: 22 };
+/** About this many labels along the bottom; more would touch each other. */
+const TREND_TICKS = 6;
+
+/**
+ * A small line chart of the saving percentage per hour or per day. One line, the time along the
+ * bottom, and a tooltip with just the time and the percentage. It scales with the width of its
+ * column, so the header charts share the page width instead of being a fixed size.
+ */
+export function savingTrendSvg(
+  entries: readonly LedgerEntry[],
+  startMs: number,
+  endMs: number,
+  unit: 'hour' | 'day',
+  ariaLabel: string
+): string {
+  const buckets = groupEntries(entries, startMs, endMs, unit === 'hour' ? hourKey : localDayKey);
+  const first = new Date(startMs);
+  const slots: Array<{ key: string; label: string }> = [];
+  if (unit === 'hour') {
+    for (let h = 0; h < 24; h += 1) {
+      const at = new Date(first.getFullYear(), first.getMonth(), first.getDate(), h);
+      if (at.getTime() >= endMs) {
+        break;
+      }
+      slots.push({ key: hourKey(at), label: `${String(h).padStart(2, '0')}:00` });
+    }
+  } else {
+    const days = Math.min(MAX_CHART_DAYS, Math.max(0, Math.round((endMs - startMs) / DAY_MS)));
+    for (let i = 0; i < days; i += 1) {
+      const key = localDayKey(new Date(first.getFullYear(), first.getMonth(), first.getDate() + i));
+      slots.push({ key, label: key.slice(5) });
+    }
+  }
+  // Leading empty buckets add nothing: start at the first one with data.
+  const firstActive = slots.findIndex((slot) => (buckets.get(slot.key)?.length ?? 0) > 0);
+  if (firstActive < 0) {
+    return `<div class="trend-empty">No requests yet</div>`;
+  }
+
+  // Running figure: each point is the saving of everything up to the end of its bucket, so the last
+  // point is the headline number and a quiet bucket simply repeats the previous value.
+  const seen: LedgerEntry[] = [];
+  const points: TrendPoint[] = slots.slice(firstActive).map((slot) => {
+    seen.push(...(buckets.get(slot.key) ?? []));
+    return { label: slot.label, percent: savingPercentOf(seen)?.percent };
+  });
+
+  // An hour with one tiny request can read -400 %: the line is clamped, the tooltip keeps the real value.
+  const clamp = (value: number): number => Math.max(-100, Math.min(100, value));
+  const values = points.map((p) => p.percent).filter((v): v is number => v !== undefined).map(clamp);
+  const lo = Math.min(0, ...values);
+  const hi = Math.max(0, ...values);
+  const span = hi - lo || 1;
+  const plotW = TREND.width - TREND.left - TREND.right;
+  const plotH = TREND.height - TREND.top - TREND.bottom;
+  const x = (i: number): number => TREND.left + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
+  const y = (value: number): number => TREND.top + (1 - (clamp(value) - lo) / span) * plotH;
+
+  // Break the line where a bucket has no value instead of drawing across the gap.
+  let d = '';
+  let pen = false;
+  points.forEach((p, i) => {
+    if (p.percent === undefined) {
+      pen = false;
+      return;
+    }
+    d += `${pen ? 'L' : 'M'}${x(i).toFixed(1)} ${y(p.percent).toFixed(1)} `;
+    pen = true;
+  });
+
+  const dots = points
+    .map((p, i) =>
+      p.percent === undefined
+        ? ''
+        : `<circle cx="${x(i).toFixed(1)}" cy="${y(p.percent).toFixed(1)}" r="2.5" fill="${SERIES.accent}" data-series="saving"></circle>` +
+          `<circle cx="${x(i).toFixed(1)}" cy="${y(p.percent).toFixed(1)}" r="8" fill="transparent"><title>${escapeHtml(`${p.label} · ${p.percent.toFixed(1)}%`)}</title></circle>`
+    )
+    .join('');
+
+  // Times along the bottom, evenly spaced; the last one is dropped when it would sit on its neighbour.
+  const step = Math.max(1, Math.ceil(points.length / TREND_TICKS));
+  const ticks = points
+    .map((p, i) => ({ p, i }))
+    .filter(({ i }) => i % step === 0 && (i + step <= points.length - 1 || i === points.length - 1 || points.length - 1 - i >= step / 2));
+  const tickText = ticks
+    .map(({ p, i }) => {
+      const anchor = i === 0 ? 'start' : 'middle';
+      return `<text x="${x(i).toFixed(1)}" y="${TREND.height - 6}" text-anchor="${anchor}" class="trend-axis">${escapeHtml(p.label)}</text>`;
+    })
+    .join('');
+
+  const zeroY = y(0).toFixed(1);
+  return `<svg viewBox="0 0 ${TREND.width} ${TREND.height}" class="trend-svg" role="img" aria-label="${escapeHtml(ariaLabel)}">
+    <line x1="${TREND.left}" x2="${TREND.width - TREND.right}" y1="${zeroY}" y2="${zeroY}" stroke="${CHART.target}" stroke-dasharray="3 3"></line>
+    <text x="${TREND.left - 5}" y="${TREND.top + 4}" text-anchor="end" class="trend-axis">${Math.round(hi)}%</text>
+    <text x="${TREND.left - 5}" y="${TREND.height - TREND.bottom}" text-anchor="end" class="trend-axis">${Math.round(lo)}%</text>
+    ${tickText}
+    <path d="${d.trim()}" fill="none" stroke="${SERIES.accent}" stroke-width="2" pointer-events="stroke" data-series="saving"></path>
+    ${dots}
+  </svg>`;
+}
+
+/** The header block: today (or the filtered range) by hour on the left, this month by day on the right. */
+export function savingTrendsHtml(
+  rangeEntries: readonly LedgerEntry[],
+  range: { start: number; end: number },
+  rangeTitle: string,
+  monthEntries: readonly LedgerEntry[],
+  tone: (percent: number) => string,
+  now: Date = new Date()
+): string {
+  const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).getTime();
+  const singleDay = range.end - range.start <= DAY_MS + 3_600_000;
+  const rangeEnd = singleDay ? Math.min(range.end, now.getTime() + 1) : Math.min(range.end, tomorrow);
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  const grain = singleDay ? 'hour' : 'day';
+
+  const block = (title: string, hint: string, entries: readonly LedgerEntry[], svg: string): string => {
+    const headline = savingPercentOf(entries);
+    const figure = headline
+      ? `<span class="trend-figure" style="color:${tone(headline.percent)}" data-tooltip="${escapeHtml(savingFormula(entries))}">${escapeHtml(headline.mark + headline.percent.toFixed(2))}%</span>`
+      : '<span class="trend-figure">—</span>';
+    return `<div class="trend-block" title="${escapeHtml(hint)}">
+      <div class="trend-title">${escapeHtml(title)} ${figure}</div>
+      ${svg}
+    </div>`;
+  };
+
+  return `<div class="trend-row">
+    ${block(rangeTitle, `Saving so far, at the end of each ${grain}; the last point is the figure beside the title.`, rangeEntries, savingTrendSvg(rangeEntries, range.start, rangeEnd, grain, `${rangeTitle}: saving by ${grain}`))}
+    ${block('This month · all repos', 'Saving so far, at the end of each day; the last point is the figure beside the title.', monthEntries, savingTrendSvg(monthEntries, monthStart, tomorrow, 'day', 'This month: saving by day'))}
+  </div>`;
 }

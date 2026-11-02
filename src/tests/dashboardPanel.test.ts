@@ -265,5 +265,22 @@ test('the page script wires the hooks the host relies on', () => {
     assert.ok(html.includes(hook), `page script should contain ${hook}`);
   }
   // Both filters the host understands are listened for.
-  assert.match(html, /\['project', 'range', 'from', 'to'\]/);
+  assert.match(html, /\['project', 'status', 'range', 'from', 'to'\]/);
+});
+
+test('the Tips button sits at the end of the tab bar, and the page script opens and closes the popup', () => {
+  DashboardPanel.show(tracker, undefined, 'improver');
+  const html = panelFake().webview.html;
+  // The button is in the tab bar, after the tabs themselves.
+  const bar = html.slice(html.indexOf('<div class="tabs">'), html.indexOf('</div>', html.indexOf('<div class="tabs">')));
+  assert.ok(bar.indexOf('data-tab="improver"') < bar.indexOf('data-open-tips'), 'after the tabs');
+  assert.match(bar, /<button type="button" class="tips-btn" data-open-tips[^>]*><svg[\s\S]*<\/svg>Tips<\/button>/);
+  // The popup is in the Token Improver pane, hidden until the script adds `tips-open`.
+  assert.match(html, /<div class="tips-modal" data-tips-modal>/);
+  assert.match(html, /Tips to save tokens/);
+  // An update of the page keeps the popup open: its class belongs to the page, not to the markup.
+  assert.match(html, /CLIENT_CLASSES = \['open-turn', 'open', 'flash', 'tips-open'\]/);
+  assert.match(html, /event\.target\.closest\('\[data-open-tips\]'\)/);
+  assert.match(html, /event\.target\.closest\('\[data-close-tips\]'\) \|\| event\.target\.matches\('\[data-tips-modal\]'\)/);
+  assert.match(html, /event\.key === 'Escape'/);
 });

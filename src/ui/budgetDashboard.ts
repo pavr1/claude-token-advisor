@@ -90,7 +90,7 @@ export function statusColor(status: string): string {
     case 'warning':
       return COLORS.warn;
     case 'watch':
-      return '#d7ba7d';
+      return '#ffd166';
     default:
       return COLORS.good;
   }
@@ -179,7 +179,7 @@ function dailyChart(series: Array<{ day: number; tokens: number }>, target: numb
       const tooltip = escapeHtml(
         `Day ${point.day}: ${point.tokens.toLocaleString()} tokens${isToday ? ' (today)' : over ? ' — over target' : ''}`
       );
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${Math.max(barHeight, 0).toFixed(1)}" rx="2" fill="${fill}" opacity="${opacity}" data-tooltip="${tooltip}"></rect>`;
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${Math.max(barHeight, 0).toFixed(1)}" rx="2" fill="${fill}" opacity="${opacity}" data-series="${isToday ? 'today' : over ? 'over target' : 'under target'}" data-tooltip="${tooltip}"></rect>`;
     })
     .join('');
 

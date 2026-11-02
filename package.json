@@ -2,7 +2,7 @@
   "name": "claude-budget-advisor",
   "displayName": "Claude Budget Advisor & Token Improver",
   "description": "Tracks Claude Code project token pacing and monthly budget health, and runs a local optimizing proxy that prunes outgoing Anthropic Messages API traffic.",
-  "version": "0.2.61",
+  "version": "0.2.96",
   "publisher": "pablo-villalobos",
   "engines": {
     "vscode": "^1.95.0"
@@ -190,6 +190,13 @@
             "type": "boolean",
             "default": false,
             "description": "Measure the size before optimization with Anthropic's count_tokens instead of a local estimate. More exact, but adds one call per turn."
+          },
+          "claudeTokenImprover.keepAliveMaxMinutes": {
+            "type": "number",
+            "default": 30,
+            "minimum": 0,
+            "maximum": 120,
+            "description": "Keep the prompt cache warm with a one-token ping every ~4.5 min, until this many minutes after your last request (30 by default, 0 = off). Each ping costs one cache read of the prefix; it pays off for pauses under ~30 min. Measured on the October ledger: best around 30. On a subscription plan every ping counts against your usage limit."
           },
           "claudeTokenImprover.pricingUrl": {
             "type": "string",

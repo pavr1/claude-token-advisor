@@ -164,10 +164,10 @@ test('the date filter drops entries outside the range', () => {
   assert.match(render(entries, { project: ALL, range: 'custom', from: day, to: day }), /1 optimized requests/);
 });
 
-test('a range with no requests still renders, with an empty donut', () => {
+test('a range with no requests still renders, with an empty trend chart', () => {
   const html = render([row({ read: 1_000 }, { minutesAgo: 5 * 24 * 60 })], { project: ALL, range: 'yesterday' });
   assert.match(html, /0 optimized requests/);
-  assert.match(html, /no requests/);
+  assert.match(html, /No requests yet/);
 });
 
 test('a Haiku summary is listed in the Billed tooltip when the turn paid for one', () => {
@@ -183,18 +183,22 @@ test('settings are read through the vscode configuration', () => {
   assert.doesNotThrow(() => render([row({ read: 1_000 })]));
 });
 
-test('the header shows both the filtered saving and the monthly saving beside the title', () => {
+test('the header shows the filtered saving and the monthly saving as two small trend charts', (t) => {
+  // Mid-month, so "2 days ago" is always still this month whatever day the suite runs on.
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 9, 20, 12, 0, 0) });
   const entries = [row({ read: 80_000, write: 5_000 }, { minutesAgo: 1 }), row({ read: 1_000, write: 40_000 }, { minutesAgo: 2 * 24 * 60 })];
   const html = render(entries, TODAY);
   const head = html.slice(html.indexOf('<div class="head">'), html.indexOf('<h2>Turns'));
   assert.match(head, /Claude Token Improver/);
   assert.match(head, /Today · all repos/);
   assert.match(head, /This month · all repos/);
-  assert.equal((head.match(/<svg /g) ?? []).length, 2);
-  assert.match(head, /donut-mini/);
+  assert.equal((head.match(/class="trend-svg"/g) ?? []).length, 2);
+  assert.doesNotMatch(head, /donut-mini/);
   assert.equal((html.match(/This month · all repos/g) ?? []).length, 1);
-  // The two donuts are different numbers: today's turn is healthy, the month includes a cold one.
-  const percents = [...head.matchAll(/class="donut-figure"[^>]*>([^<]+)</g)].map((m) => m[1]);
+  // Today on the left, the month on the right.
+  assert.ok(head.indexOf('Today · all repos') < head.indexOf('This month · all repos'));
+  // The two figures differ: today's turn is healthy, the month includes a cold one.
+  const percents = [...head.matchAll(/class="trend-figure"[^>]*>([^<]+)</g)].map((m) => m[1]);
   assert.equal(percents.length, 2);
   assert.notEqual(percents[0], percents[1]);
 });
@@ -221,4 +225,19 @@ test('the stats grid has four cards: saving, cache, pruning and downgrades', () 
     assert.ok(html.includes(`<div class="stat-label">${label}</div>`), label);
   }
   assert.doesNotMatch(html, /Typical saving|Baseline vs actual|Tokens pruned/);
+});
+
+test('the trend charts draw one line, label the time along the bottom, and tooltip only time and percentage', async () => {
+  const { savingTrendSvg } = await import('../ui/historyChart');
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const entries = [row({ read: 80_000, write: 5_000 }, { minutesAgo: 1 })];
+  const svg = savingTrendSvg(entries, start, now.getTime() + 1, 'hour', 'test');
+  assert.equal((svg.match(/<path /g) ?? []).length, 1);
+  const tips = [...svg.matchAll(/<title>([^<]*)<\/title>/g)].map((m) => m[1]);
+  assert.ok(tips.length >= 1);
+  for (const tip of tips) {
+    assert.match(tip, /^\d\d:00 · -?\d+\.\d%$/);
+  }
+  assert.match(svg, /class="trend-axis"[^>]*>\d\d:00</);
 });

@@ -25,9 +25,12 @@ import {
 import { RealCostTracker } from '../analytics/realCostTracker';
 import { InFlightProject, inFlightRequests } from '../analytics/inflight';
 import { RANGE_LABELS, RangeId, resolveRange } from './dateRange';
-import { ARROW_CELL, haikuSummaryCell, liveHitRows, liveRow, PROCESSING, pendingTotals, savingsTone, SummaryUse, timeCell } from './liveTurnRow';
+import { processingIcon } from './shared';
+import { ARROW_CELL, ARROW_FLYING_CELL, haikuSummaryCell, liveHitRows, liveRow,  pendingTotals, savingsTone, SummaryUse, timeCell } from './liveTurnRow';
 import { CLIENT_PREFIX_REUSE, isFailedHit, sentTokens } from '../analytics/tracker';
-import { historyChartsHtml } from './historyChart';
+import { Balance, HitBalance, hitBalanceOf } from './hitBalance';
+import { tipsPopupHtml } from './tips';
+import { historyChartsHtml, savingTrendsHtml } from './historyChart';
 import { PlanInfo, planLabel, planViewMode } from './planView';
 import { DEFAULT_OPTIMIZER_CONFIG } from '../proxy/optimizer';
 import { getPricingTable } from '../proxy/pricing';
@@ -37,7 +40,6 @@ import {
   COLORS,
   compact,
   donutChart,
-  miniDonut,
   escapeHtml,
   formatPercent,
   formatShare,
@@ -53,9 +55,15 @@ export const TURN_SETTLE_MS = 2000;
 export interface AnalyticsFilters {
   project: string;
   range: RangeId;
+  /** Turn status filter: ALL, or one of done / warning / failed / processing. */
+  status?: string;
   from?: string;
   to?: string;
+  /** How many chats the table draws; a wide range has thousands of hits, so it starts at CHATS_PAGE and grows on request. Totals always cover every row. */
+  chats?: number;
 }
+
+export const CHATS_PAGE = 30;
 
 /** Start of the current local day (epoch ms), matching `dayKey`'s local-time bucket. */
 function localDayStart(now = new Date()): number {
@@ -79,7 +87,7 @@ export function buildAnalyticsSectionHtml(
 ): string {
   const all = tracker.getEntries();
   if (!all.length) {
-    return buildEmptyState();
+    return buildEmptyState() + tipsPopupHtml([], keepAliveMinutes());
   }
 
   const months = [...new Set(all.map(monthKey))].sort().reverse();
@@ -99,6 +107,11 @@ export function buildAnalyticsSectionHtml(
   const stats = aggregate(entries);
 
   return buildReport(entries, stats, months, projects, effectiveProject, all, realCostTracker, plan, filters);
+}
+
+/** Minutes the keep-alive keeps going after the last request; the tips only suggest it when it is off. */
+function keepAliveMinutes(): number {
+  return vscode.workspace.getConfiguration('claudeTokenImprover').get<number>('keepAliveMaxMinutes', 30);
 }
 
 function buildEmptyState(): string {
@@ -150,21 +163,10 @@ function buildReport(
   const monthKeyNow = localMonthKey(new Date());
   // The monthly donut is the fixed reference: this month, every repo, whatever the filters say.
   const monthEntries = all.filter((entry) => monthKey(entry) === monthKeyNow);
-  const monthView = savingView(aggregate(monthEntries));
-  const dayView = savingView(stats);
   // The at-least figure needs per-turn data that older rows never recorded, so until the month is
   // covered it measures only the turns that carry it, and says so instead of looking like a full month.
-  const monthAgg = aggregate(monthEntries);
-  const partialMonth = monthAgg.floorTurns > 0 && monthAgg.floorTurns < monthAgg.turns;
   const rangeLabel = filters.range === 'custom' ? `${filters.from ?? ''} → ${filters.to ?? filters.from ?? ''}` : RANGE_LABELS[filters.range].replace('…', '');
   const scopeLabel = effectiveProject === ALL ? 'all repos' : effectiveProject;
-  // A small ring with the figure beneath it, so the head stays about as tall as the title and subtitle.
-  const savedDonut = (view: { percent: number; mark: string } | undefined): string =>
-    view
-      ? `${miniDonut(Math.max(0, view.percent), savingsTone(view.percent), 'saved')}<div class="donut-figure" style="color:${savingsTone(view.percent)}">${escapeHtml(view.mark + formatPercent(view.percent))}</div>`
-      : `${miniDonut(0, 'var(--vscode-badge-background, #555)', 'no requests')}<div class="donut-figure">—</div>`;
-  const rangeDonut = savedDonut(stats.turns > 0 ? dayView : undefined);
-  const monthDonut = savedDonut(monthAgg.turns > 0 ? monthView : undefined);
 
   return `
   <div class="head">
@@ -172,16 +174,7 @@ function buildReport(
       <h1>Claude Token Improver</h1>
       <div class="subtitle">${stats.turns.toLocaleString()} optimized requests · Normalized Cost Units, Sonnet input = 1.0 · pricing source: ${pricing.source}</div>
     </div>
-    <div class="donut-row">
-      <div class="donut-block" title="${escapeHtml(hasFloor ? 'Saving, at least: worst case vs. the best client cache. Short ranges can swing.' : 'Estimated saving. Short ranges can swing.')}">
-        ${rangeDonut}
-        <div class="donut-title">${escapeHtml(rangeLabel)} · ${escapeHtml(scopeLabel)}</div>
-      </div>
-      <div class="donut-block" title="${escapeHtml(partialMonth ? `This month, all repos. Only ${monthAgg.floorTurns.toLocaleString()} of ${monthAgg.turns.toLocaleString()} turns carry the data for the worst-case figure.` : 'This month, all repos: the steadier figure.')}">
-        ${monthDonut}
-        <div class="donut-title">This month · all repos</div>
-      </div>
-    </div>
+    ${savingTrendsHtml(entries, resolveRange(filters), `${rangeLabel} · ${scopeLabel}`, monthEntries, savingsTone)}
   </div>
 
   ${lastTurnsTable(all, filters, inFlightRequests.snapshot())}
@@ -245,7 +238,8 @@ function buildReport(
   ${breakdownSection(entries, (entry) => entry.requestedModel, 'No model data for this selection.')}
 
   <h2>Recent requests</h2>
-  ${recentTable(entries)}`;
+  ${recentTable(entries)}
+  ${tipsPopupHtml(entries, keepAliveMinutes())}`;
 }
 
 /**
@@ -259,6 +253,23 @@ function buildReport(
  * newest turn: that row is "in progress". A request that opens a new prompt has no ledger
  * row yet, so it gets a "started" row on top until its first hit lands.
  */
+const STATUS_OPTIONS: ReadonlyArray<readonly [string, string]> = [
+  [ALL, 'All'],
+  ['done', 'Done'],
+  ['warning', 'Warning'],
+  ['failed', 'Failed'],
+  ['processing', 'Processing'],
+];
+
+/** A finished turn is failed when no hit went through, a warning when some failed, otherwise done. */
+function turnStatus(group: TurnGroup): string {
+  const failedHits = group.entries.filter(isFailedHit).length;
+  if (failedHits === group.entries.length) {
+    return 'failed';
+  }
+  return failedHits > 0 || isFailedHit({ status: group.entries[group.entries.length - 1].status }) ? 'warning' : 'done';
+}
+
 function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, inFlight: ReadonlyMap<string, InFlightProject>): string {
   const range = resolveRange(filters);
   const inRange = all.filter((entry) => {
@@ -267,19 +278,15 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
   });
   const projects = [...new Set(inRange.map((entry) => entry.project))].sort();
   const project = filters.project === ALL || projects.includes(filters.project) ? filters.project : ALL;
-  const groups = groupTurns(inRange).filter((group) => project === ALL || group.project === project);
+  const status = STATUS_OPTIONS.some(([id]) => id === filters.status) ? (filters.status as string) : ALL;
+  const groups = groupTurns(inRange).filter((group) => (project === ALL || group.project === project) && (status === ALL || turnStatus(group) === status));
   // In-flight requests belong to now, so they only show when the range reaches today.
-  const live = new Map(range.includesNow ? [...inFlight].filter(([name]) => project === ALL || name === project) : []);
+  const live = new Map(range.includesNow && (status === ALL || status === 'processing') ? [...inFlight].filter(([name]) => project === ALL || name === project) : []);
   // Other ranges number their turns under their own prefix so an expanded turn of one range
   // is not mistaken for the same-numbered turn of another.
   const prefix = filters.range === 'today' ? '' : `${filters.range}${filters.range === 'custom' ? `${filters.from}${filters.to}` : ''}:`;
   // Every row shows its date and time, whatever range is selected.
   const withDate = true;
-
-  const newestOf = new Map<string, TurnGroup>();
-  for (const group of groups) {
-    newestOf.set(group.project, group);
-  }
 
   // Turn number within its project: a live new-turn row and the row it becomes share one,
   // so the client can tell which cells changed instead of treating the swap as a new row.
@@ -291,15 +298,42 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
     ordinals.set(group, `${prefix}${n}`);
   }
 
-  const started = [...live]
-    .filter(([, state]) => state.newTurn)
-    .sort(([, a], [, b]) => b.since - a.since)
-    .map(([name, state]) => liveRow(name, state, `${prefix}${(perProject.get(name) ?? 0) + 1}`));
+  const lastAt = (group: TurnGroup): number => Date.parse(group.entries[group.entries.length - 1].timestamp);
+  // Every Enter is one row. A request still running joins the newest real turn of its repo (and chat,
+  // when known); a keep-alive ping is a row of its own and never takes it.
+  const targetOf = new Map<string, TurnGroup>();
+  for (const [name, state] of live) {
+    if (state.newTurn) {
+      continue;
+    }
+    for (let i = groups.length - 1; i >= 0; i--) {
+      const group = groups[i];
+      if (group.ping || group.project !== name) {
+        continue;
+      }
+      if (state.sessionId !== undefined && group.sessionId !== undefined && group.sessionId !== state.sessionId) {
+        continue;
+      }
+      targetOf.set(name, group);
+      break;
+    }
+  }
 
-  const done = [...groups].reverse().map((group) => {
-    const state = live.get(group.project);
-    const isLive = state !== undefined && !state.newTurn && newestOf.get(group.project) === group;
-    return turnRow(group, isLive ? state : undefined, ordinals.get(group) ?? '0', withDate);
+  const startedRow = (name: string, state: InFlightProject): string => liveRow(name, state, `${prefix}${(perProject.get(name) ?? 0) + 1}`);
+  const started = [...live]
+    .filter(([name, state]) => state.newTurn || !targetOf.has(name))
+    .sort(([, x], [, y]) => y.since - x.since)
+    .map(([name, state]) => startedRow(name, state));
+
+  const limit = filters.chats ?? CHATS_PAGE;
+  const sortedGroups = [...groups].sort((x, y) => lastAt(y) - lastAt(x));
+  const hidden = Math.max(0, sortedGroups.length - limit);
+  const done = sortedGroups.slice(0, limit).map((group) => {
+    const ordinal = ordinals.get(group) ?? '0';
+    if (group.ping) {
+      return pingRow(group, ordinal, withDate);
+    }
+    return turnRow(group, targetOf.get(group.project) === group ? live.get(group.project) : undefined, ordinal, withDate);
   });
 
   const rangeOptions = (Object.keys(RANGE_LABELS) as RangeId[])
@@ -309,12 +343,16 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
     `<option value="${ALL}"${project === ALL ? ' selected' : ''}>All repos</option>`,
     ...projects.map((name) => `<option value="${escapeHtml(name)}"${project === name ? ' selected' : ''}>${escapeHtml(name)}</option>`),
   ].join('');
+  const statusOptions = STATUS_OPTIONS.map(([id, label]) => `<option value="${id}"${status === id ? ' selected' : ''}>${label}</option>`).join('');
   const todayKey = localDayKey(new Date());
   const custom =
     filters.range === 'custom'
       ? `<div class="range-custom">From <input type="date" id="from" value="${escapeHtml(filters.from ?? todayKey)}"> to <input type="date" id="to" value="${escapeHtml(filters.to ?? filters.from ?? todayKey)}"></div>`
       : '';
-  const body = [...started, ...done].join('');
+  const more = hidden > 0
+    ? `<tr class="more-row"><td colspan="15"><button type="button" data-more>Show ${Math.min(CHATS_PAGE, hidden)} more rows (${hidden.toLocaleString()} hidden; the totals above already include them)</button></td></tr>`
+    : '';
+  const body = [...started, ...done].join('') + more;
   // The totals follow the table: they add up exactly the rows the filters leave in, and sit under
   // the column labels (both sticky) so they stay in view while the turns scroll.
   const shown = groups.flatMap((group) => group.entries);
@@ -326,16 +364,18 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
   const totals = shown.length || live.size
     ? (() => {
         const s = aggregate(shown);
-        return `<tr class="totals"><td colspan="3"></td><td class="num">${(groups.length + liveTurns).toLocaleString()}</td><td class="num">${(s.turns + liveHits).toLocaleString()}</td>${flowCells(s, { rawTokens: s.rawTokens + sum((t) => t.raw), prunedNorm: s.prunedByNormalization + sum((t) => t.pruned), comp: compressionOf(shown), reused: reusedOf(shown), skipped: skippedOf(shown), sent: s.optimizedTokens + sum((t) => t.sent) })}</tr>`;
+        return `<tr class="totals"><td colspan="3"></td><td class="num" title="${escapeHtml(`Turns = prompts you typed
+${groups.length.toLocaleString()} finished + ${liveTurns.toLocaleString()} running = ${(groups.length + liveTurns).toLocaleString()}`)}">${(groups.length + liveTurns).toLocaleString()}</td><td class="num" title="${escapeHtml(`Hits = requests sent to Anthropic
+${s.turns.toLocaleString()} finished + ${liveHits.toLocaleString()} running = ${(s.turns + liveHits).toLocaleString()}`)}">${(s.turns + liveHits).toLocaleString()}</td>${flowCells(s, { rawTokens: s.rawTokens + sum((t) => t.raw), prunedNorm: s.prunedByNormalization + sum((t) => t.pruned), comp: compressionOf(shown), reused: reusedOf(shown), skipped: skippedOf(shown), sent: s.optimizedTokens + sum((t) => t.sent) })}</tr>`;
       })()
     : '';
   const title = filters.range === 'today' ? 'Turns' : `Turns · ${RANGE_LABELS[filters.range].replace('…', '')}`;
   return `<h2>${title}</h2>
   ${custom}
   <div class="turns-scroll turns-main"><table class="turns-table">
-    <colgroup><col style="width:13%"><col style="width:10%"><col style="width:4%"><col style="width:5%"><col style="width:5%"><col style="width:8%"><col style="width:7%"><col style="width:8%"><col style="width:6%"><col style="width:6.5%"><col style="width:8%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:9%"></colgroup>
+    <colgroup><col style="width:12%"><col style="width:9.5%"><col style="width:4%"><col style="width:5%"><col style="width:5%"><col style="width:8%"><col style="width:7%"><col style="width:8%"><col style="width:6%"><col style="width:9%"><col style="width:8%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:9%"></colgroup>
     <thead><tr>
-      <th class="filter-th">${withDate ? 'Date' : 'Time'}<select id="range" title="Filter by date">${rangeOptions}</select></th><th class="filter-th">Repo<select id="project" title="Filter by repo">${projectOptions}</select></th><th>Status</th><th class="num">Turns</th><th class="num">Hits${HEADER_HELP.hits}</th><th class="num">Raw request${HEADER_HELP.raw}</th><th class="num">Cleanup${HEADER_HELP.cleanup}</th><th class="num">Summarized${HEADER_HELP.haiku}</th>
+      <th class="filter-th">${withDate ? 'Date' : 'Time'}<select id="range" title="Filter by date">${rangeOptions}</select></th><th class="filter-th">Repo<select id="project" title="Filter by repo">${projectOptions}</select></th><th class="filter-th">Status<select id="status" title="Filter by status">${statusOptions}</select></th><th class="num">Turns</th><th class="num">Hits${HEADER_HELP.hits}</th><th class="num">Raw request${HEADER_HELP.raw}</th><th class="num">Cleanup${HEADER_HELP.cleanup}</th><th class="num">Summarized${HEADER_HELP.haiku}</th>
       <th class="num">Estimate${HEADER_HELP.estimate}</th><th></th><th class="num">Received${HEADER_HELP.received}</th><th class="cache-col">CR${HEADER_HELP.cr}</th><th class="cache-col">CW${HEADER_HELP.cw}</th><th class="cache-col">RI${HEADER_HELP.ri}</th><th class="num">Billed${HEADER_HELP.billed}</th>
     </tr>${totals}</thead>
     <tbody>${body || '<tr><td colspan="15" class="empty">No optimized turns in this selection.</td></tr>'}</tbody>
@@ -413,7 +453,7 @@ function effectiveRate(units: number, tokens: number): string {
 
 function flowCells(
   s: AggregateStats,
-  flow: { rawTokens: number; prunedNorm: number; comp: SummaryUse; reused: SummaryUse; sent: number; skipped?: string }
+  flow: { rawTokens: number; prunedNorm: number; comp: SummaryUse; reused: SummaryUse; sent: number; skipped?: string; flying?: boolean; hitBalance?: HitBalance }
 ): string {
   const afterCleanup = flow.rawTokens - flow.prunedNorm;
   // Billed is the ledger's own invoice figure (input, output and the Haiku summary), and the
@@ -428,9 +468,17 @@ function flowCells(
     `CR ${compact(readUnits)} + CW ${compact(writeUnits)} + RI ${compact(uncachedUnits)} + output ${compact(outputUnits)}` +
     (s.summarizerUnitCost > 0 ? ` + Haiku summary ${compact(s.summarizerUnitCost)}` : '') +
     ` = ${compact(billed)} u`;
+  const full = (value: number): string => Math.round(value).toLocaleString();
 
+  const cleanupTitle = `Cleanup = Raw − removed by cleanup\n${full(flow.rawTokens)} − ${full(flow.prunedNorm)} = ${full(afterCleanup)} t`;
+  const summarized = flow.rawTokens - flow.prunedNorm - flow.sent;
+  const sentTitle = [
+    'Sent = Raw − cleanup − summary, counted locally',
+    `${full(flow.rawTokens)} − ${full(flow.prunedNorm)} − ${full(summarized)} = ${full(flow.sent)} t`,
+    'Received is the real figure',
+  ].join('\n');
   const step = (value: number, pruned: number, base: number): string =>
-    `<td class="num">${compact(value)}<div class="turn-sub" style="color:${savingsTone(pruned)}">−${compact(pruned)} (${formatShare(pruned, base)})</div></td>`;
+    `<td class="num" title="${escapeHtml(cleanupTitle)}">${compact(value)}<div class="turn-sub" style="color:${savingsTone(pruned)}">−${compact(pruned)} (${formatShare(pruned, base)})</div></td>`;
   // Short labels so no figure gets clipped; the full name and meaning live in the tooltip.
   // The cell shows each kind's billed units; tokens and their share of the received total live in the tooltip.
   // A hit can mix kinds, so the hit counts need not add up to the total.
@@ -439,30 +487,49 @@ function flowCells(
   // One column per kind, centred, each with its tokens on the top row and its billed units below.
   // A row is tinted on its own basis: tokens say whether the cache worked (was the prefix reused?),
   // units say what it cost (a written token is 12.5x a read one), so the two can disagree.
-  const tokensBalance = cacheBalanceStyle(s.cacheReadTokens, s.cacheWriteTokens, 't');
+  let tokensBalance = cacheBalanceStyle(s.cacheReadTokens, s.cacheWriteTokens, 't');
   // Units are judged by what the cache did: green when the reads saved more than the writes cost over full price.
-  const unitsBalance = cacheBalanceStyle(s.cacheReadSavedUnits, s.cacheWritePremiumUnits, 'u');
+  let unitsBalance = cacheBalanceStyle(s.cacheReadSavedUnits, s.cacheWritePremiumUnits, 'u');
+  // A turn is tinted by its hits, not by its total: red when all are red, green when all are green, amber when both kinds are there.
+  if (flow.hitBalance) {
+    tokensBalance = { style: styleOfBalance(flow.hitBalance.tokens), note: flow.hitBalance.tokens === 'amber' ? AMBER_NOTE : '' };
+    unitsBalance = { style: styleOfBalance(flow.hitBalance.units), note: flow.hitBalance.units === 'amber' ? AMBER_NOTE : '' };
+  }
   // Of the cached tokens, how many were read and how many written.
   const cached = s.cacheReadTokens + s.cacheWriteTokens;
   const effectNote = cached > 0 ? `CR: ${Math.round((s.cacheReadTokens / cached) * 100)}% CW: ${Math.round((s.cacheWriteTokens / cached) * 100)}%` : '';
   const cacheCell = (abbr: string, tokens: number, units: number, unpriced: readonly string[] = []): string => {
     const note = abbr === 'RI' ? '' : effectNote;
     const rate = effectiveRate(units, tokens);
-    const tokensTitle = `${abbr}: ${compact(tokens)} t`;
-    const unitsTitle = `${abbr}: ${compact(tokens)} t × ${rate} = ${compact(units)} u. ${note} ${unpricedNote(unpriced)}`.replace(/\s+/g, ' ').trim();
+    const tokensTitle = `${abbr}: ${compact(tokens)} t ${tokensBalance.style === AMBER_STYLE ? AMBER_NOTE : ''}`.trim();
+    const unitsTitle = `${abbr}: ${compact(tokens)} t × ${rate} = ${compact(units)} u. ${note} ${unitsBalance.style === AMBER_STYLE ? AMBER_NOTE : ''} ${unpricedNote(unpriced)}`.replace(/\s+/g, ' ').trim();
     return `<td class="cache-col"><div class="cache-val"${tokensBalance.style} title="${escapeHtml(tokensTitle)}">${compact(tokens)} ${TOKENS_ABBR}</div><div class="cache-val"${unitsBalance.style} title="${escapeHtml(unitsTitle)}">${compact(units)} ${UNITS_ABBR}</div></td>`;
   };
-  const receivedTitle = 'RI + CW + CR, as Anthropic reported it';
+  const receivedTitle = escapeHtml(
+    [
+      'Received = RI + CW + CR, as Anthropic reported it',
+      `${full(s.uncachedInputTokens)} + ${full(s.cacheWriteTokens)} + ${full(s.cacheReadTokens)} = ${full(received)} t`,
+    ].join('\n')
+  );
+  const rawTitle = escapeHtml(`Raw = the requests as Claude Code built them, before the proxy\n= ${full(flow.rawTokens)} t`);
 
-  return `<td class="num">${compact(flow.rawTokens)}</td>
+  return `<td class="num" title="${rawTitle}">${compact(flow.rawTokens)}</td>
     ${step(afterCleanup, flow.prunedNorm, flow.rawTokens)}
     ${haikuSummaryCell(flow.comp, flow.reused, flow.skipped)}
-    <td class="num">${compact(flow.sent)}</td>
-    ${ARROW_CELL}
+    <td class="num" title="${escapeHtml(sentTitle)}">${compact(flow.sent)}</td>
+    ${flow.flying ? ARROW_FLYING_CELL : ARROW_CELL}
     <td class="num" title="${receivedTitle}">${compact(received)}</td>
     ${cacheCell('CR', s.cacheReadTokens, readUnits, s.unpriced.read)}${cacheCell('CW', s.cacheWriteTokens, writeUnits, s.unpriced.write)}${cacheCell('RI', s.uncachedInputTokens, uncachedUnits)}
     <td class="num" title="${escapeHtml(billedTooltip)}">${compact(billed)} ${UNITS_ABBR}</td>`;
 }
+
+const RED_STYLE = ' style="background:rgba(229,83,75,0.16)"';
+const GREEN_STYLE = ' style="background:rgba(63,185,80,0.16)"';
+const AMBER_STYLE = ' style="background:rgba(242,184,75,0.32)"';
+const AMBER_NOTE = 'Amber: this turn has hits that wrote more than they read, and hits that did not.';
+
+const styleOfBalance = (balance: Balance): string =>
+  balance === 'red' ? RED_STYLE : balance === 'green' ? GREEN_STYLE : balance === 'amber' ? AMBER_STYLE : '';
 
 /**
  * Light red when the writes outweigh the reads, light green when the reads outweigh the writes, on
@@ -472,15 +539,15 @@ function flowCells(
  */
 function cacheBalanceStyle(reads: number, writes: number, basis: string): { style: string; note: string } {
   if (writes > reads) {
-    return { style: ' style="background:rgba(229,83,75,0.16)"', note: `Writes > reads (${basis}).` };
+    return { style: RED_STYLE, note: `Writes > reads (${basis}).` };
   }
   if (reads > writes) {
-    return { style: ' style="background:rgba(63,185,80,0.16)"', note: `Reads > writes (${basis}).` };
+    return { style: GREEN_STYLE, note: `Reads > writes (${basis}).` };
   }
   return { style: '', note: '' };
 }
 
-function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: number | string, withDate = false): string {
+function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: number | string, withDate = false, chatId?: string): string {
   const isLive = live !== undefined;
   const s = aggregate(group.entries);
   // Hits still in flight add their pre-flight numbers; received/billed stay completed-only.
@@ -489,7 +556,7 @@ function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: n
   const prunedNorm = s.prunedByNormalization + p.pruned;
   const sent = s.optimizedTokens + p.sent;
   const hits = group.entries.length + (live?.count ?? 0);
-  const flow = flowCells(s, { rawTokens, prunedNorm, comp: compressionOf(group.entries), reused: reusedOf(group.entries), skipped: skippedOf(group.entries), sent });
+  const flow = flowCells(s, { rawTokens, prunedNorm, comp: compressionOf(group.entries), reused: reusedOf(group.entries), skipped: skippedOf(group.entries), sent, flying: p.known.sent, hitBalance: hitBalanceOf(group.entries) });
 
   // A failure is judged on the turn's newest hit: a retry that went through makes it done again.
   const lastStatus = group.entries[group.entries.length - 1].status;
@@ -502,7 +569,7 @@ function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: n
   // ✖ only when nothing in the turn went through; a mix of failed and done hits is a warning.
   const allFailed = retried === group.entries.length;
   const statusCell = isLive
-    ? PROCESSING
+    ? processingIcon(`${group.project}#${ordinal}`)
     : allFailed
       ? `<span style="color:${COLORS.bad}" title="${escapeHtml(failedLabel)}">✖</span>`
       : failed || retried > 0
@@ -514,14 +581,16 @@ function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: n
   // through the same cells as the turn row, and the turn row sums these same entries (plus the
   // in-flight ones), so the hits add up to it. Numbers stay chronological: the newest has the highest.
   const hitRows =
-    (live ? liveHitRows(key, live) : '') +
+    (live ? liveHitRows(key, live, chatId) : '') +
     group.entries
-      .map((entry, index) => hitRow(entry, key, index))
+      .map((entry, index) => hitRow(entry, key, index, chatId))
       .reverse()
       .join('');
-  return `<tr${isLive ? ' class="turn-live"' : ''} data-row="${key}" data-toggle="${key}">
+  const classes = [isLive ? 'turn-live' : '', chatId ? 'turn-child' : ''].filter(Boolean).join(' ');
+  const parent = chatId ? ` data-parent="${escapeHtml(chatId)}"` : '';
+  return `<tr${classes ? ` class="${classes}"` : ''}${parent} data-row="${key}" data-toggle="${key}">
     ${timeCell(Date.parse(group.entries[group.entries.length - 1].timestamp), live?.since, true, withDate)}
-    <td>${escapeHtml(group.project)}</td>
+    <td>${escapeHtml(group.project)}${group.sessionId ? `<div class="turn-sub" title="${escapeHtml(`Claude Code chat ${group.sessionId}`)}">chat ${escapeHtml(group.sessionId.slice(0, 4))}</div>` : ''}</td>
     <td>${statusCell}</td>
     <td class="num">1</td>
     <td class="num">${hits}</td>
@@ -529,8 +598,31 @@ function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: n
   </tr>${hitRows}`;
 }
 
-/** One completed hit of a turn, shown when the turn is expanded. */
-function hitRow(entry: LedgerEntry, turnKey: string, index: number): string {
+/** A cache keep-alive ping: one turn of one hit, marked with a pulse so it is not mistaken for a prompt. */
+function pingRow(group: TurnGroup, ordinal: number | string, withDate: boolean): string {
+  const entry = group.entries[0];
+  const s = aggregate([entry]);
+  const flow = flowCells(s, {
+    rawTokens: s.rawTokens,
+    prunedNorm: s.prunedByNormalization,
+    comp: compressionOf([entry]),
+    reused: reusedOf([entry]),
+    skipped: skippedOf([entry]),
+    sent: s.optimizedTokens,
+  });
+  const failed = isFailedHit(entry);
+  const title = failed ? 'Cache keep-alive ping failed' : 'Cache keep-alive ping: a one-token request that keeps the prompt cache from expiring';
+  return `<tr class="ping-row" data-row="${escapeHtml(group.project)}#${ordinal}">
+    ${timeCell(Date.parse(entry.timestamp), undefined, true, withDate)}
+    <td>${escapeHtml(group.project)}<div class="turn-sub">keep-alive ping</div></td>
+    <td><span class="ping-icon${failed ? ' ping-failed' : ''}" title="${escapeHtml(title)}"></span></td>
+    <td class="num">1</td>
+    <td class="num">1</td>
+    ${flow}
+  </tr>`;
+}
+
+function hitRow(entry: LedgerEntry, turnKey: string, index: number, chatId?: string): string {
   const s = aggregate([entry]);
   // From the aggregate, not the raw row, so a failed hit shows what the turn counts for it: nothing.
   const flow = flowCells(s, {
@@ -545,7 +637,7 @@ function hitRow(entry: LedgerEntry, turnKey: string, index: number): string {
   const statusCell = failed
     ? `<span style="color:${COLORS.bad}" title="${entry.status === 0 ? `failed (no response)${entry.failure ? ` · ${escapeHtml(entry.failure)}` : ''}` : `failed (HTTP ${entry.status})`}">✖</span>`
     : `<span style="color:${COLORS.good}" title="Done">✔</span>`;
-  return `<tr class="hit-row" data-row="${turnKey}/h${index}" data-parent="${turnKey}">
+  return `<tr class="hit-row" data-row="${turnKey}/h${index}" data-parent="${turnKey}"${chatId ? ` data-ancestors="${escapeHtml(chatId)}"` : ''}>
     <td></td>
     <td class="hit-label" title="${escapeHtml(`${new Date(entry.timestamp).toLocaleString()} · ${entry.servedModel ?? ''}`)}">↳ hit ${index + 1}</td>
     <td>${statusCell}</td>

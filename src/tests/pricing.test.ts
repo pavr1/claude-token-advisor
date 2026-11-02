@@ -13,7 +13,17 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { AddressInfo } from 'node:net';
 
-import { cacheMultipliers, getPricingTable, loadPricing, modelOutputWeight, modelWeight, resetPricing, usdPerNormalizedUnit } from '../proxy/pricing';
+import {
+  cacheMultipliers,
+  getPricingTable,
+  LONG_PROMPT_THRESHOLD_TOKENS,
+  loadPricing,
+  longPromptFactor,
+  modelOutputWeight,
+  modelWeight,
+  resetPricing,
+  usdPerNormalizedUnit,
+} from '../proxy/pricing';
 
 const FAKE_FEED = {
   // Exact id this codebase's own NCU denominator looks up — see sonnetInputUsdPerToken().
@@ -262,7 +272,7 @@ test('an unreadable cache file counts as no cache, and an unwritable cache dir d
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('cacheMultipliers come from the table per model, and a kind the table lacks is unpriced, never guessed', async () => {
+test('cacheMultipliers come from the table per model; the 1h write falls back to the published 2x input, read and write are never guessed', async () => {
   const feed = await startFakeFeed({
     'claude-sonnet-5': {
       litellm_provider: 'anthropic',
@@ -278,8 +288,8 @@ test('cacheMultipliers come from the table per model, and a kind the table lacks
     await loadPricing(dir, feed.url);
     const m = cacheMultipliers('claude-sonnet-5');
     assert.ok(Math.abs(m.read - 0.2) < 1e-9 && Math.abs(m.write - 1.25) < 1e-9);
-    assert.equal(m.write1h, 0, 'no 1h rate published: nothing is invented');
-    assert.deepEqual(m.unpriced, ['write1h']);
+    assert.ok(Math.abs(m.write1h - 2) < 1e-9, 'no 1h rate published: the published 2x input applies');
+    assert.equal(m.unpriced, undefined, 'a derived 1h rate is a priced kind');
 
     resetPricing();
     const unknown = cacheMultipliers(undefined);
@@ -287,5 +297,65 @@ test('cacheMultipliers come from the table per model, and a kind the table lacks
   } finally {
     await feed.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a 1h rate the feed publishes wins over the derived 2x, and a model with no input price stays unpriced', () => {
+  resetPricing();
+  try {
+    const rates = getPricingTable().rates;
+    rates['claude-own-1h'] = { input: 2e-6, output: 1e-5, cacheRead: 0.2e-6, cacheWrite: 2.5e-6, cacheWrite1h: 5e-6 };
+    rates['claude-no-input'] = { input: 0, output: 1e-5, cacheRead: 0.2e-6, cacheWrite: 2.5e-6 };
+    assert.ok(Math.abs(cacheMultipliers('claude-own-1h').write1h - 2.5) < 1e-9, 'the published 1h rate is used as is');
+    assert.deepEqual(cacheMultipliers('claude-no-input').unpriced, ['read', 'write', 'write1h'], 'nothing is derived from a zero input price');
+  } finally {
+    resetPricing();
+  }
+});
+
+/** Haiku 5.5 as the feed publishes it (the short tier) next to the Sonnet that anchors the NCU scale. */
+function loadHaiku55Table(): void {
+  resetPricing();
+  const rates = getPricingTable().rates;
+  rates['claude-sonnet-5'] = { input: 2e-6, output: 10e-6, cacheRead: 0.2e-6, cacheWrite: 2.5e-6 };
+  rates['claude-haiku-5-5'] = { input: 0.1e-6, output: 0.5e-6, cacheRead: 0.01e-6, cacheWrite: 0.125e-6 };
+}
+
+test('Haiku 5.5 bills a prompt over 100,000 tokens at 5x, strictly above the threshold', () => {
+  loadHaiku55Table();
+  try {
+    const base = modelWeight('claude-haiku-5-5');
+    const baseOut = modelOutputWeight('claude-haiku-5-5');
+    assert.ok(Math.abs(base - 0.05) < 1e-12 && Math.abs(baseOut - 0.25) < 1e-12);
+
+    assert.equal(modelWeight('claude-haiku-5-5', undefined), base, 'no prompt length: the short tier');
+    assert.equal(modelWeight('claude-haiku-5-5', LONG_PROMPT_THRESHOLD_TOKENS), base, 'exactly 100,000 is still the short tier');
+    assert.ok(Math.abs(modelWeight('claude-haiku-5-5', LONG_PROMPT_THRESHOLD_TOKENS + 1) - base * 5) < 1e-12);
+    assert.ok(Math.abs(modelOutputWeight('claude-haiku-5-5', 150_000) - baseOut * 5) < 1e-12, 'output follows the same tier');
+    assert.ok(Math.abs(modelWeight('claude-haiku-5-5-20261001', 150_000) - base * 5) < 1e-12, 'a dated id of the model is tiered too');
+  } finally {
+    resetPricing();
+  }
+});
+
+test('the long-prompt tier does not touch other models, the cache multipliers, or rates that are not from the table', () => {
+  loadHaiku55Table();
+  try {
+    const rates = getPricingTable().rates;
+    rates['claude-haiku-4-5'] = { input: 1e-6, output: 5e-6, cacheRead: 0.1e-6, cacheWrite: 1.25e-6 };
+    assert.equal(modelWeight('claude-sonnet-5', 500_000), modelWeight('claude-sonnet-5'), 'Sonnet has no long tier');
+    assert.equal(modelWeight('claude-haiku-4-5', 500_000), modelWeight('claude-haiku-4-5'), 'Haiku 4.5 has no long tier');
+    assert.equal(longPromptFactor('claude-haiku-5-5', 500_000), 5);
+    assert.equal(longPromptFactor(undefined, 500_000), 1);
+
+    // Every rate of the long tier is 5x, so a cache rate over input is the same in both tiers.
+    const m = cacheMultipliers('claude-haiku-5-5');
+    assert.ok(Math.abs(m.read - 0.1) < 1e-9 && Math.abs(m.write - 1.25) < 1e-9 && Math.abs(m.write1h - 2) < 1e-9);
+
+    // Without the model in the table its rates are the family fallback (Haiku 4.5's), not Haiku 5.5's base: no 5x on top.
+    resetPricing();
+    assert.equal(modelWeight('claude-haiku-5-5', 500_000), modelWeight('claude-haiku-5-5'));
+  } finally {
+    resetPricing();
   }
 });

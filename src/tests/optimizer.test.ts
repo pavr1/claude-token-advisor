@@ -14,6 +14,7 @@ import {
   hasToolResults,
   DEFAULT_OPTIMIZER_CONFIG,
   HAIKU_MODEL_ID,
+  SONNET_MODEL_ID,
   SUMMARIZER_CHUNK_CHARS,
   manifestSystemPrompt,
   applyCacheTtl,
@@ -33,7 +34,10 @@ import {
   BaselineMemory,
   hasClientCacheControl,
   estimateCompactionEconomics,
+  addSummarizerUsage,
+  manifestMaxOutputTokens,
 } from '../proxy/optimizer';
+import { getPricingTable, modelOutputWeight, modelWeight, resetPricing } from '../proxy/pricing';
 import { estimatePayloadTokens, MessagesPayload } from '../proxy/tokenCounter';
 
 function config(overrides: Partial<OptimizerConfig> = {}): OptimizerConfig {
@@ -408,9 +412,9 @@ test('startup default routes a first-hit Opus request to Sonnet', async () => {
     { isStartupRequest: true }
   );
 
-  assert.equal(out.model, 'claude-sonnet-5');
+  assert.equal(out.model, SONNET_MODEL_ID);
   assert.equal(telemetry.startupModelDefaulted, true);
-  assert.equal(telemetry.effectiveModel, 'claude-sonnet-5');
+  assert.equal(telemetry.effectiveModel, SONNET_MODEL_ID);
 });
 
 test('startup default leaves non-Opus models and non-startup requests alone', async () => {
@@ -1095,4 +1099,33 @@ test('hasToolResults sees through trailing system-reminder messages, so one prom
   assert.equal(hasToolResults(asPayload([typed, toolUse, toolResult, snapshot, reminder])), true);
   assert.equal(hasToolResults(asPayload([typed, toolUse, toolResult, { role: 'assistant', content: 'done' }, snapshot])), false, 'a new prompt after the loop ended');
   assert.equal(hasToolResults(asPayload([])), false);
+});
+
+test('summarizer usage remembers which chunk calls had a prompt over the Haiku long-prompt threshold', () => {
+  let total = addSummarizerUsage(undefined, { inputTokens: 90_000, outputTokens: 1_500 });
+  assert.deepEqual(total, { inputTokens: 90_000, outputTokens: 1_500, longPromptInputTokens: 0, longPromptOutputTokens: 0 });
+  total = addSummarizerUsage(total, { inputTokens: 100_001, outputTokens: 2_000 });
+  total = addSummarizerUsage(total, { inputTokens: 100_000, outputTokens: 500 });
+  assert.deepEqual(total, { inputTokens: 290_001, outputTokens: 4_000, longPromptInputTokens: 100_001, longPromptOutputTokens: 2_000 });
+});
+
+test('the economics gate prices the Haiku tier by one chunk prompt, not by the sum of the chunks', () => {
+  resetPricing();
+  try {
+    const rates = getPricingTable().rates;
+    rates['claude-sonnet-5'] = { input: 2e-6, output: 10e-6, cacheRead: 0.2e-6, cacheWrite: 2.5e-6 };
+    rates[HAIKU_MODEL_ID] = { input: 0.1e-6, output: 0.5e-6, cacheRead: 0.01e-6, cacheWrite: 0.125e-6 };
+    const older = 120_000;
+    const base = { olderTokens: older, keptTokens: 20_000, cacheWarm: false, expectedRequests: 10 };
+    // One call would carry 240K tokens (2x inflation): long tier. Three chunks carry 80K each: short tier.
+    const oneCall = estimateCompactionEconomics(base);
+    const threeChunks = estimateCompactionEconomics({ ...base, serializedChars: SUMMARIZER_CHUNK_CHARS * 2 + 1 });
+    const manifestOne = manifestMaxOutputTokens(older);
+    const manifestThree = 3 * manifestMaxOutputTokens(older / 3);
+    assert.ok(Math.abs(oneCall.haikuCost - (older * 2 * modelWeight(HAIKU_MODEL_ID, 240_000) + manifestOne * modelOutputWeight(HAIKU_MODEL_ID, 240_000))) < 1e-6);
+    assert.ok(Math.abs(threeChunks.haikuCost - (older * 2 * modelWeight(HAIKU_MODEL_ID) + manifestThree * modelOutputWeight(HAIKU_MODEL_ID))) < 1e-6);
+    assert.ok(oneCall.haikuCost > threeChunks.haikuCost * 4, 'the long tier makes the single big call several times dearer');
+  } finally {
+    resetPricing();
+  }
 });

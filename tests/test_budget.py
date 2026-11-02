@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 import claude_budget_advisor
 from claude_budget_advisor import (
     analyze_all_projects,
@@ -9,7 +10,9 @@ from claude_budget_advisor import (
     apply_spend_calibration,
     build_budget_snapshot,
     build_recommendations,
+    LONG_PROMPT_THRESHOLD_TOKENS,
     cost_units,
+    long_prompt_factor,
     derive_budget,
     encode_workspace_path,
     GENERAL_USAGE_TIPS,
@@ -645,3 +648,34 @@ def test_derive_budget_ignores_future_months():
     budget, source = derive_budget(summary, "2026-09", day=10)
     assert source == "auto_projected"
     assert budget == 300.0
+
+
+HAIKU_55_FEED = {
+    # The short tier, as the feed publishes it (USD per token).
+    "claude-haiku-5-5": {"input": 0.1e-6, "output": 0.5e-6, "cache_read": 0.01e-6, "cache_write": 0.125e-6},
+}
+
+
+def test_haiku_55_bills_a_prompt_over_100k_tokens_at_5x_counting_cache_reads():
+    short = {"input": 5_000, "cache_write": 10_000, "cache_read": 85_000, "output": 1_000}
+    long = {"input": 5_000, "cache_write": 10_000, "cache_read": 135_000, "output": 1_000}
+    base = cost_units("claude-haiku-5-5", short, HAIKU_55_FEED)
+    assert base == pytest.approx(5_000 * 0.1e-6 + 10_000 * 0.125e-6 + 85_000 * 0.01e-6 + 1_000 * 0.5e-6)
+    # 150K prompt although the regular input alone is 5K: every component, output included, bills at 5x.
+    expected_long = (5_000 * 0.1e-6 + 10_000 * 0.125e-6 + 135_000 * 0.01e-6 + 1_000 * 0.5e-6) * 5
+    assert cost_units("claude-haiku-5-5", long, HAIKU_55_FEED) == pytest.approx(expected_long)
+
+
+def test_the_haiku_55_threshold_is_strictly_above_100k_and_does_not_reach_other_models_or_the_fallback():
+    at_limit = {"input": LONG_PROMPT_THRESHOLD_TOKENS}
+    over = {"input": LONG_PROMPT_THRESHOLD_TOKENS + 1}
+    assert long_prompt_factor("claude-haiku-5-5", at_limit) == 1
+    assert long_prompt_factor("claude-haiku-5-5", over) == 5
+    assert long_prompt_factor("claude-haiku-5-5-20261001", over) == 5
+    assert long_prompt_factor("claude-sonnet-5", over) == 1
+    assert long_prompt_factor("claude-haiku-4-5", over) == 1
+    # Output tokens are not part of the prompt.
+    assert long_prompt_factor("claude-haiku-5-5", {"input": 1_000, "output": 500_000}) == 1
+    # Rates not from the feed (family fallback, Haiku 4.5's) are not Haiku 5.5's base: no 5x on top.
+    assert long_prompt_factor("claude-haiku-5-5", over, from_feed=False) == 1
+    assert cost_units("claude-haiku-5-5", over, {}) == cost_units("claude-haiku-5-5", {"input": 1}, {}) * over["input"]

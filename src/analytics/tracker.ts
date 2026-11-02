@@ -32,10 +32,12 @@ import * as path from 'path';
 import {
   CacheMultipliers,
   cacheMultipliers,
+  LONG_PROMPT_THRESHOLD_TOKENS,
   modelOutputWeight,
   modelWeight,
   usdPerNormalizedUnit,
 } from '../proxy/pricing';
+import { anchorEntries, PromptIndex } from './promptIndex';
 import { CompactionDecision, HAIKU_MODEL_ID, OptimizationTelemetry } from '../proxy/optimizer';
 
 /** Filename of the single-file ledger used before monthly files; migrated on first load, then kept as a backup. */
@@ -98,6 +100,8 @@ export interface LedgerEntry {
    * rows recorded before the baseline modelled client caching.
    */
   baselineCachedTokens?: number;
+  /** Tokens the best-case client cache would have read (the previous request's whole prefix, within the hour). Absent on older rows. */
+  floorCachedTokens?: number;
   /**
    * What this turn would have cost with no proxy and the best possible client cache (it
    * stays valid for the full hour and writes at the cheap 1.25x), so `1 - actual / floor` is the least
@@ -116,6 +120,12 @@ export interface LedgerEntry {
    * written before summaries were stored have no such turns.
    */
   summaryReused?: boolean;
+  /** True when this chat's previous request was on an earlier local day, so its history was summarized whole. */
+  dayChange?: boolean;
+  /** True when the status bar asked the user to `/compact` a large client-side history the proxy is already summarizing. */
+  clearSuggested?: boolean;
+  /** True when this request was the first of a cleared chat and carried the previous day's summaries. */
+  pendingInjected?: boolean;
   /**
    * Economics gate inputs and estimate (NCU) when compaction was evaluated, to compare
    * against the real cost of later turns. Optional: absent on older rows and on turns
@@ -182,6 +192,14 @@ export interface LedgerEntry {
    * recorded before accounts were tracked have none, and belong to no known account.
    */
   accountId?: string;
+  /** Claude Code's chat (`session_id`); absent on rows from before it was recorded. */
+  sessionId?: string;
+  /** When the request reached the proxy (epoch ms). `timestamp` is when it finished, which can fall after a prompt the request never saw. */
+  startedAt?: number;
+  /** The model's `stop_reason`; `tool_use` means the turn goes on after local tools run. */
+  stopReason?: string;
+  /** Anthropic's `request-id`; matches the transcript's `requestId`, which names the prompt exactly. */
+  anthropicRequestId?: string;
 }
 
 export interface TurnCost {
@@ -223,14 +241,6 @@ export interface TurnCost {
  * the ledger records something honest rather than a free turn.
  */
 export function computeTurnCost(telemetry: OptimizationTelemetry, usage: ApiUsage | undefined): TurnCost {
-  const baselineWeight = modelWeight(telemetry.originalModel);
-  const actualWeight = modelWeight(telemetry.effectiveModel);
-  const baselineOutputWeight = modelOutputWeight(telemetry.originalModel);
-  const actualOutputWeight = modelOutputWeight(telemetry.effectiveModel);
-  // Cache rates of each side's own model, read from the pricing table.
-  const baselineCache = cacheMultipliers(telemetry.originalModel);
-  const actualCache = cacheMultipliers(telemetry.effectiveModel);
-
   // No `usage` means Anthropic never answered (status 0, a cut stream). Nothing is known about
   // billing, so the local estimate is not charged as if it had been: the turn counts for neither
   // side of the savings figure. Only the summarizer's Haiku call, which did return, is still paid.
@@ -239,6 +249,17 @@ export function computeTurnCost(telemetry: OptimizationTelemetry, usage: ApiUsag
   const cacheReadTokens = usage?.cache_read_input_tokens ?? 0;
   const cacheWrite1h = Math.min(cacheWriteTokens, cacheWrite1hTokens(usage));
   const outputTokens = usage?.output_tokens ?? 0;
+
+  // A model priced by prompt length (Haiku 5.5) bills this request by its whole prompt: what the
+  // client would have sent for the baseline, what Anthropic received for the served model.
+  const actualPromptTokens = uncachedInputTokens + cacheWriteTokens + cacheReadTokens;
+  const baselineWeight = modelWeight(telemetry.originalModel, telemetry.rawTokens);
+  const actualWeight = modelWeight(telemetry.effectiveModel, actualPromptTokens);
+  const baselineOutputWeight = modelOutputWeight(telemetry.originalModel, telemetry.rawTokens);
+  const actualOutputWeight = modelOutputWeight(telemetry.effectiveModel, actualPromptTokens);
+  // Cache rates of each side's own model, read from the pricing table.
+  const baselineCache = cacheMultipliers(telemetry.originalModel);
+  const actualCache = cacheMultipliers(telemetry.effectiveModel);
 
   // With the client's own caching modelled (`baselineCachedTokens`), the baseline is that
   // request as Claude Code would have sent it alone: the still-cached prefix read at
@@ -282,8 +303,14 @@ export function computeTurnCost(telemetry: OptimizationTelemetry, usage: ApiUsag
   // Always priced at Haiku's own rate: the summarizer is a fixed-model call the
   // optimizer makes on its own, independent of whichever model this turn used.
   const summarizerUsage = telemetry.summarizerUsage;
+  // The calls whose prompt was over the Haiku threshold are billed at the long tier; the rest at the base one.
+  const longIn = summarizerUsage?.longPromptInputTokens ?? 0;
+  const longOut = summarizerUsage?.longPromptOutputTokens ?? 0;
   const summarizerUnitCost = summarizerUsage
-    ? summarizerUsage.inputTokens * modelWeight(HAIKU_MODEL_ID) + summarizerUsage.outputTokens * modelOutputWeight(HAIKU_MODEL_ID)
+    ? (summarizerUsage.inputTokens - longIn) * modelWeight(HAIKU_MODEL_ID) +
+      (summarizerUsage.outputTokens - longOut) * modelOutputWeight(HAIKU_MODEL_ID) +
+      longIn * modelWeight(HAIKU_MODEL_ID, LONG_PROMPT_THRESHOLD_TOKENS + 1) +
+      longOut * modelOutputWeight(HAIKU_MODEL_ID, LONG_PROMPT_THRESHOLD_TOKENS + 1)
     : 0;
 
   const cacheReadUnits = cacheReadTokens * actualWeight * actualCache.read;
@@ -352,6 +379,11 @@ export function reconcileWithUsage(
 
 type UsageLike = { uncachedInputTokens?: number; cacheWriteTokens?: number; cacheWrite1hTokens?: number; cacheReadTokens?: number; summarizerUnitCost?: number };
 
+/** The whole prompt Anthropic received for a row: regular input + cache writes + cache reads (what a long-prompt tier is decided by). */
+function promptTokensOf(entry: UsageLike): number {
+  return (entry.uncachedInputTokens ?? 0) + (entry.cacheWriteTokens ?? 0) + (entry.cacheReadTokens ?? 0);
+}
+
 /**
  * What the sent tokens actually billed at, applying the 0.10x read / 1.25x write
  * multipliers directly to the real API usage — no assumption about what a client
@@ -369,7 +401,7 @@ export function billedUnits(entry: UnitsInput): number {
  * the invoice figure leaves after the rest.
  */
 export function entryUnits(entry: UnitsInput): { read: number; write: number; regular: number; output: number } {
-  const weight = modelWeight(entry.servedModel);
+  const weight = modelWeight(entry.servedModel, promptTokensOf(entry));
   const rates = entry.cacheMultipliers ?? cacheMultipliers(entry.servedModel);
   const write1h = entry.cacheWrite1hTokens ?? 0;
   const read = entry.cacheReadUnits ?? (entry.cacheReadTokens ?? 0) * rates.read * weight;
@@ -420,7 +452,7 @@ export function backfillCacheCosts(entry: LedgerEntry): LedgerEntry {
   if (typeof entry.cacheNoCacheUnitCost === 'number' && typeof entry.cacheActualUnitCost === 'number') {
     return entry;
   }
-  const weight = modelWeight(entry.servedModel);
+  const weight = modelWeight(entry.servedModel, promptTokensOf(entry));
   const rates = entry.cacheMultipliers ?? cacheMultipliers(entry.servedModel);
   const cacheWriteTokens = entry.cacheWriteTokens ?? 0;
   const cacheReadTokens = entry.cacheReadTokens ?? 0;
@@ -514,6 +546,8 @@ export class AnalyticsTracker {
   private activeAccountId: string | undefined;
   private writeChain: Promise<void> = Promise.resolve();
   private rolledUpFor: string | undefined;
+  private promptIndex: PromptIndex | undefined;
+  private anchored: { source: readonly LedgerEntry[]; length: number; version: number; result: readonly LedgerEntry[] } | undefined;
 
   constructor(
     storageDir: string,
@@ -695,10 +729,31 @@ export class AnalyticsTracker {
   getEntries(): readonly LedgerEntry[] {
     this.load();
     const accountId = this.activeAccountId;
-    if (!accountId) {
-      return this.entries;
+    const mine = accountId ? this.entries.filter((entry) => entry.accountId === accountId) : this.entries;
+    return this.withPromptAnchors(mine);
+  }
+
+  /**
+   * Turns follow the prompts the user typed (read from Claude Code's transcripts) instead of
+   * what each request looks like. Without an index the rows stay as the proxy flagged them.
+   */
+  setPromptIndex(index: PromptIndex | undefined): void {
+    this.promptIndex = index;
+    this.anchored = undefined;
+  }
+
+  private withPromptAnchors(entries: readonly LedgerEntry[]): readonly LedgerEntry[] {
+    const index = this.promptIndex;
+    if (!index) {
+      return entries;
     }
-    return this.entries.filter((entry) => entry.accountId === accountId);
+    const cached = this.anchored;
+    if (cached && cached.source === entries && cached.length === entries.length && cached.version === index.version) {
+      return cached.result;
+    }
+    const result = anchorEntries(entries, (project) => index.anchorsFor(project), (requestId) => index.promptOf(requestId));
+    this.anchored = { source: entries, length: entries.length, version: index.version, result };
+    return result;
   }
 
   /**
@@ -859,6 +914,11 @@ export function isFailedHit(entry: Pick<LedgerEntry, 'status'>): boolean {
   return entry.status !== undefined && (entry.status < 200 || entry.status >= 300);
 }
 
+/** A cache keep-alive ping: it keeps the prompt cache warm and is billed, but the user's work did not make it. */
+export function isKeepAlivePing(entry: Pick<LedgerEntry, 'routingReason'>): boolean {
+  return entry.routingReason === 'cache keep-alive ping';
+}
+
 export function aggregate(entries: readonly LedgerEntry[]): AggregateStats {
   const stats = emptyStats();
 
@@ -955,28 +1015,39 @@ export function lastTurnEntries(entries: readonly LedgerEntry[]): LedgerEntry[] 
 /** The hits of one user turn in one project. */
 export interface TurnGroup {
   project: string;
+  /** The chat this turn belongs to, when the ledger recorded one. */
+  sessionId?: string;
   entries: LedgerEntry[];
+  /** A cache keep-alive ping: a row of its own, one turn of one hit, never part of a typed prompt's turn. */
+  ping?: boolean;
 }
 
 /**
- * Every user turn in `entries`, oldest first, grouped per project.
+ * Every user turn in `entries`, oldest first, grouped per project and chat.
  *
- * The ledger interleaves projects, so a plain walk would glue one project's tool-result
+ * The ledger interleaves projects and chats, so a plain walk would glue one chat's tool-result
  * hits onto another's turn. A hit with `newUserTurn !== false` opens a group (legacy rows
- * without the flag each count as their own turn); `false` continues that project's open one.
+ * without the flag each count as their own turn); `false` continues that chat's open one.
  */
 export function groupTurns(entries: readonly LedgerEntry[]): TurnGroup[] {
   const groups: TurnGroup[] = [];
   const open = new Map<string, TurnGroup>();
   for (const entry of entries) {
-    const current = open.get(entry.project);
+    // A ping never joins a prompt's turn, and does not end the one in progress: the next hit of that
+    // prompt still lands in its own turn.
+    if (isKeepAlivePing(entry)) {
+      groups.push({ project: entry.project, sessionId: entry.sessionId, entries: [entry], ping: true });
+      continue;
+    }
+    const key = `${entry.project}|${entry.sessionId ?? ''}`;
+    const current = open.get(key);
     if (entry.newUserTurn === false && current) {
       current.entries.push(entry);
       continue;
     }
-    const group: TurnGroup = { project: entry.project, entries: [entry] };
+    const group: TurnGroup = { project: entry.project, sessionId: entry.sessionId, entries: [entry] };
     groups.push(group);
-    open.set(entry.project, group);
+    open.set(key, group);
   }
   return groups;
 }

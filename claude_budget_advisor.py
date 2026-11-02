@@ -160,10 +160,43 @@ def resolve_model_rates(model_name: str, pricing: dict) -> tuple[dict, bool]:
     return FALLBACK_TIER_PRICING.get(tier, FALLBACK_TIER_PRICING["unknown"]), False
 
 
+# Claude Haiku 5.5 charges more for a request whose prompt is over 100,000 tokens. The prompt counts
+# every input token, cache reads and writes included, and each request is priced on its own
+# (platform.claude.com/docs/en/about-claude/pricing, "Long context pricing", checked 2026-11-02).
+# Every rate of the long tier is exactly 5x the short one, which is all the feed publishes. Mirrors
+# LONG_PROMPT_THRESHOLD_TOKENS / LONG_PROMPT_TIERS in src/proxy/pricing.ts.
+LONG_PROMPT_THRESHOLD_TOKENS = 100_000
+LONG_PROMPT_TIERS = (("claude-haiku-5-5", 5),)
+
+
+def long_prompt_factor(model_name: str, components: dict, from_feed: bool = True) -> int:
+    """How many times the base rates apply to one request: 1 unless its prompt is over the model's long-prompt threshold.
+
+    The tier scales the model's own published rates, so it applies only to rates that came from the feed:
+    the built-in family fallback is not Haiku 5.5's base price and 5x of it would match no real price.
+    """
+    if not from_feed:
+        return 1
+    prompt = sum(components.get(key, 0) for key in ("input", "cache_read", "cache_write"))
+    if prompt <= LONG_PROMPT_THRESHOLD_TOKENS:
+        return 1
+    lowered = (model_name or "").lower()
+    for prefix, factor in LONG_PROMPT_TIERS:
+        if lowered.startswith(prefix):
+            return factor
+    return 1
+
+
+def weighted_cost(model_name: str, components: dict, rates: dict, from_feed: bool = True) -> float:
+    """One request's cost from its own token components and the model's rates, long-prompt tier included."""
+    base = sum(components.get(key, 0) * rates.get(key, 0.0) for key in COMPONENT_FIELDS)
+    return base * long_prompt_factor(model_name, components, from_feed)
+
+
 def cost_units(model_name: str, components: dict, pricing: dict | None = None) -> float:
     """Convert tokens to real cost; token types differ in price by up to ~100x."""
-    rates, _ = resolve_model_rates(model_name, pricing or {})
-    return sum(components.get(key, 0) * rates.get(key, 0.0) for key in COMPONENT_FIELDS)
+    rates, from_feed = resolve_model_rates(model_name, pricing or {})
+    return weighted_cost(model_name, components, rates, from_feed)
 
 
 def load_project_name_config(base_dir: str | Path) -> str | None:
@@ -419,7 +452,7 @@ def analyze_all_projects(base_dir: str | Path, month: str, pricing: dict | None 
             rates, exact = resolve_model_rates(model_name, pricing)
             if not exact:
                 unpriced.add(model_name)
-            weighted = sum(components.get(key, 0) * rates.get(key, 0.0) for key in COMPONENT_FIELDS)
+            weighted = weighted_cost(model_name, components, rates, exact)
             by_month[entry_month] += tokens
             by_month_weighted[entry_month] += weighted
             if entry_month != month:
@@ -488,7 +521,7 @@ def analyze_project_usage(
         rates, exact = resolve_model_rates(model_name, pricing)
         if not exact:
             unpriced.add(model_name)
-        weighted = sum(components.get(key, 0) * rates.get(key, 0.0) for key in COMPONENT_FIELDS)
+        weighted = weighted_cost(model_name, components, rates, exact)
         by_month[entry_month] += tokens
         by_month_weighted[entry_month] += weighted
         if entry_month != month:

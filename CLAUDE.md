@@ -13,6 +13,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 7. **Panel labels:** `u` = units and `t` = tokens in table cells, always as `<abbr>` with the full word as tooltip; billed cells show units, percentages go in tooltips.
 8. **Priority: the tool first.** Presentation (deck) and documentation (F-05, F-29) are the last steps, only once the tool is 100 % functional; do not work on them before.
 9. **Verify before claiming.** Say what was measured versus assumed; do not state a cause or a number that was not checked in the code or the ledger.
+10. **Every change or addition ships with its unit tests.** New behaviour gets new tests and changed behaviour updates the existing ones, in the same change; run `npm test` before reporting it done.
+11. **Never assume: verify.** Before relying on how Claude Code, the API or the data behaves, check it against real evidence (ledger rows, captured requests, code) and say what was checked. An unverified guess is stated as a guess and is never built into behaviour.
 
 ## Commands
 

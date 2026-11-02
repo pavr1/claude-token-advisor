@@ -4,7 +4,7 @@
  */
 
 import { InFlightProject, InFlightStage } from '../analytics/inflight';
-import { COLORS, compact, escapeHtml, formatShare } from './shared';
+import { COLORS, compact, escapeHtml, formatShare, processingIcon } from './shared';
 
 /** Green when a number is a saving, amber when it is not. Red is reserved for cache writes. */
 export function savingsTone(value: number): string {
@@ -25,12 +25,15 @@ export function timeCell(lastAt: number | undefined, liveSince?: number, toggle 
 }
 
 /** Status label of a live row; the spinner and trailing dots animate in CSS. */
-export const PROCESSING = '<span class="spin" title="Processing"></span>';
 
 /** CR, CW and RI have no figures until Anthropic answers. */
 const CACHE_PLACEHOLDER = '<td class="cache-col">—</td>'.repeat(3);
 
-export const ARROW_CELL = '<td class="turn-arrow">→</td>';
+/** Settled rows leave the handoff column empty; only a request on its way to Anthropic shows the arrow. */
+export const ARROW_CELL = '<td class="turn-arrow"></td>';
+
+/** The arrow flies left to right (CSS) while the optimized request is out and the answer has not come back. */
+export const ARROW_FLYING_CELL = '<td class="turn-arrow"><span class="arrow-fly" title="Sent to Anthropic, waiting for the answer">→</span></td>';
 
 /** What the Haiku summaries of a set of hits did: how many hits, and the tokens they kept out of the request. */
 export interface SummaryUse {
@@ -99,21 +102,23 @@ export function pendingTotals(live: InFlightProject | undefined) {
  * A new prompt whose first hit has not come back. Each column fills in as soon as its
  * number exists: raw → sent once optimization ends, received/billed once the upstream answers.
  */
-export function liveRow(project: string, live: InFlightProject, ordinal: number | string): string {
+export function liveRow(project: string, live: InFlightProject, ordinal: number | string, chatId?: string): string {
   const key = `${escapeHtml(project)}#${ordinal}`;
+  const child = chatId ? ` turn-child" data-parent="${escapeHtml(chatId)}` : '';
   return (
-    `<tr class="turn-live" data-row="${key}" data-toggle="${key}">${timeCell(undefined, live.since, true)}<td>${escapeHtml(project)}</td><td>${PROCESSING}</td><td class="num">1</td><td class="num">${live.count}</td>\n    ${liveCells(live)}</tr>` +
-    liveHitRows(key, live)
+    `<tr class="turn-live${child}" data-row="${key}" data-toggle="${key}">${timeCell(undefined, live.since, true)}<td>${escapeHtml(project)}</td><td>${processingIcon(key)}</td><td class="num">1</td><td class="num">${live.count}</td>\n    ${liveCells(live)}</tr>` +
+    liveHitRows(key, live, chatId)
   );
 }
 
 /** One sub-row per request still in flight, so the hits of a live turn add up to its row. */
-export function liveHitRows(turnKey: string, live: InFlightProject): string {
+export function liveHitRows(turnKey: string, live: InFlightProject, chatId?: string): string {
+  const ancestors = chatId ? ` data-ancestors="${escapeHtml(chatId)}"` : '';
   let rows = '';
   for (let i = 0; i < live.count; i += 1) {
     const stage: InFlightStage | undefined = live.preflight[i];
     const one: InFlightProject = { count: 1, newTurn: false, since: live.since, preflight: stage ? [stage] : [] };
-    rows += `<tr class="hit-row turn-live" data-row="${turnKey}/L${i}" data-parent="${turnKey}"><td></td><td class="hit-label">↳ hit</td><td>${PROCESSING}</td><td></td><td class="num">1</td>\n    ${liveCells(one)}</tr>`;
+    rows += `<tr class="hit-row turn-live" data-row="${turnKey}/L${i}" data-parent="${turnKey}"${ancestors}><td></td><td class="hit-label">↳ hit</td><td>${processingIcon(`${turnKey}/L${i}`)}</td><td></td><td class="num">1</td>\n    ${liveCells(one)}</tr>`;
   }
   return rows;
 }
@@ -139,5 +144,5 @@ function liveCells(live: InFlightProject): string {
       )
     : empty;
   const sentCell = p.known.sent ? `<td class="num">${compact(p.sent)}</td>` : empty;
-  return `${rawCell}${cleanupCell}${summaryCell}${sentCell}${ARROW_CELL}${empty}${CACHE_PLACEHOLDER}${empty}`;
+  return `${rawCell}${cleanupCell}${summaryCell}${sentCell}${p.known.sent ? ARROW_FLYING_CELL : ARROW_CELL}${empty}${CACHE_PLACEHOLDER}${empty}`;
 }

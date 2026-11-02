@@ -26,9 +26,11 @@ import {
   lastTurnEntries,
   LedgerEntry,
   monthKey,
+  ApiUsage,
 } from './analytics/tracker';
 import { readActiveAccount } from './analytics/activeAccount';
 import { InFlightStage, inFlightRequests } from './analytics/inflight';
+import { PromptIndex } from './analytics/promptIndex';
 import { RealCostEvent, RealCostTracker } from './analytics/realCostTracker';
 import { detectPython, MIN_PYTHON, PythonMissingError, PythonRuntime } from './budget/pythonRuntime';
 import { BypassMonitor } from './proxy/bypassMonitor';
@@ -43,6 +45,7 @@ import {
   ProxyEvent,
   ProxyPortInUseError,
   TokenImproverProxy,
+  fallbackTelemetry,
   TurnRecord,
   UnifiedRateLimitSnapshot,
 } from './proxy/server';
@@ -103,6 +106,7 @@ let ownerWatch: ReturnType<typeof setInterval> | undefined;
 let ledgerFollower: ReturnType<typeof setInterval> | undefined;
 
 let tracker: AnalyticsTracker | undefined;
+let promptIndex: PromptIndex | undefined;
 /** Anthropic's own reported cost, from the local OTLP sink. Undefined until telemetry lands. */
 let realCostTracker: RealCostTracker | undefined;
 /** `globalStorage` folder; the compaction summaries are kept here so a proxy restart doesn't re-pay for them. */
@@ -340,6 +344,7 @@ function readProxyConfig(): ProxyConfig {
     // Trailing slashes would produce `//v1/messages` upstream.
     upstreamBaseUrl: (upstream || DEFAULT_UPSTREAM_BASE_URL).replace(/\/+$/, ''),
     exactTokenCounting: config.get<boolean>('exactTokenCounting', false) ?? false,
+    keepAliveMaxMinutes: Math.max(0, config.get<number>('keepAliveMaxMinutes', 30) ?? 30),
     optimizer: {
       enableNormalization: config.get<boolean>('stage1Normalization', true) ?? true,
       enableCompaction: config.get<boolean>('stage2Compaction', true) ?? true,
@@ -444,14 +449,32 @@ function isThisWindowsProject(project: string | undefined): boolean {
 }
 
 /** Owner only: a request reached the proxy. */
-function onRequestStarted(project: string | undefined, newUserTurn: boolean, id?: string): void {
+function onRequestStarted(project: string | undefined, newUserTurn: boolean, id?: string, sessionId?: string): void {
   checkAccountSwitch();
-  proxy?.broadcast({ type: 'start', project: project ?? currentProjectName(), newUserTurn, id });
-  inFlightRequests.start(project ?? currentProjectName(), newUserTurn, Date.now(), id);
-  DashboardPanel.refreshIfOpen();
+  const name = project ?? currentProjectName();
   if (isThisWindowsProject(project)) {
     statusBar?.beginRequest();
   }
+  const register = (opensTurn: boolean): void => {
+    proxy?.broadcast({ type: 'start', project: name, newUserTurn: opensTurn, id, sessionId });
+    inFlightRequests.start(name, opensTurn, Date.now(), id, sessionId);
+    DashboardPanel.refreshIfOpen();
+  };
+  // A request opens a turn only when the user typed a prompt for it: Claude Code also sends quota
+  // probes, titles and classifiers that end in plain text and look like a prompt. The transcript
+  // is read right now, since the prompt was written just before the request went out.
+  if (!promptIndex) {
+    register(newUserTurn);
+    return;
+  }
+  const index = promptIndex;
+  void index
+    .refresh()
+    .catch(() => false)
+    .then(() => {
+      const verdict = index.claimOpener(name, sessionId);
+      register(verdict === 'unknown' ? newUserTurn : verdict === 'new');
+    });
 }
 
 /** Owner only: a request cleared optimization, so its raw → sent numbers are known before the response. */
@@ -473,7 +496,7 @@ function onStreamProgress(outputTokens: number, project: string | undefined): vo
 function onProxyEvent(event: ProxyEvent): void {
   if (event.type === 'start') {
     checkAccountSwitch();
-    inFlightRequests.start(event.project, event.newUserTurn === true, Date.now(), event.id);
+    inFlightRequests.start(event.project, event.newUserTurn === true, Date.now(), event.id, event.sessionId);
     DashboardPanel.refreshIfOpen();
     if (event.project === currentProjectName()) {
       statusBar?.beginRequest();
@@ -505,7 +528,7 @@ function onProxyEvent(event: ProxyEvent): void {
   // The owner already wrote this entry to disk. Keep it in memory only, so the
   // analytics panel stays current without a second writer on the ledger.
   tracker?.ingest(event.entry);
-  inFlightRequests.finish(event.entry.project);
+  inFlightRequests.finish(event.entry.project, event.entry.stopReason, event.entry.sessionId);
   if (event.entry.project === currentProjectName()) {
     showTurn(event.entry);
   } else {
@@ -777,13 +800,30 @@ function showTurn(entry: LedgerEntry): void {
   const all = tracker.getEntries();
   const todayStats = aggregate(all.filter((candidate) => dayKey(candidate) === dayKey(entry)));
   const monthStats = aggregate(all.filter((candidate) => monthKey(candidate) === monthKey(entry)));
+  // The hit may have ended in tool_use: the client now runs local tools and the turn is not over.
+  statusBar?.setToolsRunning(inFlightRequests.snapshot().get(entry.project)?.count === 0);
+  // A keep-alive ping carries no optimizer telemetry: it must not reset the hint.
+  if (entry.routingReason !== 'cache keep-alive ping') {
+    statusBar?.setClearHint(entry.clearSuggested === true);
+  }
   statusBar?.reportTurn(lastTurnStats, todayStats, monthStats, entry.servedModel);
 
   DashboardPanel.refreshIfOpen();
 }
 
+/** Owner only: a cache keep-alive ping goes into the ledger like any turn, so Billed adds up. */
+function onKeepAlivePing(ping: { project: string | undefined; sessionId?: string; model: string; usage: ApiUsage | undefined; status: number }): void {
+  const telemetry = fallbackTelemetry({ model: ping.model });
+  const input = (ping.usage?.input_tokens ?? 0) + (ping.usage?.cache_read_input_tokens ?? 0) + (ping.usage?.cache_creation_input_tokens ?? 0);
+  // A ping saves nothing: size it as sent, so it books its own cost against a like-for-like baseline.
+  onTurnCompleted(
+    { telemetry: { ...telemetry, rawTokens: input, optimizedTokens: input, isNewUserTurn: false }, usage: ping.usage, status: ping.status, project: ping.project, sessionId: ping.sessionId },
+    true
+  );
+}
+
 /** Owner only: record a proxied turn in the ledger, share it with joined windows, and show it here if it's ours. */
-function onTurnCompleted(record: TurnRecord): void {
+function onTurnCompleted(record: TurnRecord, isKeepAlivePing = false): void {
   if (!tracker) {
     return;
   }
@@ -799,18 +839,22 @@ function onTurnCompleted(record: TurnRecord): void {
     requestedModel: record.telemetry.originalModel,
     servedModel: record.telemetry.effectiveModel,
     modelSwapped: record.telemetry.modelDowngraded,
-    routingReason: record.telemetry.routingReason,
+    routingReason: isKeepAlivePing ? 'cache keep-alive ping' : record.telemetry.routingReason,
     rawTokens: record.telemetry.rawTokens,
     optimizedTokens: reconciled.optimizedTokens,
     prunedByNormalization: record.telemetry.prunedByNormalization,
     prunedByCompaction: reconciled.prunedByCompaction,
     compactionTriggered: record.telemetry.compactionTriggered,
     summaryReused: record.telemetry.summaryReused,
+    dayChange: record.telemetry.dayChange,
+    clearSuggested: record.telemetry.clearSuggested,
+    pendingInjected: record.telemetry.pendingInjected,
     compactionEconomics: record.telemetry.compactionEconomics,
     compactionSkippedReason: record.telemetry.compactionSkippedReason,
     historyTokens: record.telemetry.historyTokens,
     compactionTriggerTokens: record.telemetry.compactionTriggerTokens,
     baselineCachedTokens: record.telemetry.baselineCachedTokens,
+    floorCachedTokens: record.telemetry.floorCachedTokens,
     clientCacheTtlMs: record.telemetry.clientCacheTtlMs,
     rawTokensExact: record.telemetry.rawTokensExact,
     cacheWrite1hTokens: cost.cacheWrite1hTokens,
@@ -840,10 +884,16 @@ function onTurnCompleted(record: TurnRecord): void {
     status: record.status,
     failure: record.failure,
     accountId: tracker.getActiveAccountId(),
+    sessionId: record.sessionId,
+    startedAt: record.startedAt,
+    stopReason: record.stopReason,
+    anthropicRequestId: record.anthropicRequestId,
   };
 
   tracker.record(entry);
-  inFlightRequests.finish(entry.project);
+  if (!isKeepAlivePing) {
+    inFlightRequests.finish(entry.project, entry.stopReason, entry.sessionId);
+  }
   proxy?.broadcast({ type: 'turn', entry });
 
   if (isThisWindowsProject(record.project)) {
@@ -931,7 +981,9 @@ async function startProxyNow(notify: boolean, quiet: boolean): Promise<void> {
   proxyWanted = true;
   const config = readProxyConfig();
   config.summaryStorePath = storageDir ? path.join(storageDir, 'compaction_summaries.json') : undefined;
+  config.pendingHistoryPath = storageDir ? path.join(storageDir, 'lastdayhistory.json') : undefined;
   config.baselineMemoryPath = storageDir ? path.join(storageDir, 'cache_last_request.json') : undefined;
+  config.modelCatalogPath = storageDir ? path.join(storageDir, 'latest_models.json') : undefined;
   await releaseProxy();
 
   for (let attempt = 1; ; attempt++) {
@@ -944,7 +996,8 @@ async function startProxyNow(notify: boolean, quiet: boolean): Promise<void> {
       {
         onRequestStart: onRequestStarted,
         onRequestOptimized,
-        onTurnComplete: onTurnCompleted,
+        onTurnComplete: (record) => onTurnCompleted(record),
+        onKeepAlive: onKeepAlivePing,
         onRealCost: onRealCostReceived,
         onStreamProgress,
         onRateLimitUpdate: onRateLimitReceived,
@@ -1245,6 +1298,7 @@ async function showDashboard(context: vscode.ExtensionContext, initialTab: Dashb
   try {
     DashboardPanel.updateSummary(await getSummary(context));
   } catch (error) {
+    DashboardPanel.finishLoading();
     if (error instanceof PythonMissingError) {
       statusBar?.setPythonMissing();
       promptInstallPython(context, true);
@@ -1330,6 +1384,7 @@ function watchInstall(context: vscode.ExtensionContext): void {
 
 /** How often a window that does not own the proxy checks whether the owner appended to the ledger. */
 const LEDGER_FOLLOW_MS = 1_000;
+const PROMPT_FOLLOW_MS = 2_000;
 
 /**
  * Keep a window that does not own the proxy in step with the ledger. The owner writes it; every
@@ -1346,6 +1401,31 @@ function followLedger(context: vscode.ExtensionContext): void {
     DashboardPanel.refreshIfOpen();
   }, LEDGER_FOLLOW_MS);
   context.subscriptions.push({ dispose: () => clearInterval(ledgerFollower) });
+}
+
+/**
+ * Turns follow what the user typed, read from Claude Code's transcripts: the first pass can take a
+ * moment (a month of transcripts), later ones only read what each file gained.
+ */
+function followPrompts(context: vscode.ExtensionContext): void {
+  const index = new PromptIndex();
+  tracker?.setPromptIndex(index);
+  promptIndex = index;
+  const poll = (): void => {
+    void index.refresh().then((changed) => {
+      if (changed) {
+        restoreStatusBarHistory();
+        DashboardPanel.refreshIfOpen();
+      }
+    });
+  };
+  // Prompts from before this window started are history; only new ones open a live turn.
+  void index.refresh().then(() => {
+    index.claimAll();
+    poll();
+  });
+  const timer = setInterval(poll, PROMPT_FOLLOW_MS);
+  context.subscriptions.push({ dispose: () => clearInterval(timer) });
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -1365,6 +1445,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   realCostTracker = new RealCostTracker(context.globalStorageUri.fsPath);
   realCostTracker.load();
   followLedger(context);
+  followPrompts(context);
   syncActiveAccount();
   output.appendLine(`installed: ${installedAt ? new Date(installedAt).toLocaleString() : 'unknown'} (no data cutoff)`);
 

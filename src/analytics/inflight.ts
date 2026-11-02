@@ -32,14 +32,22 @@ export interface InFlightProject {
   newTurn: boolean;
   /** When the oldest of the project's pending requests began. */
   since: number;
+  /** Chat of the newest pending request that opened a turn, when the client sent one. */
+  sessionId?: string;
 }
 
+/** Local tools can run for a while with nothing in flight; past this the turn is assumed interrupted. */
+export const TOOL_WAIT_EXPIRY_MS = 10 * 60_000;
+
 export class InFlightTracker {
-  private readonly started: Array<{ project: string; at: number; newTurn: boolean; preflight?: InFlightStage; id?: string }> = [];
+  /** Projects whose last hit ended in `tool_use`: the client is running local tools, still part of the turn. */
+  private readonly runningTools = new Map<string, { at: number; sessionId?: string }>();
+  private readonly started: Array<{ project: string; at: number; newTurn: boolean; preflight?: InFlightStage; id?: string; sessionId?: string }> = [];
 
   /** `newTurn`: the request opens a new prompt rather than continuing one with a tool result. */
-  start(project: string, newTurn: boolean, now = Date.now(), id?: string): void {
-    this.started.push({ project, at: now, newTurn, id });
+  start(project: string, newTurn: boolean, now = Date.now(), id?: string, sessionId?: string): void {
+    this.runningTools.delete(project);
+    this.started.push({ project, at: now, newTurn, id, sessionId });
   }
 
   /** One more pipeline figure for `project`'s oldest request that has not finished optimization. */
@@ -57,10 +65,20 @@ export class InFlightTracker {
   }
 
   /** A turn landed for `project`: its oldest pending request is done. */
-  finish(project: string): void {
+  finish(project: string, stopReason?: string, sessionId?: string, now = Date.now()): void {
     const index = this.started.findIndex((request) => request.project === project);
     if (index >= 0) {
       this.started.splice(index, 1);
+    }
+    // `tool_use`: the answer asks for local tools, so the turn is not over until the next hit lands.
+    if (stopReason === 'tool_use') {
+      this.runningTools.set(project, { at: now, sessionId });
+    } else {
+      // A side request (title, classifier) of another chat ending in plain text must not end this chat's turn.
+      const wait = this.runningTools.get(project);
+      if (wait && (wait.sessionId === undefined || sessionId === undefined || wait.sessionId === sessionId)) {
+        this.runningTools.delete(project);
+      }
     }
   }
 
@@ -79,7 +97,15 @@ export class InFlightTracker {
         preflight: request.preflight ? [...(current?.preflight ?? []), request.preflight] : (current?.preflight ?? []),
         newTurn: (current?.newTurn ?? false) || request.newTurn,
         since: current?.since ?? request.at,
+        sessionId: request.newTurn ? request.sessionId : current?.sessionId ?? request.sessionId,
       });
+    }
+    for (const [project, wait] of this.runningTools) {
+      if (now - wait.at >= TOOL_WAIT_EXPIRY_MS) {
+        this.runningTools.delete(project);
+      } else if (!projects.has(project)) {
+        projects.set(project, { count: 0, preflight: [], newTurn: false, since: wait.at, sessionId: wait.sessionId });
+      }
     }
     return projects;
   }

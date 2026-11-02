@@ -147,7 +147,7 @@ test('hover tooltip behaviour: shows the data-tooltip text on hover, repositions
 test('htmlDocument is script-free by default and allows exactly one nonce-tagged script when asked', () => {
   const plain = htmlDocument('T <1>', '<p>x</p>');
   assert.match(plain, /<title>T &lt;1&gt;<\/title>/);
-  assert.match(plain, /default-src 'none'; style-src 'unsafe-inline';"/);
+  assert.match(plain, /default-src 'none'; style-src 'unsafe-inline'; font-src data:;"/);
   assert.doesNotMatch(plain, /<script/);
   assert.ok(plain.includes(BASE_STYLES));
 
