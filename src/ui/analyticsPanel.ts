@@ -26,7 +26,7 @@ import { RealCostTracker } from '../analytics/realCostTracker';
 import { InFlightProject, inFlightRequests } from '../analytics/inflight';
 import { RANGE_LABELS, RangeId, resolveRange } from './dateRange';
 import { processingIcon } from './shared';
-import { ARROW_CELL, ARROW_FLYING_CELL, haikuSummaryCell, liveHitRows, liveRow,  pendingTotals, savingsTone, SummaryUse, timeCell } from './liveTurnRow';
+import { ARROW_CELL, ARROW_FLYING_CELL, liveHitRows, liveRow,  pendingTotals, savingsTone, SummaryUse, summaryColumnCell, timeCell } from './liveTurnRow';
 import { CLIENT_PREFIX_REUSE, isFailedHit, sentTokens } from '../analytics/tracker';
 import { Balance, HitBalance, hitBalanceOf } from './hitBalance';
 import { tipsPopupHtml } from './tips';
@@ -308,11 +308,16 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
     }
     for (let i = groups.length - 1; i >= 0; i--) {
       const group = groups[i];
-      if (group.ping || group.project !== name) {
+      if (group.project !== name) {
         continue;
       }
       if (state.sessionId !== undefined && group.sessionId !== undefined && group.sessionId !== state.sessionId) {
         continue;
+      }
+      // A ping newer than every real turn behind it: the request starts a row of its own above the
+      // ping, instead of reopening an older turn that sits underneath it.
+      if (group.ping) {
+        break;
       }
       targetOf.set(name, group);
       break;
@@ -326,14 +331,27 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
     .map(([name, state]) => startedRow(name, state));
 
   const limit = filters.chats ?? CHATS_PAGE;
-  const sortedGroups = [...groups].sort((x, y) => lastAt(y) - lastAt(x));
+  // A turn whose last hit ended its answer (anything but `tool_use`) is finished: a request that shows up
+  // afterwards (title, classifier) is one more hit of it, but never turns it back to "in progress".
+  const liveOf = (group: TurnGroup): InFlightProject | undefined => (targetOf.get(group.project) === group ? live.get(group.project) : undefined);
+  const settled = (group: TurnGroup, state: InFlightProject | undefined): boolean => {
+    const stop = group.entries[group.entries.length - 1].stopReason;
+    return state !== undefined && state.count > 0 && stop !== undefined && stop !== 'tool_use';
+  };
+  // The row sorts by the same time its Time cell shows, so a turn that gets a newer time moves up at once.
+  const sortAt = (group: TurnGroup): number => {
+    const state = liveOf(group);
+    return Math.max(lastAt(group), state && !settled(group, state) ? state.since : 0);
+  };
+  const sortedGroups = [...groups].sort((x, y) => sortAt(y) - sortAt(x));
   const hidden = Math.max(0, sortedGroups.length - limit);
   const done = sortedGroups.slice(0, limit).map((group) => {
     const ordinal = ordinals.get(group) ?? '0';
     if (group.ping) {
       return pingRow(group, ordinal, withDate);
     }
-    return turnRow(group, targetOf.get(group.project) === group ? live.get(group.project) : undefined, ordinal, withDate);
+    const state = liveOf(group);
+    return turnRow(group, state, ordinal, withDate, undefined, settled(group, state));
   });
 
   const rangeOptions = (Object.keys(RANGE_LABELS) as RangeId[])
@@ -350,7 +368,7 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
       ? `<div class="range-custom">From <input type="date" id="from" value="${escapeHtml(filters.from ?? todayKey)}"> to <input type="date" id="to" value="${escapeHtml(filters.to ?? filters.from ?? todayKey)}"></div>`
       : '';
   const more = hidden > 0
-    ? `<tr class="more-row"><td colspan="15"><button type="button" data-more>Show ${Math.min(CHATS_PAGE, hidden)} more rows (${hidden.toLocaleString()} hidden; the totals above already include them)</button></td></tr>`
+    ? `<tr class="more-row"><td colspan="17"><button type="button" data-more>Show ${Math.min(CHATS_PAGE, hidden)} more rows (${hidden.toLocaleString()} hidden; the totals above already include them)</button></td></tr>`
     : '';
   const body = [...started, ...done].join('') + more;
   // The totals follow the table: they add up exactly the rows the filters leave in, and sit under
@@ -366,19 +384,19 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
         const s = aggregate(shown);
         return `<tr class="totals"><td colspan="3"></td><td class="num" title="${escapeHtml(`Turns = prompts you typed
 ${groups.length.toLocaleString()} finished + ${liveTurns.toLocaleString()} running = ${(groups.length + liveTurns).toLocaleString()}`)}">${(groups.length + liveTurns).toLocaleString()}</td><td class="num" title="${escapeHtml(`Hits = requests sent to Anthropic
-${s.turns.toLocaleString()} finished + ${liveHits.toLocaleString()} running = ${(s.turns + liveHits).toLocaleString()}`)}">${(s.turns + liveHits).toLocaleString()}</td>${flowCells(s, { rawTokens: s.rawTokens + sum((t) => t.raw), prunedNorm: s.prunedByNormalization + sum((t) => t.pruned), comp: compressionOf(shown), reused: reusedOf(shown), skipped: skippedOf(shown), sent: s.optimizedTokens + sum((t) => t.sent) })}</tr>`;
+${s.turns.toLocaleString()} finished + ${liveHits.toLocaleString()} running = ${(s.turns + liveHits).toLocaleString()}`)}">${(s.turns + liveHits).toLocaleString()}</td>${flowCells(s, { rawTokens: s.rawTokens + sum((t) => t.raw), prunedNorm: s.prunedByNormalization + sum((t) => t.pruned), comp: compressionOf(shown), reused: reusedOf(shown), skipped: skippedOf(shown), sent: s.estimatedTokens + sum((t) => t.sent), entries: shown })}</tr>`;
       })()
     : '';
   const title = filters.range === 'today' ? 'Turns' : `Turns · ${RANGE_LABELS[filters.range].replace('…', '')}`;
   return `<h2>${title}</h2>
   ${custom}
   <div class="turns-scroll turns-main"><table class="turns-table">
-    <colgroup><col style="width:12%"><col style="width:9.5%"><col style="width:4%"><col style="width:5%"><col style="width:5%"><col style="width:8%"><col style="width:7%"><col style="width:8%"><col style="width:6%"><col style="width:9%"><col style="width:8%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:9%"></colgroup>
+    <colgroup><col style="width:12%"><col style="width:9.5%"><col style="width:4%"><col style="width:5%"><col style="width:5%"><col style="width:8%"><col style="width:7%"><col style="width:8%"><col style="width:6%"><col style="width:9%"><col style="width:8%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:9%"><col style="width:8%"></colgroup>
     <thead><tr>
-      <th class="filter-th">${withDate ? 'Date' : 'Time'}<select id="range" title="Filter by date">${rangeOptions}</select></th><th class="filter-th">Repo<select id="project" title="Filter by repo">${projectOptions}</select></th><th class="filter-th">Status<select id="status" title="Filter by status">${statusOptions}</select></th><th class="num">Turns</th><th class="num">Hits${HEADER_HELP.hits}</th><th class="num">Raw request${HEADER_HELP.raw}</th><th class="num">Cleanup${HEADER_HELP.cleanup}</th><th class="num">Summarized${HEADER_HELP.haiku}</th>
-      <th class="num">Estimate${HEADER_HELP.estimate}</th><th></th><th class="num">Received${HEADER_HELP.received}</th><th class="cache-col">CR${HEADER_HELP.cr}</th><th class="cache-col">CW${HEADER_HELP.cw}</th><th class="cache-col">RI${HEADER_HELP.ri}</th><th class="num">Billed${HEADER_HELP.billed}</th>
+      <th class="filter-th">${withDate ? 'Date' : 'Time'}<select id="range" title="Filter by date">${rangeOptions}</select></th><th class="filter-th">Repo<select id="project" title="Filter by repo">${projectOptions}</select></th><th class="filter-th">Status<select id="status" title="Filter by status">${statusOptions}</select></th><th class="num">Turns</th><th class="num">Hits${HEADER_HELP.hits}</th><th>Model${HEADER_HELP.model}</th><th class="num">Raw request${HEADER_HELP.raw}</th><th class="num">Cleanup${HEADER_HELP.cleanup}</th><th class="num">Summarized${HEADER_HELP.summary}</th>
+      <th class="num">Estimate${HEADER_HELP.estimate}</th><th></th><th class="num">Received${HEADER_HELP.received}</th><th class="cache-col">CR${HEADER_HELP.cr}</th><th class="cache-col">CW${HEADER_HELP.cw}</th><th class="cache-col">RI${HEADER_HELP.ri}</th><th class="cache-col">Out${HEADER_HELP.out}</th><th class="num">Billed${HEADER_HELP.billed}</th>
     </tr>${totals}</thead>
-    <tbody>${body || '<tr><td colspan="15" class="empty">No optimized turns in this selection.</td></tr>'}</tbody>
+    <tbody>${body || '<tr><td colspan="17" class="empty">No optimized turns in this selection.</td></tr>'}</tbody>
   </table></div>`;
 }
 
@@ -391,18 +409,18 @@ function compressionOf(entries: readonly LedgerEntry[]): SummaryUse {
   const created = entries.filter((entry) => entry.compactionTriggered);
   return {
     hits: created.length,
-    haikuUnits: created.reduce((sum, e) => sum + (e.summarizerUnitCost ?? 0), 0),
+    costUnits: created.reduce((sum, e) => sum + (e.summarizerUnitCost ?? 0), 0),
     before: created.reduce((sum, e) => sum + e.rawTokens - e.prunedByNormalization, 0),
     pruned: created.reduce((sum, e) => sum + e.prunedByCompaction, 0),
   };
 }
 
-/** Hits that reused an already written summary: same before → after, no Haiku call. */
+/** Hits that reused an already built summary: same before → after, nothing new to build. */
 function reusedOf(entries: readonly LedgerEntry[]): SummaryUse {
   const reused = entries.filter((entry) => entry.summaryReused === true && !entry.compactionTriggered);
   return {
     hits: reused.length,
-    haikuUnits: 0,
+    costUnits: 0,
     before: reused.reduce((sum, e) => sum + e.rawTokens - e.prunedByNormalization, 0),
     pruned: reused.reduce((sum, e) => sum + e.prunedByCompaction, 0),
   };
@@ -424,12 +442,14 @@ const HEADER_HELP = {
   hits: helpIcon('Requests Claude Code sent to Anthropic; one prompt can make several (tool use).'),
   raw: helpIcon('The request as Claude Code sent it. Raw − Cleanup − Summarized = Sent.'),
   cleanup: helpIcon('Tokens removed without changing the meaning (whitespace, filler). Applies to every hit.'),
-  haiku: helpIcon('✓ new summary written · ↻ stored one reused · · none. Only when the 5-minute cache is cold.'),
+  summary: helpIcon('✓ new summary built by the proxy · ↻ stored one reused · · none. Only on a cold cache.'),
   estimate: helpIcon('What the proxy sent after cleanup and summary, counted locally. Received is the real figure.'),
   received: helpIcon('Tokens Anthropic processed: RI + CW + CR, from the API response.'),
   cr: helpIcon('Cache read: tokens served from cache. Top row t = tokens, bottom row u = units.'),
   cw: helpIcon('Cache write: tokens stored in cache, billed above input. Top row t = tokens, bottom row u = units.'),
   ri: helpIcon('Regular input: tokens sent without caching. Top row t = tokens, bottom row u = units.'),
+  out: helpIcon('Output: tokens the model wrote. Top row t = tokens, bottom row u = units.'),
+  model: helpIcon('Model that served the request. A turn that switched models shows both; hover a figure for the split.'),
   billed: helpIcon('What Anthropic charged, in units: input, cache, output and summary. Hover for the breakdown.'),
 };
 
@@ -451,12 +471,46 @@ function effectiveRate(units: number, tokens: number): string {
   return tokens > 0 ? String(Number((units / tokens).toPrecision(3))) : '—';
 }
 
+/** "claude-haiku-5-5" → "Haiku 5.5"; anything that does not fit the pattern is shown as is. */
+export function shortModel(model: string | undefined): string {
+  const match = /^claude-([a-z]+)-(\d+)(?:-(\d+))?/.exec(model ?? '');
+  return match ? `${match[1][0].toUpperCase()}${match[1].slice(1)} ${match[2]}${match[3] ? `.${match[3]}` : ''}` : model || '—';
+}
+
+/** The served models of these hits, in the order they first appear. */
+function modelsOf(entries: readonly LedgerEntry[]): string[] {
+  return [...new Set(entries.map((entry) => entry.servedModel ?? ''))].filter(Boolean);
+}
+
+/**
+ * One line per served model: its tokens, the rate they billed at and the units. Used when a row mixes
+ * models, where a single "× rate" would be a blend that no model charges.
+ */
+function modelBreakdown(entries: readonly LedgerEntry[], pick: (s: AggregateStats) => { tokens: number; units: number }): string {
+  return modelsOf(entries)
+    .map((model) => ({ model, ...pick(aggregate(entries.filter((entry) => (entry.servedModel ?? '') === model))) }))
+    .filter(({ tokens }) => tokens > 0)
+    .map(({ model, tokens, units }) => `${shortModel(model)}: ${compact(tokens)} t × ${effectiveRate(units, tokens)} = ${compact(units)} u`)
+    .join('\n');
+}
+
+function modelCell(entries: readonly LedgerEntry[]): string {
+  const models = modelsOf(entries);
+  if (models.length === 0) {
+    return '<td>—</td>';
+  }
+  const label = models.length <= 2 ? models.map(shortModel).join(' → ') : `${models.length} models`;
+  return `<td title="${escapeHtml(models.map(shortModel).join(' → '))}">${escapeHtml(label)}</td>`;
+}
+
 function flowCells(
   s: AggregateStats,
-  flow: { rawTokens: number; prunedNorm: number; comp: SummaryUse; reused: SummaryUse; sent: number; skipped?: string; flying?: boolean; hitBalance?: HitBalance }
+  flow: { rawTokens: number; prunedNorm: number; comp: SummaryUse; reused: SummaryUse; sent: number; skipped?: string; flying?: boolean; hitBalance?: HitBalance; entries?: readonly LedgerEntry[] }
 ): string {
+  const entries = flow.entries ?? [];
+  const mixed = modelsOf(entries).length > 1;
   const afterCleanup = flow.rawTokens - flow.prunedNorm;
-  // Billed is the ledger's own invoice figure (input, output and the Haiku summary), and the
+  // Billed is the ledger's own invoice figure (input, output and, in rows up to 1 Nov 2026, the summary a model wrote), and the
   // saving is measured against what the same turn would have billed without the proxy.
   const billed = s.actualUnitCost;
   const readUnits = s.cacheReadUnits;
@@ -466,7 +520,7 @@ function flowCells(
   // Short on purpose: the rate behind each part is in the Cached cell's own tooltips.
   const billedTooltip =
     `CR ${compact(readUnits)} + CW ${compact(writeUnits)} + RI ${compact(uncachedUnits)} + output ${compact(outputUnits)}` +
-    (s.summarizerUnitCost > 0 ? ` + Haiku summary ${compact(s.summarizerUnitCost)}` : '') +
+    (s.summarizerUnitCost > 0 ? ` + summary written by a model ${compact(s.summarizerUnitCost)}` : '') +
     ` = ${compact(billed)} u`;
   const full = (value: number): string => Math.round(value).toLocaleString();
 
@@ -498,12 +552,24 @@ function flowCells(
   // Of the cached tokens, how many were read and how many written.
   const cached = s.cacheReadTokens + s.cacheWriteTokens;
   const effectNote = cached > 0 ? `CR: ${Math.round((s.cacheReadTokens / cached) * 100)}% CW: ${Math.round((s.cacheWriteTokens / cached) * 100)}%` : '';
-  const cacheCell = (abbr: string, tokens: number, units: number, unpriced: readonly string[] = []): string => {
-    const note = abbr === 'RI' ? '' : effectNote;
-    const rate = effectiveRate(units, tokens);
-    const tokensTitle = `${abbr}: ${compact(tokens)} t ${tokensBalance.style === AMBER_STYLE ? AMBER_NOTE : ''}`.trim();
-    const unitsTitle = `${abbr}: ${compact(tokens)} t × ${rate} = ${compact(units)} u. ${note} ${unitsBalance.style === AMBER_STYLE ? AMBER_NOTE : ''} ${unpricedNote(unpriced)}`.replace(/\s+/g, ' ').trim();
-    return `<td class="cache-col"><div class="cache-val"${tokensBalance.style} title="${escapeHtml(tokensTitle)}">${compact(tokens)} ${TOKENS_ABBR}</div><div class="cache-val"${unitsBalance.style} title="${escapeHtml(unitsTitle)}">${compact(units)} ${UNITS_ABBR}</div></td>`;
+  const cacheCell = (
+    abbr: string,
+    tokens: number,
+    units: number,
+    unpriced: readonly string[] = [],
+    pick: (s: AggregateStats) => { tokens: number; units: number } = () => ({ tokens, units }),
+    tinted = true
+  ): string => {
+    const note = abbr === 'RI' || abbr === 'OUT' ? '' : effectNote;
+    const tokensStyle = tinted ? tokensBalance.style : '';
+    const unitsStyle = tinted ? unitsBalance.style : '';
+    // A row that mixes models has no single rate: show tokens → units and one line per model.
+    const how = mixed
+      ? `${abbr}: ${compact(tokens)} t → ${compact(units)} u (mixed models)\n${modelBreakdown(entries, pick)}`
+      : `${abbr}: ${compact(tokens)} t × ${effectiveRate(units, tokens)} = ${compact(units)} u`;
+    const tokensTitle = `${abbr}: ${compact(tokens)} t ${tokensStyle === AMBER_STYLE ? AMBER_NOTE : ''}`.trim();
+    const unitsTitle = `${how}. ${note} ${unitsStyle === AMBER_STYLE ? AMBER_NOTE : ''} ${unpricedNote(unpriced)}`.replace(/[^\S\n]+/g, ' ').trim();
+    return `<td class="cache-col"><div class="cache-val"${tokensStyle} title="${escapeHtml(tokensTitle)}">${compact(tokens)} ${TOKENS_ABBR}</div><div class="cache-val"${unitsStyle} title="${escapeHtml(unitsTitle)}">${compact(units)} ${UNITS_ABBR}</div></td>`;
   };
   const receivedTitle = escapeHtml(
     [
@@ -513,13 +579,13 @@ function flowCells(
   );
   const rawTitle = escapeHtml(`Raw = the requests as Claude Code built them, before the proxy\n= ${full(flow.rawTokens)} t`);
 
-  return `<td class="num" title="${rawTitle}">${compact(flow.rawTokens)}</td>
+  return `${modelCell(entries)}<td class="num" title="${rawTitle}">${compact(flow.rawTokens)}</td>
     ${step(afterCleanup, flow.prunedNorm, flow.rawTokens)}
-    ${haikuSummaryCell(flow.comp, flow.reused, flow.skipped)}
+    ${summaryColumnCell(flow.comp, flow.reused, flow.skipped)}
     <td class="num" title="${escapeHtml(sentTitle)}">${compact(flow.sent)}</td>
     ${flow.flying ? ARROW_FLYING_CELL : ARROW_CELL}
     <td class="num" title="${receivedTitle}">${compact(received)}</td>
-    ${cacheCell('CR', s.cacheReadTokens, readUnits, s.unpriced.read)}${cacheCell('CW', s.cacheWriteTokens, writeUnits, s.unpriced.write)}${cacheCell('RI', s.uncachedInputTokens, uncachedUnits)}
+    ${cacheCell('CR', s.cacheReadTokens, readUnits, s.unpriced.read, (x) => ({ tokens: x.cacheReadTokens, units: x.cacheReadUnits }))}${cacheCell('CW', s.cacheWriteTokens, writeUnits, s.unpriced.write, (x) => ({ tokens: x.cacheWriteTokens, units: x.cacheWriteUnits }))}${cacheCell('RI', s.uncachedInputTokens, uncachedUnits, [], (x) => ({ tokens: x.uncachedInputTokens, units: x.regularInputUnits }))}${cacheCell('OUT', s.outputTokens, outputUnits + s.summarizerUnitCost, [], (x) => ({ tokens: x.outputTokens, units: x.outputUnits + x.summarizerUnitCost }))}
     <td class="num" title="${escapeHtml(billedTooltip)}">${compact(billed)} ${UNITS_ABBR}</td>`;
 }
 
@@ -547,16 +613,17 @@ function cacheBalanceStyle(reads: number, writes: number, basis: string): { styl
   return { style: '', note: '' };
 }
 
-function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: number | string, withDate = false, chatId?: string): string {
-  const isLive = live !== undefined;
+function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: number | string, withDate = false, chatId?: string, holdDone = false): string {
+  // `holdDone`: the turn already finished; its live request shows as a hit but the row stays done.
+  const isLive = live !== undefined && !holdDone;
   const s = aggregate(group.entries);
   // Hits still in flight add their pre-flight numbers; received/billed stay completed-only.
   const p = pendingTotals(live);
   const rawTokens = s.rawTokens + p.raw;
   const prunedNorm = s.prunedByNormalization + p.pruned;
-  const sent = s.optimizedTokens + p.sent;
+  const sent = s.estimatedTokens + p.sent;
   const hits = group.entries.length + (live?.count ?? 0);
-  const flow = flowCells(s, { rawTokens, prunedNorm, comp: compressionOf(group.entries), reused: reusedOf(group.entries), skipped: skippedOf(group.entries), sent, flying: p.known.sent, hitBalance: hitBalanceOf(group.entries) });
+  const flow = flowCells(s, { rawTokens, prunedNorm, comp: compressionOf(group.entries), reused: reusedOf(group.entries), skipped: skippedOf(group.entries), sent, flying: p.known.sent, hitBalance: hitBalanceOf(group.entries), entries: group.entries });
 
   // A failure is judged on the turn's newest hit: a retry that went through makes it done again.
   const lastStatus = group.entries[group.entries.length - 1].status;
@@ -589,7 +656,7 @@ function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: n
   const classes = [isLive ? 'turn-live' : '', chatId ? 'turn-child' : ''].filter(Boolean).join(' ');
   const parent = chatId ? ` data-parent="${escapeHtml(chatId)}"` : '';
   return `<tr${classes ? ` class="${classes}"` : ''}${parent} data-row="${key}" data-toggle="${key}">
-    ${timeCell(Date.parse(group.entries[group.entries.length - 1].timestamp), live?.since, true, withDate)}
+    ${timeCell(Date.parse(group.entries[group.entries.length - 1].timestamp), isLive ? live?.since : undefined, true, withDate)}
     <td>${escapeHtml(group.project)}${group.sessionId ? `<div class="turn-sub" title="${escapeHtml(`Claude Code chat ${group.sessionId}`)}">chat ${escapeHtml(group.sessionId.slice(0, 4))}</div>` : ''}</td>
     <td>${statusCell}</td>
     <td class="num">1</td>
@@ -608,7 +675,8 @@ function pingRow(group: TurnGroup, ordinal: number | string, withDate: boolean):
     comp: compressionOf([entry]),
     reused: reusedOf([entry]),
     skipped: skippedOf([entry]),
-    sent: s.optimizedTokens,
+    sent: s.estimatedTokens,
+    entries: [entry],
   });
   const failed = isFailedHit(entry);
   const title = failed ? 'Cache keep-alive ping failed' : 'Cache keep-alive ping: a one-token request that keeps the prompt cache from expiring';
@@ -631,7 +699,8 @@ function hitRow(entry: LedgerEntry, turnKey: string, index: number, chatId?: str
     comp: compressionOf([entry]),
     reused: reusedOf([entry]),
     skipped: skippedOf([entry]),
-    sent: s.optimizedTokens,
+    sent: s.estimatedTokens,
+    entries: [entry],
   });
   const failed = entry.status !== undefined && (entry.status < 200 || entry.status >= 300);
   const statusCell = failed
@@ -681,11 +750,11 @@ function breakdownSection(
 
 /**
  * Drill-down on the sliding-window compaction trigger (Stage 2): how often it
- * actually fires against the configured token threshold, and whether the Haiku
- * summarizer call it pays for nets out ahead of the tokens it prunes. The "Chat
- * compression" row in the table above nets this against the rest of the turn;
- * this section isolates it, because a summarizer call that costs more than what
- * it prunes can make a compacted turn cost *more* than doing nothing at all.
+ * actually fires against the configured token threshold, and what it prunes. The summary
+ * is built by the proxy itself and costs no tokens; rows up to 1 Nov 2026 hold what Haiku charged
+ * for writing it, and for those a summary that cost more than it pruned could make a compacted
+ * turn cost *more* than doing nothing at all. The "Chat compression" row in the table above nets
+ * this against the rest of the turn; this section isolates it.
  */
 /** Groups skip reasons by kind (the economics one carries per-turn numbers) and counts them, most common first. */
 function skipReasonCounts(entries: readonly LedgerEntry[]): Array<{ reason: string; count: number }> {
@@ -696,7 +765,7 @@ function skipReasonCounts(entries: readonly LedgerEntry[]): Array<{ reason: stri
       continue;
     }
     const reason = raw.startsWith('expected net')
-      ? 'economics gate: the saving would not cover the Haiku call plus cache rewrite'
+      ? 'economics gate: the saving would not cover the cache rewrite'
       : raw;
     counts.set(reason, (counts.get(reason) ?? 0) + 1);
   }
@@ -719,11 +788,11 @@ function compactionSection(entries: readonly LedgerEntry[]): string {
   const cacheTtl = config.get<string>('cacheTtl', DEFAULT_OPTIMIZER_CONFIG.cacheTtl) === '1h' ? '1 hour' : '5 minute';
   const configLine = `<div class="stat-sub">Fires only on a cold cache (longer than the ${cacheTtl} cache lifetime since the last request), once session history reaches ${thresholdTokens.toLocaleString()} tokens (and at least 4 messages), and only once per conversation until it is rebuilt; replaces the oldest ${(
     fraction * 100
-  ).toFixed(0)}% of it with a Haiku-written summary.</div>`;
+  ).toFixed(0)}% of it with a summary the proxy builds itself (no model, no cost).</div>`;
 
   const sum = (values: number[]) => values.reduce((total, value) => total + value, 0);
 
-  // Turns where the economics gate declined to call Haiku. `net` is the estimate, not a measured cost.
+  // Turns where the economics gate declined to compact. `net` is the estimate, not a measured cost.
   const skipped = entries.filter((entry) => entry.compactionSkippedReason);
   const skippedWithEstimate = skipped.filter((entry) => entry.compactionEconomics && entry.compactionEconomics.net <= 0);
   const avoidedNcu = sum(skippedWithEstimate.map((entry) => -(entry.compactionEconomics?.net ?? 0)));
@@ -759,8 +828,8 @@ function compactionSection(entries: readonly LedgerEntry[]): string {
          ${netLossTurns.length} of ${triggered.length} compacted turns (${(
         (netLossTurns.length / triggered.length) *
         100
-      ).toFixed(0)}%) cost <em>more</em> than the unoptimized baseline once the summarizer call is counted —
-         the Haiku summarization itself (${compact(summarizerNcu)} Units total across this selection) is the largest
+      ).toFixed(0)}%) cost <em>more</em> than the unoptimized baseline once the cost of the summary is counted —
+         for the summaries a model wrote, the summary itself (${compact(summarizerNcu)} Units total across this selection) is the largest
          single line item on those turns.
        </div>`
     : '';
@@ -784,9 +853,9 @@ function compactionSection(entries: readonly LedgerEntry[]): string {
       <div class="stat-sub">${compact(totalPruned)} pruned in total</div>
     </div>
     <div>
-      <div class="stat-label">Summarizer cost</div>
+      <div class="stat-label">Summary cost</div>
       <div class="stat-value" style="color:${COLORS.warn}">${compact(summarizerNcu)} ${UNITS_ABBR}</div>
-      <div class="stat-sub">${overheadTurns.length} / ${triggered.length} triggers cost more in Haiku tokens than they pruned</div>
+      <div class="stat-sub">${summarizerNcu > 0 ? `${overheadTurns.length} / ${triggered.length} triggers cost more than they pruned (summaries a model wrote)` : 'built by the proxy itself: no model, no cost'}</div>
     </div>
     <div>
       <div class="stat-label">Net effect on triggered turns</div>

@@ -12,6 +12,7 @@
  * reading about in the tooltip, but it must not mask an over-budget warning.
  */
 
+import { clearTooltipMarkdown } from './clearNotice';
 import * as vscode from 'vscode';
 import { AggregateStats, billedUnits } from '../analytics/tracker';
 import { paceLabel, renderEmbeddedProgressBar, statusFromPercent, statusLabel, statusToIcon, Summary } from './budgetDashboard';
@@ -63,6 +64,8 @@ export class StatusBar {
   private lastTurn: AggregateStats | undefined;
   /** Summaries are waiting for the user's `/clear`: the tooltip asks for it and explains nothing is lost. */
   private clearHint = false;
+  /** When the chat the summary belongs to started (epoch ms), when it is known. */
+  private clearSince: number | undefined;
   private todayStats: AggregateStats | undefined;
   private monthStats: AggregateStats | undefined;
   /** Anthropic's own reported cost for today/this month, from the local OTel sink. Undefined until it lands. */
@@ -328,8 +331,9 @@ export class StatusBar {
   }
 
   /** Call before `reportTurn`, which renders. */
-  setClearHint(value: boolean): void {
+  setClearHint(value: boolean, since?: number): void {
     this.clearHint = value;
+    this.clearSince = value ? since : undefined;
   }
 
   reportProxyError(message: string): void {
@@ -378,10 +382,12 @@ export class StatusBar {
   }
 
   private buildGaugeText(): string {
+    // The warning rides on the gauge item (the one on screen with a live budget) and only adds an icon: the colour stays the budget's.
+    const warning = this.clearHint ? ' $(warning)' : '';
     if (!this.gaugeTimer) {
-      return this.isBusy ? `$(claude-budget-gauge-${GAUGE_REST})` : '$(claude-budget-gauge)';
+      return (this.isBusy ? `$(claude-budget-gauge-${GAUGE_REST})` : '$(claude-budget-gauge)') + warning;
     }
-    return `$(claude-budget-gauge-${Math.min(GAUGE_FRAMES, Math.max(1, Math.round(this.gaugePos)))})`;
+    return `$(claude-budget-gauge-${Math.min(GAUGE_FRAMES, Math.max(1, Math.round(this.gaugePos)))})` + warning;
   }
 
   private renderGauge(): void {
@@ -428,6 +434,10 @@ export class StatusBar {
         segments.push('$(sync~spin)');
       }
     } else if (this.proxyError) {
+      segments.push('$(warning)');
+    }
+    // Without a gauge the text item is the one on screen: the same icon, unless a proxy error already put one.
+    if (this.clearHint && !this.gaugeVisible && (busy || !this.proxyError)) {
       segments.push('$(warning)');
     }
     // Idle with a completed last turn: no segment here anymore — the same
@@ -501,10 +511,7 @@ export class StatusBar {
 
     this.appendBudgetSection(md);
     if (this.clearHint) {
-      md.appendMarkdown(
-        "\n**New day:** the proxy summarized yesterday's history and saved it. Run `/clear` and send your next message: " +
-          'the summary is added to the new chat automatically, so nothing is lost and Claude Code stops resending the old history.\n'
-      );
+      md.appendMarkdown(clearTooltipMarkdown(this.clearSince));
     }
     md.appendMarkdown('\nClick for dashboards (savings breakdown is in the Token Improver tab).');
     return md;

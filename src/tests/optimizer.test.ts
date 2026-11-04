@@ -15,15 +15,10 @@ import {
   DEFAULT_OPTIMIZER_CONFIG,
   HAIKU_MODEL_ID,
   SONNET_MODEL_ID,
-  SUMMARIZER_CHUNK_CHARS,
-  manifestSystemPrompt,
   applyCacheTtl,
   cacheTtlMs,
   CACHE_TTL_1H_MS,
   CACHE_TTL_5M_MS,
-  manifestTargetTokens,
-  MANIFEST_MAX_TOKENS,
-  MANIFEST_MIN_TOKENS,
   latestUserText,
   normalizeText,
   optimizePayload,
@@ -34,8 +29,6 @@ import {
   BaselineMemory,
   hasClientCacheControl,
   estimateCompactionEconomics,
-  addSummarizerUsage,
-  manifestMaxOutputTokens,
 } from '../proxy/optimizer';
 import { getPricingTable, modelOutputWeight, modelWeight, resetPricing } from '../proxy/pricing';
 import { estimatePayloadTokens, MessagesPayload } from '../proxy/tokenCounter';
@@ -120,7 +113,7 @@ test('compaction does not run below the sliding threshold', async () => {
   const { telemetry } = await optimizePayload(payload, config({ slidingThresholdTokens: 100_000 }), {
     summarize: async () => {
       called = true;
-      return { text: 'manifest', usage: { inputTokens: 500, outputTokens: 80 } };
+      return { text: 'manifest' };
     },
   });
 
@@ -128,7 +121,7 @@ test('compaction does not run below the sliding threshold', async () => {
   assert.equal(telemetry.compactionTriggered, false);
 });
 
-test('compaction skips a trigger whose compactable "older" segment is too thin to be worth a Haiku call', async () => {
+test('compaction skips a trigger whose compactable "older" segment is too thin to be worth replacing', async () => {
   // The last two messages are always kept verbatim regardless of size, so a single
   // huge second-to-last message forces the entire kept "recent" tail past budget in
   // one step, leaving only the four tiny leading turns as "older" — a real shape
@@ -147,7 +140,7 @@ test('compaction skips a trigger whose compactable "older" segment is too thin t
   const { payload: out, telemetry } = await optimizePayload(payload, config({ slidingThresholdTokens: 1000 }), {
     summarize: async () => {
       called = true;
-      return { text: 'manifest', usage: { inputTokens: 500, outputTokens: 80 } };
+      return { text: 'manifest' };
     },
   });
 
@@ -162,7 +155,6 @@ test('compaction replaces old history and reports the tokens it removed', async 
   const { payload: out, telemetry } = await optimizePayload(payload, config({ slidingThresholdTokens: 1000 }), {
     summarize: async () => ({
       text: '- **Active Stack**: node\n- **Resolved Bugs**: none',
-      usage: { inputTokens: 500, outputTokens: 80 },
     }),
   });
 
@@ -173,7 +165,6 @@ test('compaction replaces old history and reports the tokens it removed', async 
   assert.equal(out.messages![0]['role'], 'user');
   assert.equal(out.messages![1]['role'], 'assistant');
   // 3.2: the summarizer's own usage reaches telemetry instead of vanishing.
-  assert.deepEqual(telemetry.summarizerUsage, { inputTokens: 500, outputTokens: 80 });
 });
 
 test('compaction sizes the kept tail by token budget, not message count, so heavy recent turns are folded into the summary too', async () => {
@@ -202,7 +193,6 @@ test('compaction sizes the kept tail by token budget, not message count, so heav
     {
       summarize: async () => ({
         text: '- **Active Stack**: node\n- **Resolved Bugs**: none',
-        usage: { inputTokens: 500, outputTokens: 80 },
       }),
     }
   );
@@ -236,7 +226,6 @@ test('compaction never splits a tool_use from its tool_result across the cut', a
   const { payload: out, telemetry } = await optimizePayload(payload, config({ slidingThresholdTokens: 1000 }), {
     summarize: async () => ({
       text: '- **Active Stack**: node\n- **Resolved Bugs**: none',
-      usage: { inputTokens: 500, outputTokens: 80 },
     }),
   });
 
@@ -277,7 +266,7 @@ test('compaction is skipped on a tool_result continuation even above threshold, 
   const { payload: out, telemetry } = await optimizePayload(payload, config({ slidingThresholdTokens: 1000 }), {
     summarize: async () => {
       called = true;
-      return { text: 'manifest', usage: { inputTokens: 500, outputTokens: 80 } };
+      return { text: 'manifest' };
     },
   });
 
@@ -298,7 +287,6 @@ test('a failing summarizer leaves history intact and records the reason', async 
   assert.equal(telemetry.compactionTriggered, false);
   assert.equal(telemetry.compactionError, 'upstream 529');
   assert.equal(out.messages!.length, payload.messages!.length);
-  assert.equal(telemetry.summarizerUsage, undefined);
 });
 
 // --- Stage 3 -----------------------------------------------------------------
@@ -579,7 +567,7 @@ function recordingSummarizer() {
     calls,
     summarize: async (messages: Array<Record<string, unknown>>) => {
       calls.push(messages);
-      return { text: `summary ${calls.length}`, usage: { inputTokens: 500, outputTokens: 80 } };
+      return { text: `summary ${calls.length}` };
     },
   };
 }
@@ -862,21 +850,12 @@ test('economics: more expected requests only ever improve the net', () => {
 
 test('the same history on a cold cache is still compacted', async () => {
   const { telemetry } = await optimizePayload(historyPayload(20, 2000), config({ slidingThresholdTokens: 1000 }), {
-    summarize: async () => ({ text: '- **Active Stack**: node', usage: { inputTokens: 500, outputTokens: 80 } }),
+    summarize: async () => ({ text: '- **Active Stack**: node' }),
   });
   assert.equal(telemetry.compactionTriggered, true);
   assert.equal(telemetry.compactionSkippedReason, undefined);
   assert.equal(telemetry.compactionEconomics?.cacheWarm, false);
   assert.ok((telemetry.compactionEconomics?.net ?? 0) > 0);
-});
-
-test('the gate prices one manifest per summarizer chunk, not one per segment', () => {
-  const base = { olderTokens: 100_000, keptTokens: 20_000, cacheWarm: false, expectedRequests: 10 };
-  const one = estimateCompactionEconomics({ ...base, serializedChars: SUMMARIZER_CHUNK_CHARS });
-  const three = estimateCompactionEconomics({ ...base, serializedChars: SUMMARIZER_CHUNK_CHARS * 2 + 1 });
-  const extraManifest = (three.haikuCost - one.haikuCost) / 2;
-  assert.ok(extraManifest > 0);
-  assert.equal(estimateCompactionEconomics(base).haikuCost, one.haikuCost);
 });
 
 test('a warm cache is never compacted by default, however large the history', async () => {
@@ -890,7 +869,7 @@ test('a warm cache is never compacted by default, however large the history', as
     baselineMemory,
     summarize: async () => {
       called = true;
-      return { text: 'manifest', usage: { inputTokens: 500, outputTokens: 80 } };
+      return { text: 'manifest' };
     },
   });
 
@@ -907,7 +886,7 @@ test('a cold cache below the sliding threshold is not compacted', async () => {
     {
       summarize: async () => {
         called = true;
-        return { text: 'manifest', usage: { inputTokens: 500, outputTokens: 80 } };
+        return { text: 'manifest' };
       },
     }
   );
@@ -952,14 +931,14 @@ test('a cold cache compacts once, marks the conversation resumed, and the next c
   let calls = 0;
   const summarize = async () => {
     calls += 1;
-    return { text: 'manifest', usage: undefined };
+    return { text: 'manifest' };
   };
 
   const first = await optimizePayload(historyPayload(20, 2000), config({ slidingThresholdTokens: 1000 }), { summarize, summaryStore: store });
   assert.equal(first.telemetry.compactionTriggered, true);
   assert.equal(calls, 1);
 
-  // A longer history of the same conversation, cold again: the flag blocks a second Haiku call.
+  // A longer history of the same conversation, cold again: the flag blocks a second summary.
   const second = await optimizePayload(historyPayload(30, 2000), config({ slidingThresholdTokens: 1000 }), { summarize, summaryStore: store });
   assert.equal(calls, 1);
   assert.equal(second.telemetry.compactionTriggered, false);
@@ -972,7 +951,7 @@ test('resumed clears once 50K tokens of new history pile up after the summary', 
   let calls = 0;
   const summarize = async () => {
     calls += 1;
-    return { text: 'manifest', usage: undefined };
+    return { text: 'manifest' };
   };
 
   await optimizePayload(historyPayload(20, 2000), config({ slidingThresholdTokens: 1000 }), { summarize, summaryStore: store });
@@ -993,20 +972,6 @@ test('BaselineMemory keeps the last request time across a restart, so a warm cac
   assert.equal(reopened.cachedTokens('conv', 120_000, 1_000 + 60_000), 100_000, 'within the TTL the old prefix is still cached');
   assert.equal(new BaselineMemory(5 * 60_000, 200, file).cachedTokens('conv', 120_000, 1_000 + 60_000 + 6 * 60_000), 0, 'past the TTL it is cold');
   fs.rmSync(dir, { recursive: true, force: true });
-});
-
-test('the manifest grows with what is summarized, within its floor and cap', () => {
-  assert.equal(manifestTargetTokens(1_000), MANIFEST_MIN_TOKENS);
-  assert.equal(manifestTargetTokens(100_000), 2_000);
-  assert.equal(manifestTargetTokens(10_000_000), MANIFEST_MAX_TOKENS);
-  assert.match(manifestSystemPrompt(2_000), /at most 2000 tokens/);
-});
-
-test('the economics gate prices a bigger manifest on a bigger segment', () => {
-  const small = estimateCompactionEconomics({ olderTokens: 10_000, keptTokens: 4_000, cacheWarm: false, expectedRequests: 1, serializedChars: 25_000 });
-  const large = estimateCompactionEconomics({ olderTokens: 100_000, keptTokens: 4_000, cacheWarm: false, expectedRequests: 1, serializedChars: 250_000 });
-  assert.ok(large.net > small.net);
-  assert.ok(large.haikuCost > small.haikuCost * 9, 'output grows with the segment, not only the input');
 });
 
 test('cacheTtlMs maps the setting to its lifetime and defaults to 5 minutes', () => {
@@ -1101,31 +1066,90 @@ test('hasToolResults sees through trailing system-reminder messages, so one prom
   assert.equal(hasToolResults(asPayload([])), false);
 });
 
-test('summarizer usage remembers which chunk calls had a prompt over the Haiku long-prompt threshold', () => {
-  let total = addSummarizerUsage(undefined, { inputTokens: 90_000, outputTokens: 1_500 });
-  assert.deepEqual(total, { inputTokens: 90_000, outputTokens: 1_500, longPromptInputTokens: 0, longPromptOutputTokens: 0 });
-  total = addSummarizerUsage(total, { inputTokens: 100_001, outputTokens: 2_000 });
-  total = addSummarizerUsage(total, { inputTokens: 100_000, outputTokens: 500 });
-  assert.deepEqual(total, { inputTokens: 290_001, outputTokens: 4_000, longPromptInputTokens: 100_001, longPromptOutputTokens: 2_000 });
+test('a cache that a keep-alive ping keeps warm is warm for the compaction, although the client\'s own record says it is cold', async () => {
+  const NOW = Date.UTC(2026, 10, 2, 20, 0, 0);
+  let calls = 0;
+  const summarize = async () => ({ text: '## Requests\n1. Asked: x', calls: (calls += 1) });
+  const run = (cacheLastUsedAt?: number, over: Partial<OptimizerConfig> = {}) =>
+    optimizePayload(historyPayload(20, 2000), config({ slidingThresholdTokens: 1000, ...over }), { summarize, now: () => NOW, cacheLastUsedAt });
+
+  const noKeepAlive = await run(undefined);
+  assert.equal(noKeepAlive.telemetry.compactionTriggered, true, 'nothing says the cache is alive: it is cold, as before');
+  assert.equal(noKeepAlive.telemetry.realCacheWarm, undefined);
+
+  const pinged = await run(NOW - 60_000);
+  assert.equal(pinged.telemetry.realCacheWarm, true);
+  assert.equal(pinged.telemetry.compactionTriggered, false, 'a ping a minute ago: the real cache is warm, rewriting it would be a waste');
+  assert.equal(pinged.telemetry.compactionSkippedReason, 'cache is warm (kept warm by the keep-alive); compaction waits for a cold cache');
+
+  const expired = await run(NOW - 6 * 60_000);
+  assert.equal(expired.telemetry.realCacheWarm, false);
+  assert.equal(expired.telemetry.compactionTriggered, true, 'the last ping was longer ago than the 5 minute lifetime');
+
+  const hour = await run(NOW - 30 * 60_000, { cacheTtl: '1h' });
+  assert.equal(hour.telemetry.realCacheWarm, true, 'with the 1 hour cache, 30 minutes is still warm');
+  assert.equal(hour.telemetry.compactionTriggered, false);
 });
 
-test('the economics gate prices the Haiku tier by one chunk prompt, not by the sum of the chunks', () => {
-  resetPricing();
-  try {
-    const rates = getPricingTable().rates;
-    rates['claude-sonnet-5'] = { input: 2e-6, output: 10e-6, cacheRead: 0.2e-6, cacheWrite: 2.5e-6 };
-    rates[HAIKU_MODEL_ID] = { input: 0.1e-6, output: 0.5e-6, cacheRead: 0.01e-6, cacheWrite: 0.125e-6 };
-    const older = 120_000;
-    const base = { olderTokens: older, keptTokens: 20_000, cacheWarm: false, expectedRequests: 10 };
-    // One call would carry 240K tokens (2x inflation): long tier. Three chunks carry 80K each: short tier.
-    const oneCall = estimateCompactionEconomics(base);
-    const threeChunks = estimateCompactionEconomics({ ...base, serializedChars: SUMMARIZER_CHUNK_CHARS * 2 + 1 });
-    const manifestOne = manifestMaxOutputTokens(older);
-    const manifestThree = 3 * manifestMaxOutputTokens(older / 3);
-    assert.ok(Math.abs(oneCall.haikuCost - (older * 2 * modelWeight(HAIKU_MODEL_ID, 240_000) + manifestOne * modelOutputWeight(HAIKU_MODEL_ID, 240_000))) < 1e-6);
-    assert.ok(Math.abs(threeChunks.haikuCost - (older * 2 * modelWeight(HAIKU_MODEL_ID) + manifestThree * modelOutputWeight(HAIKU_MODEL_ID))) < 1e-6);
-    assert.ok(oneCall.haikuCost > threeChunks.haikuCost * 4, 'the long tier makes the single big call several times dearer');
-  } finally {
-    resetPricing();
+test('the economics of a summary count no model, and the summary left in place is capped whatever the history', () => {
+  const base = { olderTokens: 200_000, keptTokens: 20_000, cacheWarm: false, expectedRequests: 10 };
+  const small = estimateCompactionEconomics({ ...base, olderTokens: 20_000 });
+  const large = estimateCompactionEconomics(base);
+  const huge = estimateCompactionEconomics({ ...base, olderTokens: 2_000_000 });
+  assert.ok(large.net > small.net, 'a bigger segment saves more');
+  assert.ok(huge.net > large.net, 'and the summary does not grow with it');
+  assert.equal('haikuCost' in large, false, 'there is no model to pay');
+  assert.equal(large.rewriteCost, 0, 'a cold cache has nothing to rewrite');
+  assert.ok(estimateCompactionEconomics({ ...base, cacheWarm: true }).rewriteCost > 0, 'a warm one does');
+  // A segment so thin that the summary would be as big as it is saves next to nothing.
+  const thin = estimateCompactionEconomics({ ...base, olderTokens: 2_000 });
+  assert.ok(thin.savings < small.savings / 5);
+});
+
+test('the turn says the proxy wrote the summary, and says nothing when none was made', async () => {
+  const summarize = async () => ({ text: '## Requests\n1. Asked: x' });
+  const made = await optimizePayload(historyPayload(20, 2000), config({ slidingThresholdTokens: 1000 }), { summarize });
+  assert.equal(made.telemetry.compactionTriggered, true);
+  assert.equal(made.telemetry.summaryKind, 'local');
+  assert.equal('haikuCost' in (made.telemetry.compactionEconomics ?? {}), false);
+  const none = await optimizePayload(historyPayload(2, 100), config({ slidingThresholdTokens: 1_000_000 }), { summarize });
+  assert.equal(none.telemetry.summaryKind, undefined);
+});
+
+test('a history over the warm-cache threshold is summarized even while the cache is warm, if the economics say it pays', async () => {
+  const NOW = Date.UTC(2026, 10, 2, 20, 0, 0);
+  const summarize = async () => ({ text: '## Requests\n1. Asked: x' });
+  const run = (over: Partial<OptimizerConfig>) =>
+    optimizePayload(historyPayload(20, 40_000), config({ slidingThresholdTokens: 1000, ...over }), { summarize, now: () => NOW, cacheLastUsedAt: NOW - 60_000 });
+  const below = await run({ warmCacheCompactionTokens: 100_000_000 });
+  assert.equal(below.telemetry.compactionTriggered, false, 'under the threshold the warm cache still waits');
+  const over = await run({ warmCacheCompactionTokens: 100_000 });
+  assert.equal(over.telemetry.compactionTriggered, true, 'over it a warm cache does not stop the summary');
+  assert.equal(over.telemetry.compactionEconomics?.cacheWarm, true, 'and the economics priced the rewrite of a warm cache');
+  assert.ok((over.telemetry.compactionEconomics?.rewriteCost ?? 0) > 0);
+  const off = await run({ warmCacheCompactionTokens: 0 });
+  assert.equal(off.telemetry.compactionTriggered, false, '0 turns it off');
+});
+
+test('a long history inside one user turn has no cut point, and the skip reason says so', async () => {
+  // One typed prompt followed by many big tool round trips: no earlier user turn exists to cut at.
+  const big = 'x'.repeat(8000);
+  const messages: Array<Record<string, unknown>> = [{ role: 'user', content: 'read these files' }];
+  for (let i = 0; i < 6; i += 1) {
+    messages.push({ role: 'assistant', content: [{ type: 'tool_use', id: `t${i}`, name: 'Read', input: {} }] });
+    messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${i}`, content: big }] });
   }
+  messages.push({ role: 'assistant', content: 'done' });
+  messages.push({ role: 'user', content: 'what was the key?' });
+
+  let calls = 0;
+  const { telemetry } = await optimizePayload({ model: 'claude-sonnet-5', messages } as unknown as MessagesPayload, config({ slidingThresholdTokens: 1000 }), {
+    summarize: async () => {
+      calls += 1;
+      return { text: 'manifest' };
+    },
+  });
+  assert.equal(calls, 0);
+  assert.equal(telemetry.compactionTriggered, false);
+  assert.match(telemetry.compactionSkippedReason ?? '', /no valid cut point/);
 });

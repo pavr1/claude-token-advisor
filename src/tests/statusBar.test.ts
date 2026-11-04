@@ -421,3 +421,77 @@ test('the tooltip title shows the extension version when it is known', () => {
   const tip = String((fake.statusBarItems[fake.statusBarItems.length - 1].tooltip as { value?: string }).value ?? '');
   assert.match(tip, /### Claude Budget Advisor v9\.8\.7/);
 });
+
+test('a summarized history waiting for /clear puts a warning icon on the gauge item, and takes it away when it is delivered', () => {
+  const { bar, gauge, item, text, bg, color } = make();
+  bar.setBudget(tokensSummary());
+  assert.equal(text(), '$(claude-budget-gauge) 42.50% $(pass-filled)');
+
+  bar.setClearHint(true);
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+  assert.match(gauge.text, /^\$\(claude-budget-gauge\) \$\(warning\)$/, 'the icon sits on the item that is on screen');
+  assert.equal(item.visible, false, 'no second item: the text item stays hidden');
+  assert.equal(bg(), undefined, 'the colour stays the budget\'s: an on-track budget is not tinted by the notice');
+  assert.equal(color(), undefined);
+
+  bar.setClearHint(false);
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+  assert.equal(gauge.text, '$(claude-budget-gauge)');
+});
+
+test('the warning icon does not change the budget colour, and stays while the gauge needle moves', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { bar, gauge, bg } = make();
+  bar.setBudget(tokensSummary({ percent_used: 80.01, status: 'over_budget' }));
+  bar.setClearHint(true);
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+  assert.equal(bg(), 'statusBarItem.errorBackground', 'the over-budget colour is still the budget\'s');
+
+  bar.beginRequest();
+  t.mock.timers.tick(500);
+  assert.match(gauge.text, /^\$\(claude-budget-gauge-\d+\) \$\(warning\)$/, 'every animation frame carries the icon');
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+});
+
+test('without a gauge the text item carries the warning, once, and a proxy error does not double it', () => {
+  const { bar, item } = make();
+  bar.setClearHint(true);
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+  assert.equal(item.visible, true);
+  assert.match(item.text, /\$\(warning\)/, 'loading state, no budget yet');
+  assert.equal((item.text.match(/\$\(warning\)/g) ?? []).length, 1);
+
+  bar.reportProxyError('upstream down');
+  assert.equal((item.text.match(/\$\(warning\)/g) ?? []).length, 1, 'the proxy error already shows one');
+});
+
+test('the tooltip tells what to do and says the dashboard is one click away, only while the summary waits', () => {
+  const { bar, tip } = make();
+  bar.setBudget(tokensSummary());
+  assert.doesNotMatch(tip(), /New day/);
+  bar.setClearHint(true);
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+  assert.match(tip(), /\$\(warning\) \*\*New day:\*\* this chat has been open since an earlier day/);
+  assert.match(tip(), /resends all of its history with every message, which uses more tokens/);
+  assert.match(tip(), /The proxy summarized it and saved it/);
+  assert.match(tip(), /Run `\/clear` and send your next message/);
+  assert.match(tip(), /the new chat starts with that summary, so nothing is lost/);
+  assert.match(tip(), /Click this icon for details/);
+});
+
+test('the tooltip says since when the chat has been open when it is known, and "an earlier day" when it is not', () => {
+  const { bar, tip } = make();
+  bar.setBudget(tokensSummary());
+  bar.setClearHint(true, new Date(2026, 9, 30, 12).getTime());
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+  assert.match(tip(), /this chat has been open since Fri, Oct 30, and Claude Code resends/);
+
+  bar.setClearHint(true);
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+  assert.match(tip(), /this chat has been open since an earlier day, and Claude Code resends/);
+
+  bar.setClearHint(false, new Date(2026, 9, 30, 12).getTime());
+  bar.setClearHint(true);
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+  assert.match(tip(), /since an earlier day/, 'a date given with "nothing waiting" is not kept for the next wait');
+});

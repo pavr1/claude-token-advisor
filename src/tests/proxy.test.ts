@@ -22,7 +22,6 @@ import {
   TokenImproverProxy,
   TurnRecord,
   UnifiedRateLimitSnapshot,
-  splitForSummarizer,
   describeFetchError,
   isRetryableConnectionError,
 } from '../proxy/server';
@@ -950,25 +949,6 @@ test('a closed subscription never reports an end', async () => {
   await proxy.stop();
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(ended, 0);
-});
-
-test('splitForSummarizer keeps one chunk when it fits', () => {
-  const user = (text: string) => ({ role: 'user', content: [{ type: 'text', text }] });
-  const asst = (text: string) => ({ role: 'assistant', content: [{ type: 'text', text }] });
-  assert.equal(splitForSummarizer([user('a'), asst('b'), user('c'), asst('d')], 10_000).length, 1);
-});
-
-test('splitForSummarizer cuts only on fresh user turns and preserves order', () => {
-  const user = (text: string) => ({ role: 'user', content: [{ type: 'text', text }] });
-  const asst = (text: string) => ({ role: 'assistant', content: [{ type: 'text', text }] });
-  const toolResult = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: 'y'.repeat(300) }] };
-  const msgs = [user('a'.repeat(300)), asst('b'), toolResult, asst('c'), user('d'.repeat(300)), asst('e')];
-  const chunks = splitForSummarizer(msgs, 400);
-  assert.deepEqual(chunks.flat(), msgs);
-  assert.ok(chunks.length > 1);
-  for (const chunk of chunks.slice(1)) {
-    assert.ok(!JSON.stringify(chunk[0]).includes('tool_result'));
-  }
 });
 
 test('isNewerVersion compares dotted numeric versions', () => {

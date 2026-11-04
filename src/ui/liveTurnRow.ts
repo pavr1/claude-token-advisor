@@ -26,8 +26,8 @@ export function timeCell(lastAt: number | undefined, liveSince?: number, toggle 
 
 /** Status label of a live row; the spinner and trailing dots animate in CSS. */
 
-/** CR, CW and RI have no figures until Anthropic answers. */
-const CACHE_PLACEHOLDER = '<td class="cache-col">—</td>'.repeat(3);
+/** CR, CW, RI and Out have no figures until Anthropic answers. */
+const CACHE_PLACEHOLDER = '<td class="cache-col">—</td>'.repeat(4);
 
 /** Settled rows leave the handoff column empty; only a request on its way to Anthropic shows the arrow. */
 export const ARROW_CELL = '<td class="turn-arrow"></td>';
@@ -35,25 +35,25 @@ export const ARROW_CELL = '<td class="turn-arrow"></td>';
 /** The arrow flies left to right (CSS) while the optimized request is out and the answer has not come back. */
 export const ARROW_FLYING_CELL = '<td class="turn-arrow"><span class="arrow-fly" title="Sent to Anthropic, waiting for the answer">→</span></td>';
 
-/** What the Haiku summaries of a set of hits did: how many hits, and the tokens they kept out of the request. */
+/** What the summaries of a set of hits did: how many hits, and the tokens they kept out of the request. */
 export interface SummaryUse {
   hits: number;
   /** Request size before the summary (0 when unknown, as on a live row). */
   before: number;
   pruned: number;
-  /** One-time Haiku cost in units; always 0 for a reused summary. */
-  haikuUnits: number;
+  /** What a model charged for writing them, in units: only rows up to 1 Nov 2026 (Haiku) have one. 0 for a summary the proxy built and for a reused one. */
+  costUnits: number;
 }
 
 /**
- * The single "Haiku summary" cell: `✓ new` when a hit wrote a summary (one Haiku call), `↻ reused`
- * when it picked up one written earlier (free), `·` when nothing was summarized. The numbers behind
+ * The single "Summarized" cell: `✓ new` when a hit got a summary (the proxy builds it itself, with no model and no cost),
+ * `↻ reused` when it picked up one built earlier, `·` when nothing was summarized. The numbers behind
  * the mark live in the tooltip, so the column answers "did it summarize?" at a glance.
  */
-export function haikuSummaryCell(created: SummaryUse, reused: SummaryUse, skippedReason?: string): string {
+export function summaryColumnCell(created: SummaryUse, reused: SummaryUse, skippedReason?: string): string {
   if (created.hits === 0 && reused.hits === 0) {
     const why = skippedReason ? `: ${skippedReason}` : '';
-    return `<td class="num"><span class="muted" title="${escapeHtml(`No Haiku summary on this request${why}`)}">·</span></td>`;
+    return `<td class="num"><span class="muted" title="${escapeHtml(`No summary on this request${why}`)}">·</span></td>`;
   }
   const saved = (use: SummaryUse): string =>
     use.before > 0
@@ -62,11 +62,15 @@ export function haikuSummaryCell(created: SummaryUse, reused: SummaryUse, skippe
   const label = (mark: string, word: string, use: SummaryUse): string => `${mark} ${use.hits > 1 ? `${use.hits} ` : ''}${word}`;
   const lines: string[] = [];
   if (created.hits > 0) {
-    const title = `Haiku wrote ${created.hits} summary(ies): ${saved(created)}. Cost ${compact(created.haikuUnits)} u, in Billed.`;
+    // Only rows up to 1 Nov 2026 carry a cost: Haiku wrote those summaries. The proxy builds them itself since.
+    const title =
+      created.costUnits > 0
+        ? `A model wrote ${created.hits} summary(ies): ${saved(created)}. Cost ${compact(created.costUnits)} u, in Billed.`
+        : `The proxy built ${created.hits} summary(ies) itself: ${saved(created)}. No model, no cost.`;
     lines.push(`<div style="color:${savingsTone(created.pruned)}" title="${escapeHtml(title)}">${label('✓', 'new', created)}</div>`);
   }
   if (reused.hits > 0) {
-    const title = `Reused ${reused.hits} stored summary(ies): ${saved(reused)}. No Haiku call.`;
+    const title = `Reused ${reused.hits} stored summary(ies): ${saved(reused)}. Nothing new to build.`;
     lines.push(`<div style="color:${savingsTone(reused.pruned)}" title="${escapeHtml(title)}">${label('↻', 'reused', reused)}</div>`);
   }
   return `<td class="num">${lines.join('')}</td>`;
@@ -106,7 +110,7 @@ export function liveRow(project: string, live: InFlightProject, ordinal: number 
   const key = `${escapeHtml(project)}#${ordinal}`;
   const child = chatId ? ` turn-child" data-parent="${escapeHtml(chatId)}` : '';
   return (
-    `<tr class="turn-live${child}" data-row="${key}" data-toggle="${key}">${timeCell(undefined, live.since, true)}<td>${escapeHtml(project)}</td><td>${processingIcon(key)}</td><td class="num">1</td><td class="num">${live.count}</td>\n    ${liveCells(live)}</tr>` +
+    `<tr class="turn-live${child}" data-row="${key}" data-toggle="${key}">${timeCell(undefined, live.since, true)}<td>${escapeHtml(project)}</td><td>${processingIcon(key)}</td><td class="num">1</td><td class="num">${live.count}</td><td></td>\n    ${liveCells(live)}</tr>` +
     liveHitRows(key, live, chatId)
   );
 }
@@ -118,7 +122,7 @@ export function liveHitRows(turnKey: string, live: InFlightProject, chatId?: str
   for (let i = 0; i < live.count; i += 1) {
     const stage: InFlightStage | undefined = live.preflight[i];
     const one: InFlightProject = { count: 1, newTurn: false, since: live.since, preflight: stage ? [stage] : [] };
-    rows += `<tr class="hit-row turn-live" data-row="${turnKey}/L${i}" data-parent="${turnKey}"${ancestors}><td></td><td class="hit-label">↳ hit</td><td>${processingIcon(`${turnKey}/L${i}`)}</td><td></td><td class="num">1</td>\n    ${liveCells(one)}</tr>`;
+    rows += `<tr class="hit-row turn-live" data-row="${turnKey}/L${i}" data-parent="${turnKey}"${ancestors}><td></td><td class="hit-label">↳ hit</td><td>${processingIcon(`${turnKey}/L${i}`)}</td><td></td><td class="num">1</td><td></td>\n    ${liveCells(one)}</tr>`;
   }
   return rows;
 }
@@ -136,11 +140,11 @@ function liveCells(live: InFlightProject): string {
   const rawCell = p.known.raw ? `<td class="num">${compact(p.raw)}</td>` : empty;
   const cleanupCell = step(p.known.raw && p.known.pruned, afterCleanup, p.pruned, p.raw);
   const compactionKnown = p.known.raw && p.known.pruned && p.known.compacted;
-  // Nothing is claimed under Haiku summary until the compaction stage has reported.
+  // Nothing is claimed under Summarized until the compaction stage has reported.
   const summaryCell = compactionKnown
-    ? haikuSummaryCell(
-        { hits: p.compactedHits, before: 0, pruned: p.compacted, haikuUnits: 0 },
-        { hits: p.reusedHits, before: 0, pruned: p.reused, haikuUnits: 0 }
+    ? summaryColumnCell(
+        { hits: p.compactedHits, before: 0, pruned: p.compacted, costUnits: 0 },
+        { hits: p.reusedHits, before: 0, pruned: p.reused, costUnits: 0 }
       )
     : empty;
   const sentCell = p.known.sent ? `<td class="num">${compact(p.sent)}</td>` : empty;

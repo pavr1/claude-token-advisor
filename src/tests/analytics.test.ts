@@ -279,20 +279,6 @@ test('a model downgrade is priced at the served model weight', () => {
   assert.ok(Math.abs(cost.savingsPercent - (1 - 4_000 / 3 / 10_000) * 100) < 1e-9);
 });
 
-test('the compaction summarizer\'s cost is folded into actualUnitCost only, at Haiku\'s rate', () => {
-  const withoutSummarizer = computeTurnCost(telemetry(), { input_tokens: 4_000 });
-
-  const cost = computeTurnCost(telemetry({ summarizerUsage: { inputTokens: 2_000, outputTokens: 300 } }), {
-    input_tokens: 4_000,
-  });
-
-  const expectedSummarizerCost = 2_000 * modelWeight(HAIKU_MODEL_ID) + 300 * modelOutputWeight(HAIKU_MODEL_ID);
-  // Baseline never runs compaction, so it never pays for a summary — unaffected.
-  assert.equal(cost.baselineUnitCost, withoutSummarizer.baselineUnitCost);
-  assert.equal(cost.summarizerUnitCost, expectedSummarizerCost);
-  assert.equal(cost.actualUnitCost, withoutSummarizer.actualUnitCost + expectedSummarizerCost);
-});
-
 test('no summarizer usage means zero summarizer cost, not undefined/NaN', () => {
   const cost = computeTurnCost(telemetry(), { input_tokens: 4_000 });
   assert.equal(cost.summarizerUnitCost, 0);
@@ -560,11 +546,6 @@ test('billed minus summary, cache and regular input equals the measured output u
   const cases: Array<[string, Partial<OptimizationTelemetry>, Parameters<typeof computeTurnCost>[1]]> = [
     ['plain Sonnet turn', {}, { input_tokens: 500, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 2_000, output_tokens: 700 }],
     [
-      'with a Haiku summary',
-      { summarizerUsage: { inputTokens: 8_000, outputTokens: 600 } },
-      { input_tokens: 500, cache_read_input_tokens: 0, cache_creation_input_tokens: 12_000, output_tokens: 300 },
-    ],
-    [
       '1h cache write',
       {},
       { input_tokens: 10, cache_creation_input_tokens: 20_000, cache_creation: { ephemeral_1h_input_tokens: 20_000 }, output_tokens: 400 },
@@ -697,19 +678,6 @@ test('the baseline of a Haiku 5.5 turn is tiered by the prompt the client would 
     assert.ok(Math.abs(cost.actualUnitCost - 40_000 * 0.05) < 1e-6);
   }));
 
-test('the summarizer is billed at the long tier only for the calls whose prompt crossed the threshold', () =>
-  withHaiku55Table(() => {
-    const t = telemetry({
-      summarizerUsage: { inputTokens: 160_000, outputTokens: 3_000, longPromptInputTokens: 110_000, longPromptOutputTokens: 2_000 },
-    });
-    const cost = computeTurnCost(t, undefined);
-    const expected = 50_000 * 0.05 + 1_000 * 0.25 + 110_000 * 0.05 * 5 + 2_000 * 0.25 * 5;
-    assert.ok(Math.abs(cost.summarizerUnitCost - expected) < 1e-6);
-    // Usage recorded before the long-prompt fields existed is all short tier.
-    const old = computeTurnCost(telemetry({ summarizerUsage: { inputTokens: 160_000, outputTokens: 3_000 } }), undefined);
-    assert.ok(Math.abs(old.summarizerUnitCost - (160_000 * 0.05 + 3_000 * 0.25)) < 1e-6);
-  }));
-
 test('rows without stored units are rebuilt at the long tier when their prompt was over 100,000 tokens', () =>
   withHaiku55Table(() => {
     const m = cacheMultipliers('claude-haiku-5-5');
@@ -722,3 +690,10 @@ test('rows without stored units are rebuilt at the long tier when their prompt w
     const short = entry({ servedModel: 'claude-haiku-5-5', uncachedInputTokens: 5_000, cacheReadTokens: 90_000 });
     assert.ok(Math.abs(entryUnits(short).read - 90_000 * m.read * 0.05) < 1e-6);
   }));
+
+test('a turn pays nothing for its summary: the proxy builds it itself, so the cost of the turn is its own tokens', () => {
+  const t = telemetry({ compactionTriggered: true, summaryKind: 'local' });
+  const cost = computeTurnCost(t, { input_tokens: 500, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 2_000, output_tokens: 700 });
+  assert.equal(cost.summarizerUnitCost, 0);
+  assert.ok(Math.abs(cost.actualUnitCost - (cost.regularInputUnits + cost.cacheActualUnitCost + cost.outputUnits)) < 1e-6);
+});

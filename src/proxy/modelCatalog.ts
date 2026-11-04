@@ -3,12 +3,13 @@
  * keeps sending its users to a model that has been superseded.
  *
  * The proxy needs two models of its own choosing: Sonnet (the default that replaces Opus on the first
- * request, stage 0) and Haiku (the routing of simple turns, stage 3, and the summaries, stage 2). It
+ * request, stage 0) and Haiku (the routing of simple turns, stage 3). It
  * asks `GET /v1/models` with the credentials of the request it is already serving, picks the newest of
  * each family by creation date, and remembers the answer on disk so the next start does not wait.
  * When it cannot ask (no credentials yet, no network, an answer it does not understand) it keeps what
  * it had: the last answer, or the models below.
  */
+import { recordError, recordUnlessMissing } from '../errorLog';
 import * as fs from 'fs';
 
 export interface LatestModels {
@@ -135,6 +136,7 @@ export class ModelCatalog {
       this.save();
     } catch (error) {
       this.failedAt = this.now();
+      recordError('models.lookup', error);
       this.options.log?.(`models: could not ask for the newest (${error instanceof Error ? error.message : String(error)}); keeping ${this.models.sonnet} and ${this.models.haiku}`);
     }
   }
@@ -151,8 +153,9 @@ export class ModelCatalog {
         // Remembered answers are used at once but re-checked after the usual time.
         this.askedAt = typeof saved.askedAt === 'number' ? saved.askedAt : 0;
       }
-    } catch {
+    } catch (error) {
       // no file yet, or one that is not ours: start from the fallback
+      recordUnlessMissing('models.load', error);
     }
   }
 
@@ -163,8 +166,9 @@ export class ModelCatalog {
     }
     try {
       fs.writeFileSync(file, JSON.stringify({ ...this.models, askedAt: this.askedAt }), 'utf8');
-    } catch {
+    } catch (error) {
       // the answer is still in memory; a missing file only costs one more lookup next time
+      recordError('models.write', error);
     }
   }
 }

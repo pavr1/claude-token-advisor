@@ -101,7 +101,7 @@ test('a failed hit adds nothing to the flow columns: it was not billed, the retr
   assert.equal(onlyFailure.optimizedTokens, 0);
 });
 
-test('a failed hit that still paid for a Haiku summary keeps that cost', () => {
+test('a failed hit that still paid for a summary a model wrote keeps that cost', () => {
   const paid = failure(1);
   paid.summarizerUnitCost = 123;
   paid.actualUnitCost = 123;
@@ -119,11 +119,11 @@ test('the Billed tooltip is one short line that closes on the invoice total', ()
   assert.doesNotMatch(tooltip, /tok ×/);
 });
 
-test('the Billed tooltip adds the Haiku summary only when the turn paid for one', () => {
+test('the Billed tooltip adds a summary only when the turn paid a model for one (rows up to 1 Nov 2026)', () => {
   const withSummary = render([hit(1, { summarizerUnitCost: 800, actualUnitCost: 4_800 })]);
-  assert.match(withSummary, /title="CR [^"]+ \+ Haiku summary [^"]+ = [^"]+ u"/);
+  assert.match(withSummary, /title="CR [^"]+ \+ summary written by a model [^"]+ = [^"]+ u"/);
   const without = render([hit(1)]);
-  assert.doesNotMatch(without, /\+ Haiku summary/);
+  assert.doesNotMatch(without, /\+ summary written by a model/);
 });
 
 test('a turn where every hit failed is the only one that shows the cross', () => {

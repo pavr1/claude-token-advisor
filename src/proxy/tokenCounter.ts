@@ -15,6 +15,7 @@
  * user opts into exact accounting and accepts the extra round trip.
  */
 
+import { recordError } from '../errorLog';
 import { upstreamFetch } from './upstreamClient';
 
 const CHARS_PER_TOKEN_PROSE = 3.8;
@@ -172,6 +173,7 @@ export async function countTokensRemote(
     }
     return parsed.input_tokens;
   } catch (error) {
+    recordError('proxy.count_tokens', controller.signal.aborted ? `timeout after ${timeoutMs} ms` : error);
     onFailure?.(controller.signal.aborted ? `timeout after ${timeoutMs} ms` : error instanceof Error ? error.message : String(error));
     return null;
   } finally {

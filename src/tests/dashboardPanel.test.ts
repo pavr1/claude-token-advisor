@@ -284,3 +284,62 @@ test('the Tips button sits at the end of the tab bar, and the page script opens 
   assert.match(html, /event\.target\.closest\('\[data-close-tips\]'\) \|\| event\.target\.matches\('\[data-tips-modal\]'\)/);
   assert.match(html, /event\.key === 'Escape'/);
 });
+
+test('the /clear banner sits above the tabs on every tab, explains the steps, and goes away when the summary is delivered', () => {
+  DashboardPanel.setClearPending(true);
+  try {
+    DashboardPanel.show(tracker, undefined, 'budget');
+    const html = String(panelFake().webview.html);
+    assert.match(html, /data-clear-banner/);
+    assert.ok(html.indexOf('data-clear-banner') < html.indexOf('<div class="tabs">'), 'above the tabs, so it shows on both');
+    assert.match(html, /Run <code>\/clear<\/code> in Claude Code/);
+    assert.match(html, /Send your next message/);
+    assert.match(html, /starts with the saved summary, so Claude keeps the thread and nothing is lost/);
+    assert.match(html, /open since an earlier day\./);
+    assert.doesNotMatch(html, /Its history is summarized and ready|cache of an old chat/);
+    assert.match(html, /uses more tokens/);
+
+    send({ type: 'ready' });
+    panelFake().webview.messages.length = 0;
+    DashboardPanel.setClearPending(false);
+    assert.equal(updates().length, 1, 'the open page is updated in place');
+    assert.doesNotMatch(updates()[0], /data-clear-banner/);
+  } finally {
+    DashboardPanel.setClearPending(false);
+  }
+});
+
+test('the /clear banner is remembered while the panel is closed, and an unchanged state does not re-render', () => {
+  DashboardPanel.setClearPending(true);
+  try {
+    DashboardPanel.show(tracker, undefined, 'improver');
+    assert.match(String(panelFake().webview.html), /data-clear-banner/, 'a panel opened later starts with it');
+    send({ type: 'ready' });
+    panelFake().webview.messages.length = 0;
+    DashboardPanel.setClearPending(true);
+    assert.equal(updates().length, 0, 'same state: nothing to repaint');
+  } finally {
+    DashboardPanel.setClearPending(false);
+  }
+});
+
+test('with nothing waiting the page has no /clear banner', () => {
+  DashboardPanel.setClearPending(false);
+  DashboardPanel.show(tracker);
+  assert.doesNotMatch(String(panelFake().webview.html), /data-clear-banner/);
+});
+
+test('the /clear banner names the day the chat has been open since, and follows a change of it', () => {
+  DashboardPanel.setClearPending(true, new Date(2026, 9, 30, 12).getTime());
+  try {
+    DashboardPanel.show(tracker, undefined, 'improver');
+    assert.match(String(panelFake().webview.html), /open since Fri, Oct 30\./);
+    send({ type: 'ready' });
+    panelFake().webview.messages.length = 0;
+    DashboardPanel.setClearPending(true, new Date(2026, 9, 31, 12).getTime());
+    assert.equal(updates().length, 1, 'a new date repaints the open page');
+    assert.match(updates()[0], /open since Sat, Oct 31\./);
+  } finally {
+    DashboardPanel.setClearPending(false);
+  }
+});

@@ -245,6 +245,9 @@ export const BASE_STYLES = `
   .tips li.tip-warn { border-left-color: #f2b84b; }
   .tips li.tip-good { border-left-color: #3fc9b0; }
   .tips li.tip-info { border-left-color: #8a9bad; }
+  .clear-banner { border: 1px solid #f2b84b; border-left-width: 4px; border-radius: 4px; padding: 8px 14px; margin: 10px 0; background: var(--vscode-inputValidation-warningBackground, rgba(242, 184, 75, 0.12)); }
+  .clear-banner ol { margin: 6px 0 6px 20px; padding: 0; }
+  .clear-banner code { font-family: var(--vscode-editor-font-family, monospace); background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.2)); padding: 0 4px; border-radius: 3px; }
   table { border-collapse: collapse; width: 100%; font-size: 0.8em; }
   th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--vscode-widget-border, #333); }
   th { opacity: 0.65; font-weight: 600; text-transform: uppercase; font-size: 0.9em; letter-spacing: 0.03em; }
@@ -311,6 +314,7 @@ ${GAUGE_CSS}
   /* The header (with the Date and Repo filters) stays visible while the rows scroll under it. */
   /* Column labels and totals read as one wide, slightly darker band; only its bottom edge has a line. */
   .turns-table thead th { position: sticky; top: 0; z-index: 2; opacity: 1; color: #1e1e1e; background: #f2b84b; border-bottom: none; }
+  .turns-table thead tr:first-child th:nth-child(n+4) { vertical-align: top; }
   .turns-table thead tr.totals td { position: sticky; top: var(--head-h, 2.6em); z-index: 2; background: #f2b84b; color: #1e1e1e; font-weight: 600; vertical-align: top; border-bottom: 1px solid var(--vscode-widget-border, #444); }
   .turns-table thead tr.totals td, .turns-table thead tr.totals td * { color: #000 !important; }
   .turns-table thead:not(:has(.totals)) th { border-bottom: 1px solid var(--vscode-widget-border, #444); }

@@ -1,4 +1,4 @@
-/** The "·" under Haiku summary says why nothing was summarized; the table keeps its column proportions. */
+/** The "·" under Summarized says why nothing was summarized; the table keeps its column proportions. */
 
 import './helpers/fakeVscode';
 import assert from 'node:assert/strict';
@@ -6,9 +6,9 @@ import test from 'node:test';
 
 import { AnalyticsTracker, LedgerEntry } from '../analytics/tracker';
 import { ALL, buildAnalyticsSectionHtml } from '../ui/analyticsPanel';
-import { haikuSummaryCell } from '../ui/liveTurnRow';
+import { summaryColumnCell } from '../ui/liveTurnRow';
 
-const none = { hits: 0, before: 0, pruned: 0, haikuUnits: 0 };
+const none = { hits: 0, before: 0, pruned: 0, costUnits: 0 };
 
 function hit(minutesAgo: number, over: Partial<LedgerEntry> = {}): LedgerEntry {
   return {
@@ -40,25 +40,25 @@ const render = (entries: LedgerEntry[]): string =>
   buildAnalyticsSectionHtml({ getEntries: () => entries } as unknown as AnalyticsTracker, { project: ALL, range: 'today' });
 
 test('the dot names the reason when the proxy recorded one, and stays plain when it did not', () => {
-  assert.match(haikuSummaryCell(none, none, 'fewer than 4 unsummarized messages'), /title="No Haiku summary on this request: fewer than 4 unsummarized messages"/);
-  assert.match(haikuSummaryCell(none, none), /title="No Haiku summary on this request"/);
+  assert.match(summaryColumnCell(none, none, 'fewer than 4 unsummarized messages'), /title="No summary on this request: fewer than 4 unsummarized messages"/);
+  assert.match(summaryColumnCell(none, none), /title="No summary on this request"/);
 });
 
 test('the reason is escaped, since it is recorded text', () => {
-  const cell = haikuSummaryCell(none, none, 'a "quoted" <reason>');
+  const cell = summaryColumnCell(none, none, 'a "quoted" <reason>');
   assert.doesNotMatch(cell, /<reason>/);
   assert.match(cell, /&lt;reason&gt;/);
 });
 
 test('a summary that happened wins over any skip reason', () => {
-  const cell = haikuSummaryCell({ hits: 1, before: 100, pruned: 40, haikuUnits: 5 }, none, 'ignored');
+  const cell = summaryColumnCell({ hits: 1, before: 100, pruned: 40, costUnits: 5 }, none, 'ignored');
   assert.doesNotMatch(cell, /ignored/);
   assert.match(cell, /new/);
 });
 
 test('the table shows the recorded reason on the turn and on its hit', () => {
   const html = render([hit(1, { compactionSkippedReason: 'fewer than 4 unsummarized messages' })]);
-  const matches = html.match(/No Haiku summary on this request: fewer than 4 unsummarized messages/g) ?? [];
+  const matches = html.match(/No summary on this request: fewer than 4 unsummarized messages/g) ?? [];
   // Totals row, turn row and the hit row.
   assert.equal(matches.length, 3);
 });
@@ -73,14 +73,14 @@ test('a reason repeated across hits carries its count, and different reasons are
 });
 
 test('a hit with no recorded reason keeps the plain tooltip', () => {
-  assert.match(render([hit(1)]), /title="No Haiku summary on this request"/);
+  assert.match(render([hit(1)]), /title="No summary on this request"/);
 });
 
 test('the arrow column is wider and centered, and Cached gave up the space', () => {
   const html = render([hit(1)]);
   const widths = [...(/<colgroup>([\s\S]*?)<\/colgroup>/.exec(html)?.[1] ?? '').matchAll(/width:([\d.]+)%/g)].map((m) => Number(m[1]));
-  assert.equal(widths.length, 15);
-  // Order: Date, Repo, Status, Turns, Hits, Raw, Cleanup, Summarized, Estimate, arrow, Received, CR, CW, RI, Billed.
+  assert.equal(widths.length, 17);
+  // Order: Date, Repo, Status, Turns, Hits, Raw, Cleanup, Summarized, Estimate, arrow, Received, CR, CW, RI, Out, Billed, Model.
   assert.ok(widths[9] > 3, 'arrow column should be wider than before');
   assert.ok(widths[11] + widths[12] + widths[13] < 23, 'CR, CW and RI together should have given space up');
   assert.ok(widths[0] >= 12, 'Date must fit the time');

@@ -1,3 +1,4 @@
+import { recordError } from '../errorLog';
 import * as vscode from 'vscode';
 import type { PythonRuntime } from '../budget/pythonRuntime';
 import { ClaudeProcess, findBypassing, scan } from './processScan';
@@ -73,6 +74,7 @@ export class BypassMonitor {
       }
       this.render();
     } catch (error) {
+      recordError('bypass_monitor.check', error);
       if (!this.failureLogged) {
         this.failureLogged = true;
         this.log(`unrouted-claude check failed: ${error instanceof Error ? error.message : String(error)}`);

@@ -2,7 +2,7 @@
   "name": "claude-budget-advisor",
   "displayName": "Claude Budget Advisor & Token Improver",
   "description": "Tracks Claude Code project token pacing and monthly budget health, and runs a local optimizing proxy that prunes outgoing Anthropic Messages API traffic.",
-  "version": "0.2.96",
+  "version": "0.2.109",
   "publisher": "pablo-villalobos",
   "engines": {
     "vscode": "^1.95.0"
@@ -138,7 +138,7 @@
           "claudeTokenImprover.stage2Compaction": {
             "type": "boolean",
             "default": true,
-            "description": "Stage 2. Remove greeting filler and, past the sliding threshold, replace the oldest history with a Haiku summary (one extra Haiku call each time)."
+            "description": "Stage 2. Remove greeting filler and, past the sliding threshold, replace the oldest history with a summary the proxy builds itself from the conversation (what was asked and answered, files touched, commands run). No model is called and it costs no tokens."
           },
           "claudeTokenImprover.stage3ModelRouting": {
             "type": "boolean",
@@ -173,6 +173,12 @@
             "default": 15000,
             "description": "History size, in tokens, that triggers a summary."
           },
+          "claudeTokenImprover.warmCacheCompactionTokens": {
+            "type": "number",
+            "default": 300000,
+            "minimum": 0,
+            "description": "History size, in tokens, from which a summary is made even while the cache is warm (for example kept warm by the keep-alive), if the estimate says it pays for the cache rewrite. 0 turns it off."
+          },
           "claudeTokenImprover.compactionFraction": {
             "type": "number",
             "default": 0.75,
@@ -184,7 +190,12 @@
             "type": "number",
             "default": 10,
             "minimum": 1,
-            "description": "Requests expected after a summary, used to decide if it pays for itself. A summary is skipped when its expected saving is below the Haiku call plus the cache rewrite."
+            "description": "Requests expected after a summary, used to decide if it pays for itself. A summary is skipped when its expected saving is below the cache rewrite."
+          },
+          "claudeTokenImprover.agentSummary": {
+            "type": "boolean",
+            "default": true,
+            "description": "Write the summary of old history with a short `claude -p` run (Haiku, from a neutral folder, in chunks under 100K tokens). It uses a little of your Claude Code quota; if it fails the proxy builds a local summary instead. Off: always local."
           },
           "claudeTokenImprover.exactTokenCounting": {
             "type": "boolean",

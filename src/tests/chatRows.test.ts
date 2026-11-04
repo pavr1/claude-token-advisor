@@ -93,6 +93,44 @@ test('a keep-alive ping is a row of its own, one turn and one hit, and never joi
   assert.match(cellsOf(prompt)[4], />2</);
 });
 
+test('a request that arrives after a ping starts its own live row above the ping, not inside the older turn', () => {
+  const entries = [
+    hit(20, { sessionId: 'aaaa1111' }),
+    hit(5, { sessionId: 'aaaa1111', newUserTurn: false, routingReason: 'cache keep-alive ping', outputTokens: 1 }),
+  ];
+  inFlightRequests.start('repo', false, Date.now(), 'p1', 'aaaa1111');
+  const html = render(entries);
+  inFlightRequests.finish('repo');
+  // The older turn (#1) stays finished; the live row is a third row (#3), after the turn and the ping.
+  assert.match(html, /<tr class="turn-live" data-row="repo#3"/);
+  const older = html.slice(html.indexOf('data-row="repo#1" data-toggle'), html.indexOf('data-row="repo#1" data-toggle') + 200);
+  assert.doesNotMatch(older, /turn-live/);
+  assert.ok(html.indexOf('data-row="repo#3"') < html.indexOf('class="ping-row"'), 'the live row sits above the ping');
+});
+
+test('a request after a finished turn is one more hit of it, and the turn stays done', () => {
+  const entries = [hit(20, { sessionId: 'aaaa1111', stopReason: 'end_turn' })];
+  inFlightRequests.start('repo', false, Date.now(), 'p2', 'aaaa1111');
+  const html = render(entries);
+  inFlightRequests.finish('repo');
+  const row = html.slice(html.indexOf('data-row="repo#1" data-toggle'));
+  assert.doesNotMatch(row.slice(0, row.indexOf('</tr>')), /turn-live/);
+  assert.match(html, /data-row="repo#1\/L0"/, 'the request is not lost: it hangs from its turn as a live hit');
+  assert.doesNotMatch(html, /data-row="repo#2"/, 'and it does not open a row of its own');
+});
+
+test('a turn still waiting on tools goes back to in progress, and moves to the top with its new time', () => {
+  const entries = [
+    hit(20, { sessionId: 'aaaa1111', stopReason: 'tool_use' }),
+    hit(10, { sessionId: 'bbbb2222', stopReason: 'end_turn' }),
+  ];
+  inFlightRequests.start('repo', false, Date.now(), 'p3', 'aaaa1111');
+  const html = render(entries);
+  inFlightRequests.finish('repo');
+  assert.match(html, /<tr class="turn-live" data-row="repo#1"/);
+  assert.ok(html.indexOf('data-row="repo#1" data-toggle') < html.indexOf('data-row="repo#2" data-toggle'), 'the older turn with a newer time sorts first');
+});
+
 test('the arrow flies on a turn row for every hit in flight once its estimate is known, not only the first', () => {
   const entries = [hit(2, { sessionId: 'aaaa1111' })];
   inFlightRequests.start('repo', false, Date.now(), 'r1');

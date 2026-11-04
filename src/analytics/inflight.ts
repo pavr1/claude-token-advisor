@@ -15,7 +15,7 @@ export interface InFlightPreflight {
   rawTokens: number;
   prunedByNormalization: number;
   prunedByCompaction: number;
-  /** True when this hit wrote a new summary (Haiku call); false when it reused one or did not compact. */
+  /** True when this hit got a summary built for it (by the proxy, locally); false when it reused one or did not compact. */
   summaryCreated: boolean;
   optimizedTokens: number;
 }

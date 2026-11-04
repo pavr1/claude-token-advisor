@@ -11,25 +11,22 @@
  *   - Never log credentials, prompt text, or response text.
  */
 
+import { recordError } from '../errorLog';
 import * as http from 'http';
 import express, { Express, Request, Response } from 'express';
 import { ModelCatalog } from './modelCatalog';
 import { PendingHistoryStore } from './pendingHistory';
 import { upstreamFetch } from './upstreamClient';
+import { buildLocalSummary } from './localSummary';
+import { summarizeWithAgent, runClaudeAgent, type AgentRunner } from './agentSummary';
 import { chatKey, sessionIdOf, KeepAlive, KeepAliveSnapshot, PingResult } from './keepAlive';
 import {
   DEFAULT_OPTIMIZER_CONFIG,
   hasToolResults,
   isFreshUserTurn,
-  manifestMaxOutputTokens,
-  manifestSystemPrompt,
-  manifestTargetTokens,
   OptimizationTelemetry,
   OptimizerConfig,
   optimizePayload,
-  addSummarizerUsage,
-  SummarizerUsage,
-  SUMMARIZER_CHUNK_CHARS,
   SummaryStore,
   BaselineMemory,
   cacheTtlMs,
@@ -84,30 +81,6 @@ export function isNewerVersion(a: string, b: string): boolean {
 }
 
 /** Thrown by `start()` when the port is taken, so the caller can probe who holds it. */
-
-/** Split on fresh user turns so no tool_use/tool_result pair straddles two chunks. */
-export function splitForSummarizer(
-  messages: Array<Record<string, unknown>>,
-  maxChars: number
-): Array<Array<Record<string, unknown>>> {
-  const chunks: Array<Array<Record<string, unknown>>> = [];
-  let current: Array<Record<string, unknown>> = [];
-  let size = 0;
-  for (const message of messages) {
-    const length = JSON.stringify(message).length;
-    if (current.length && size + length > maxChars && isFreshUserTurn(message)) {
-      chunks.push(current);
-      current = [];
-      size = 0;
-    }
-    current.push(message);
-    size += length;
-  }
-  if (current.length) {
-    chunks.push(current);
-  }
-  return chunks;
-}
 
 export class ProxyPortInUseError extends Error {
   constructor(port: number) {
@@ -387,9 +360,10 @@ class StreamUsageParser {
 
       try {
         this.consume(JSON.parse(payload) as Record<string, unknown>);
-      } catch {
+      } catch (error) {
         // A malformed event must not break the passthrough; the bytes are already
         // on their way to the client regardless.
+        recordError('proxy.stream_event', error);
       }
     }
   }
@@ -477,6 +451,9 @@ export class TokenImproverProxy {
   /** Logged once: `claude_code.cost.usage` reported as DELTA temporality, which `RealCostTracker` has to sum instead of tracking as a running total. */
   private loggedDeltaCostTemporality = false;
   private readonly keepAlive: KeepAlive;
+
+  /** Runs `claude -p` for the compaction summary; replaced in tests. */
+  agentRunner: AgentRunner = runClaudeAgent;
 
   constructor(config: ProxyConfig, observer: ProxyObserver, log: LogFn) {
     this.config = config;
@@ -662,6 +639,7 @@ export class TokenImproverProxy {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.log(`turn failed: ${message}`);
+      recordError('proxy.turn', error, { project: res.locals['project'] as string | undefined });
       if (!res.headersSent) {
         res.status(500).json({
           type: 'error',
@@ -715,7 +693,8 @@ export class TokenImproverProxy {
       baselineMemory: this.baselineMemory,
       pendingStore: this.pendingHistory,
       project: res.locals['project'] as string | undefined,
-      summarize: (messages) => this.summarizeHistory(messages, credentialHeaders(headers)),
+      cacheLastUsedAt: this.keepAlive.lastTouchedAt(chatKey(original, res.locals['project'] as string | undefined)),
+      summarize: (messages) => this.summarizeHistory(messages),
       onStage: (stage) =>
         this.observer.onRequestOptimized?.(res.locals['project'] as string | undefined, stage, res.locals['requestId'] as string),
     });
@@ -739,6 +718,7 @@ export class TokenImproverProxy {
     } catch (error) {
       const message = describeFetchError(error);
       this.log(`upstream request failed: ${message}`);
+      recordError('proxy.upstream_unreachable', message, { project: res.locals['project'] as string | undefined });
       settle({ telemetry, usage: undefined, status: 0, failure: message });
       res.status(502).json({
         type: 'error',
@@ -775,6 +755,15 @@ export class TokenImproverProxy {
       }
     };
 
+    if (!upstream.ok) {
+      // The body of a streamed error is not read here; the status says what happened and the text branch below adds the detail.
+      recordError('proxy.upstream_http', `HTTP ${upstream.status}${isStreaming ? ' (streamed)' : ''}`, {
+        status: upstream.status,
+        project: res.locals['project'] as string | undefined,
+        requestId: upstream.headers.get('request-id') ?? undefined,
+        model: typeof payload['model'] === 'string' ? (payload['model'] as string) : undefined,
+      });
+    }
     if (isStreaming && upstream.body) {
       await this.relayStream(upstream, res, telemetry, settle);
       rememberForKeepAlive();
@@ -784,6 +773,11 @@ export class TokenImproverProxy {
     const text = await upstream.text();
     if (!upstream.ok) {
       this.log(`upstream HTTP ${upstream.status} (${res.locals['project'] ?? 'unknown'}): ${text.slice(0, 300)}`);
+      recordError('proxy.upstream_error_body', `HTTP ${upstream.status}: ${upstreamErrorSummary(text)}`, {
+        status: upstream.status,
+        project: res.locals['project'] as string | undefined,
+        requestId: upstream.headers.get('request-id') ?? undefined,
+      });
     }
     let usage: ApiUsage | undefined;
     let stopReason: string | undefined;
@@ -791,8 +785,11 @@ export class TokenImproverProxy {
       const parsed = JSON.parse(text) as { usage?: ApiUsage; stop_reason?: unknown };
       usage = parsed.usage;
       stopReason = typeof parsed.stop_reason === 'string' ? parsed.stop_reason : undefined;
-    } catch {
+    } catch (error) {
       usage = undefined;
+      if (upstream.ok) {
+        recordError('proxy.response_parse', error, { status: upstream.status });
+      }
     }
 
     settle({ telemetry, usage, status: upstream.status, stopReason });
@@ -869,6 +866,7 @@ export class TokenImproverProxy {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.log(`stream relay interrupted: ${message}`);
+      recordError('proxy.stream_relay', error);
     } finally {
       settle({ telemetry, usage: parser.result(), status: upstream.status, stopReason: parser.stopReason() });
       res.end();
@@ -903,6 +901,7 @@ export class TokenImproverProxy {
     } catch (error) {
       // A malformed export must never break the proxy; the response above already went out.
       this.log(`failed to decode OTLP metrics export: ${error instanceof Error ? error.message : String(error)}`);
+      recordError('proxy.otlp_decode', error);
       return;
     }
 
@@ -924,106 +923,30 @@ export class TokenImproverProxy {
   }
 
   // -------------------------------------------------------------------------
-  // Stage 2 helper: summarize dropped history with Haiku
+  // Stage 2 helper: summarize dropped history, locally
   // -------------------------------------------------------------------------
 
   /**
-   * Turn the oldest slice of history into a dense technical manifest.
-   *
-   * Throws on any failure so `applyCompaction` can keep the original history — a
-   * lost summary is a missed optimization, never a lost conversation.
+   * Turn the oldest slice of history into a short summary. It is built here, from the messages themselves (`buildLocalSummary`),
+   * and not by a model: Anthropic answered the call to Haiku with HTTP 429 because it did not present itself as Claude Code
+   * (F-59), and nothing here may pretend to be it. No call is made, so there is no cost and no usage to account for.
    */
-  private async summarizeHistory(
-    messages: Array<Record<string, unknown>>,
-    headers: Record<string, string>
-  ): Promise<{ text: string; usage: SummarizerUsage | undefined }> {
-    // Haiku's window is 200k tokens; a long session can hand over far more. The slice is
-    // summarized in sequential chunks (cut on fresh user turns, sized by the real
-    // serialized length), each into its own manifest, joined in order. No manifest is
-    // ever fed back into the summarizer. On "prompt is too long" the chunk budget halves.
-    let budgetChars = SUMMARIZER_CHUNK_CHARS;
-    for (let attempt = 0; ; attempt += 1) {
+  private async summarizeHistory(messages: Array<Record<string, unknown>>): Promise<{ text: string; kind: 'local' | 'agent'; units?: number }> {
+    const tokens = estimatePayloadTokens({ messages });
+    if (this.config.optimizer.agentSummary) {
       try {
-        const texts: string[] = [];
-        let usage: SummarizerUsage | undefined;
-        for (const chunk of splitForSummarizer(messages, budgetChars)) {
-          const result = await this.summarizeChunk(chunk, headers);
-          texts.push(result.text);
-          if (result.usage) {
-            usage = addSummarizerUsage(usage, result.usage);
-          }
-        }
-        return { text: texts.filter((t) => t.trim()).join('\n\n'), usage };
+        const { text, chunks, units } = await summarizeWithAgent(messages, this.agentRunner);
+        this.log(`compaction: summarized ${messages.length} messages (~${tokens} tokens) with a claude -p agent in ${chunks} chunk(s), ${text.length} characters, ${units} billed units`);
+        return { text, kind: 'agent', units };
       } catch (error) {
-        const tooLong = error instanceof Error && /too long|HTTP 413/i.test(error.message);
-        if (!tooLong || attempt >= 3) {
-          throw error;
-        }
-        budgetChars = Math.floor(budgetChars / 2);
-        this.log(`compaction: summarizer input too long, retrying with ${budgetChars}-char chunks`);
+        const message = error instanceof Error ? error.message : String(error);
+        this.log(`compaction: agent summary failed (${message}); using the local summary`);
+        recordError('proxy.agent_summary', message);
       }
     }
-  }
-
-  private async summarizeChunk(
-    messages: Array<Record<string, unknown>>,
-    headers: Record<string, string>
-  ): Promise<{ text: string; usage: SummarizerUsage | undefined }> {
-    const chunkTokens = estimatePayloadTokens({ messages });
-    const request = {
-      model: this.models.current.haiku,
-      // The prompt only *asks* for the target size; models routinely overshoot
-      // a self-reported length target. This enforces it — Haiku's output tokens are
-      // priced above Sonnet's input rate, so an unbounded manifest can cost more than
-      // the history it replaces prunes (see MIN_COMPACTABLE_TOKENS in optimizer.ts).
-      max_tokens: manifestMaxOutputTokens(chunkTokens),
-      system: manifestSystemPrompt(manifestTargetTokens(chunkTokens)),
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: `Compress this conversation history into the manifest:\n\n${JSON.stringify(messages)}`,
-            },
-          ],
-        },
-      ],
-    };
-
-    const response = await upstreamFetch(`${this.config.upstreamBaseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: { ...headers, 'content-type': 'application/json' },
-      body: JSON.stringify(request),
-    });
-
-    if (!response.ok) {
-      // Keep Anthropic's own message: a bare 400 cannot be told apart from an oversized
-      // request, a bad model id or a rejected parameter.
-      const detail = (await response.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 300);
-      throw new Error(`summarizer returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
-    }
-
-    const parsed = (await response.json()) as {
-      content?: Array<{ type?: string; text?: string }>;
-      usage?: { input_tokens?: number; output_tokens?: number };
-    };
-    const text = (parsed.content ?? [])
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text ?? '')
-      .join('\n')
-      .trim();
-    // No cache fields: this request never sets `cache_control`.
-    const usage: SummarizerUsage | undefined = parsed.usage
-      ? { inputTokens: parsed.usage.input_tokens ?? 0, outputTokens: parsed.usage.output_tokens ?? 0 }
-      : undefined;
-
-    this.log(
-      `compaction: summarized ${messages.length} messages ` +
-        `(~${estimatePayloadTokens({ messages })} tokens) into ~${Math.ceil(text.length / 3.8)} tokens`
-    );
-
-    return { text, usage };
+    const text = buildLocalSummary(messages);
+    this.log(`compaction: summarized ${messages.length} messages (~${tokens} tokens) locally into ${text.length} characters`);
+    return { text, kind: 'local' };
   }
 
   // -------------------------------------------------------------------------
@@ -1057,6 +980,7 @@ export class TokenImproverProxy {
     } catch (error) {
       const message = describeFetchError(error);
       this.log(`passthrough to ${req.method} ${req.path} failed: ${message}`);
+      recordError('proxy.passthrough', message, { method: req.method, path: req.path });
       res.status(502).json({
         type: 'error',
         error: { type: 'api_error', message: `Claude Token Improver could not reach the upstream API: ${message}` },
@@ -1138,5 +1062,17 @@ export class TokenImproverProxy {
       // Drop keep-alive sockets so close() is not held open by an idle client.
       server.closeAllConnections?.();
     });
+  }
+}
+
+/** The error type and message of an Anthropic error body, without its request id, so equal errors count as one. */
+function upstreamErrorSummary(text: string): string {
+  try {
+    const parsed = JSON.parse(text) as { error?: { type?: unknown; message?: unknown } };
+    const type = typeof parsed.error?.type === 'string' ? parsed.error.type : 'error';
+    const message = typeof parsed.error?.message === 'string' ? parsed.error.message : '';
+    return `${type}${message ? `: ${message}` : ''}`.slice(0, 300);
+  } catch {
+    return text.slice(0, 200);
   }
 }

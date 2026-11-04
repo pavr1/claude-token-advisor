@@ -8,6 +8,7 @@
  *     Messages API traffic and records the resulting savings.
  */
 
+import { configureErrorLog, recordError } from './errorLog';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -51,6 +52,7 @@ import {
 } from './proxy/server';
 import { newestInstalledVersion } from './proxy/installedVersions';
 import { announceVersion, EventSubscription, probeProxy, ProbeResult, subscribeToEvents } from './proxy/coordinator';
+import { chatFirstSeen, ClearNotifier } from './ui/clearNotice';
 import { DashboardPanel, DashboardTab } from './ui/dashboardPanel';
 import { Summary } from './ui/budgetDashboard';
 import { StatusBar } from './ui/statusBar';
@@ -293,6 +295,7 @@ async function refreshBudget(context: vscode.ExtensionContext): Promise<void> {
       promptInstallPython(context);
       return;
     }
+    recordError('budget.summary', error);
     statusBar?.setBudgetError(error instanceof Error ? error.message : String(error));
   }
 }
@@ -355,6 +358,11 @@ function readProxyConfig(): ProxyConfig {
       slidingThresholdTokens:
         config.get<number>('slidingThresholdTokens', DEFAULT_OPTIMIZER_CONFIG.slidingThresholdTokens) ??
         DEFAULT_OPTIMIZER_CONFIG.slidingThresholdTokens,
+      warmCacheCompactionTokens: Math.max(
+        0,
+        config.get<number>('warmCacheCompactionTokens', DEFAULT_OPTIMIZER_CONFIG.warmCacheCompactionTokens) ??
+          DEFAULT_OPTIMIZER_CONFIG.warmCacheCompactionTokens
+      ),
       compactionFraction: Math.min(
         0.95,
         Math.max(
@@ -368,6 +376,7 @@ function readProxyConfig(): ProxyConfig {
         config.get<number>('expectedRequestsAfterCompaction', DEFAULT_OPTIMIZER_CONFIG.expectedRequestsAfterCompaction) ??
           DEFAULT_OPTIMIZER_CONFIG.expectedRequestsAfterCompaction
       ),
+      agentSummary: config.get<boolean>('agentSummary', DEFAULT_OPTIMIZER_CONFIG.agentSummary) ?? DEFAULT_OPTIMIZER_CONFIG.agentSummary,
     },
   };
 }
@@ -387,6 +396,7 @@ async function checkCavemanDependency(context: vscode.ExtensionContext): Promise
     const entries = await fs.promises.readdir(skillsDir);
     hasCaveman = entries.some((entry) => entry.toLowerCase().includes('caveman'));
   } catch (err) {
+    recordError('extension.dependency_check', err);
     output.appendLine(
       `dependency check: could not read ${skillsDir} (${err instanceof Error ? err.message : String(err)})`
     );
@@ -470,7 +480,10 @@ function onRequestStarted(project: string | undefined, newUserTurn: boolean, id?
   const index = promptIndex;
   void index
     .refresh()
-    .catch(() => false)
+    .catch((error) => {
+      recordError('prompt_index.refresh', error);
+      return false;
+    })
     .then(() => {
       const verdict = index.claimOpener(name, sessionId);
       register(verdict === 'unknown' ? newUserTurn : verdict === 'new');
@@ -597,8 +610,9 @@ function watchForNewerInstall(context: vscode.ExtensionContext): void {
       if (newest) {
         onNewerExtensionVersion(newest);
       }
-    } catch {
+    } catch (error) {
       // Best effort: the folder can be mid-write while VS Code installs.
+      recordError('extension.install_check', error);
     }
   };
   try {
@@ -613,8 +627,9 @@ function watchForNewerInstall(context: vscode.ExtensionContext): void {
         watcher.close();
       },
     });
-  } catch {
+  } catch (error) {
     // The folder cannot be watched: the proxy announcement still covers windows that start later.
+    recordError('extension.install_watch', error);
   }
 }
 
@@ -741,6 +756,7 @@ function triggerRateLimitWarmup(address: string): void {
   })
     .then(() => output.appendLine('rate-limit warm-up: request sent'))
     .catch((error) => {
+      recordError('extension.rate_limit_warmup', error);
       output.appendLine(`rate-limit warm-up skipped: ${error instanceof Error ? error.message : String(error)}`);
     });
 }
@@ -781,6 +797,15 @@ function refreshRealCostOnStatusBar(): void {
   );
 }
 
+/** When the chat that the waiting summary belongs to started (epoch ms), when the turn that made it said so. */
+let clearSince: number | undefined;
+
+/** The popup that asks for the `/clear` once, when the summarized history starts waiting; its button opens the dashboard. */
+const clearNotifier = new ClearNotifier(
+  (message, action) => vscode.window.showWarningMessage(message, action),
+  () => void vscode.commands.executeCommand(`${BUDGET_SECTION}.showMenu`)
+);
+
 /** Add a turn from this window's project to the current group and refresh the status bar. */
 function showTurn(entry: LedgerEntry): void {
   if (!tracker) {
@@ -804,7 +829,17 @@ function showTurn(entry: LedgerEntry): void {
   statusBar?.setToolsRunning(inFlightRequests.snapshot().get(entry.project)?.count === 0);
   // A keep-alive ping carries no optimizer telemetry: it must not reset the hint.
   if (entry.routingReason !== 'cache keep-alive ping') {
-    statusBar?.setClearHint(entry.clearSuggested === true);
+    const clearPending = entry.clearSuggested === true;
+    // The date belongs to the chat whose own turn made the summary, so it is read on that turn and kept until the wait ends.
+    // Any other turn of the project, or one after a restart, does not know it and the notice says "an earlier day".
+    if (!clearPending) {
+      clearSince = undefined;
+    } else if (entry.dayChange === true && entry.compactionTriggered === true) {
+      clearSince = chatFirstSeen(all, entry.sessionId);
+    }
+    statusBar?.setClearHint(clearPending, clearSince);
+    DashboardPanel.setClearPending(clearPending, clearSince);
+    clearNotifier.update(clearPending, clearSince);
   }
   statusBar?.reportTurn(lastTurnStats, todayStats, monthStats, entry.servedModel);
 
@@ -842,10 +877,12 @@ function onTurnCompleted(record: TurnRecord, isKeepAlivePing = false): void {
     routingReason: isKeepAlivePing ? 'cache keep-alive ping' : record.telemetry.routingReason,
     rawTokens: record.telemetry.rawTokens,
     optimizedTokens: reconciled.optimizedTokens,
+    estimatedTokens: record.telemetry.optimizedTokens,
     prunedByNormalization: record.telemetry.prunedByNormalization,
     prunedByCompaction: reconciled.prunedByCompaction,
     compactionTriggered: record.telemetry.compactionTriggered,
     summaryReused: record.telemetry.summaryReused,
+    summaryKind: record.telemetry.summaryKind,
     dayChange: record.telemetry.dayChange,
     clearSuggested: record.telemetry.clearSuggested,
     pendingInjected: record.telemetry.pendingInjected,
@@ -1028,6 +1065,7 @@ async function startProxyNow(notify: boolean, quiet: boolean): Promise<void> {
       return;
     } catch (error) {
       if (!(error instanceof ProxyPortInUseError)) {
+        recordError('proxy.start', error);
         failStart(error instanceof Error ? error.message : String(error), quiet);
         return;
       }
@@ -1305,6 +1343,7 @@ async function showDashboard(context: vscode.ExtensionContext, initialTab: Dashb
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
+    recordError('dashboard.open', error);
     void vscode.window.showErrorMessage(`Claude Budget Advisor failed: ${message}`);
   }
 }
@@ -1435,6 +1474,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   watchForNewerInstall(context);
 
   storageDir = context.globalStorageUri.fsPath;
+  configureErrorLog(path.join(storageDir, 'errors.json'));
   tracker = new AnalyticsTracker(context.globalStorageUri.fsPath);
   const installedAt = readInstallTime(context.extensionPath);
   // No install cutoff on the ledger: updating or reinstalling keeps globalStorage, so the whole

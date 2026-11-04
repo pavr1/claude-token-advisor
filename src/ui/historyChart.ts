@@ -1,6 +1,6 @@
 /**
  * Day-by-day charts of the persistent ledger: the request flow the Last turns table shows (raw,
- * cleanup, Haiku summary, received, billed), and cache reads vs writes in billed units. Hand-drawn SVG like the donut, so the webview needs no chart library. Kept free
+ * cleanup, summary, received, billed), and cache reads vs writes in billed units. Hand-drawn SVG like the donut, so the webview needs no chart library. Kept free
  * of `vscode` imports so it can be unit tested.
  */
 
@@ -34,7 +34,7 @@ export interface DayPoint {
   /** Short text under the bar. */
   label: string;
   turns: number;
-  /** The table's flow for the day: raw tokens, removed by cleanup, removed by the Haiku summary, received by Anthropic (tokens), billed (units). */
+  /** The table's flow for the day: raw tokens, removed by cleanup, removed by the summary, received by Anthropic (tokens), billed (units). */
   raw: number;
   cleaned: number;
   summarized: number;
@@ -446,7 +446,7 @@ function savingFormula(entries: readonly LedgerEntry[]): string {
     `Billed = what Anthropic charged, ${rows.length.toLocaleString()} requests = ${n(billed)} u`,
     `  regular input ${n(sum((e) => e.regularInputUnits))} + cache read ${n(sum((e) => e.cacheReadUnits))}`,
     `  + cache write ${n(sum((e) => e.cacheWriteUnits))} + output ${n(sum((e) => e.outputUnits))}`,
-    `  + Haiku summaries ${n(sum((e) => e.summarizerUnitCost))}`,
+    `  + summaries a model wrote ${n(sum((e) => e.summarizerUnitCost))}`,
     '',
     `Without proxy = same requests as Claude Code sends them = ${n(without)} u`,
     '  per request: cached × read rate + (raw − cached) × write rate + output × rate',

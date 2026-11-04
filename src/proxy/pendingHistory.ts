@@ -7,6 +7,7 @@
  * file, until the first request of the next chat takes them (one-shot) and forwards them.
  */
 
+import { recordError, recordUnlessMissing } from '../errorLog';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -72,8 +73,9 @@ export class PendingHistoryStore {
           this.entries.set(project, { summaries: value.summaries, savedAt: value.savedAt });
         }
       }
-    } catch {
+    } catch (error) {
       // No file yet, or unreadable: start empty.
+      recordUnlessMissing('pending_history.load', error);
     }
   }
 
@@ -86,8 +88,9 @@ export class PendingHistoryStore {
       const tempPath = `${this.filePath}.tmp`;
       fs.writeFileSync(tempPath, JSON.stringify({ version: 1, pending: Object.fromEntries(this.entries) }), 'utf8');
       fs.renameSync(tempPath, this.filePath);
-    } catch {
+    } catch (error) {
       // A failed write only loses the hand-over; the summary is still in the SummaryStore.
+      recordError('pending_history.write', error);
     }
   }
 }

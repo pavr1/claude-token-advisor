@@ -6,6 +6,7 @@
  * independently.
  */
 
+import { clearBannerHtml } from './clearNotice';
 import * as vscode from 'vscode';
 import { AnalyticsTracker } from '../analytics/tracker';
 import { RealCostTracker } from '../analytics/realCostTracker';
@@ -20,6 +21,10 @@ export type DashboardTab = 'budget' | 'improver';
 export class DashboardPanel {
   private static current: DashboardPanel | undefined;
   private static latestRateLimit: UnifiedRateLimitSnapshot | undefined;
+  /** The earlier history is summarized and waits for the user's `/clear`; remembered while the panel is closed too. */
+  private static clearPending = false;
+  /** When the chat the summary belongs to started (epoch ms), when it is known. */
+  private static clearSince: number | undefined;
 
   private readonly panel: vscode.WebviewPanel;
   private readonly tracker: AnalyticsTracker;
@@ -133,6 +138,17 @@ export class DashboardPanel {
     }
   }
 
+  /** Show or take down the "run /clear" banner. Re-renders in place if the panel is open. */
+  static setClearPending(pending: boolean, since?: number): void {
+    const nextSince = pending ? since : undefined;
+    if (DashboardPanel.clearPending === pending && DashboardPanel.clearSince === nextSince) {
+      return;
+    }
+    DashboardPanel.clearPending = pending;
+    DashboardPanel.clearSince = nextSince;
+    DashboardPanel.current?.render();
+  }
+
   /** Fresh session/weekly rate-limit reading (Pro/Max/Team). Re-renders in place if the panel is open. */
   static updateRateLimit(info: UnifiedRateLimitSnapshot | undefined): void {
     // Remembered even while the panel is closed, so one opened later starts with it.
@@ -178,6 +194,7 @@ export class DashboardPanel {
     return `${loading ? `<div class="page-loading"><h1 class="page-welcome">Welcome to Claude Budget Advisor</h1>${processingIcon('page')}<div class="page-loading-text">Loading data<span class="dots"></span></div></div>` : ''}
   <div class="page-content${loading ? ' page-hidden' : ''}">
   ${buildAccountHeaderHtml(this.summary, this.rateLimit)}
+  ${DashboardPanel.clearPending ? clearBannerHtml(DashboardPanel.clearSince) : ''}
   <div class="tabs">
     ${showBudget ? `<button class="tab${budgetActive ? ' active' : ''}" data-tab="budget">Budget</button>` : ''}
     <button class="tab${budgetActive ? '' : ' active'}" data-tab="improver">Token Improver</button>

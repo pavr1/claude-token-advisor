@@ -10,6 +10,7 @@
  * every historical row instead of a store shaped for what this data actually is.
  */
 
+import { recordError, recordUnlessMissing } from '../errorLog';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -191,7 +192,8 @@ export class RealCostTracker {
       this.series = new Map(
         Object.entries(parsed.series ?? {}).map(([key, reading]) => [key, migrateSeriesReading(reading)])
       );
-    } catch {
+    } catch (error) {
+      recordUnlessMissing('real_cost.load', error);
       this.series = new Map();
     }
   }
@@ -263,7 +265,7 @@ export class RealCostTracker {
 
   private scheduleFlush(): void {
     const snapshot: RealCostFile = { version: REAL_COST_VERSION, series: Object.fromEntries(this.series) };
-    this.writeChain = this.writeChain.then(() => this.flush(snapshot)).catch(() => undefined);
+    this.writeChain = this.writeChain.then(() => this.flush(snapshot)).catch((error) => recordError('real_cost.write', error));
   }
 
   private async flush(snapshot: RealCostFile): Promise<void> {

@@ -14,6 +14,7 @@
  * the savings rather than just assert them.
  */
 
+import { recordError, recordUnlessMissing } from '../errorLog';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -21,12 +22,12 @@ import * as path from 'node:path';
 import { cacheMultipliers, longPromptFactor, modelOutputWeight, modelWeight } from './pricing';
 import { FALLBACK_MODELS, LatestModels } from './modelCatalog';
 import { PendingHistoryStore } from './pendingHistory';
+import { LOCAL_SUMMARY_MAX_CHARS } from './localSummary';
 import { estimatePayloadTokens, MessagesPayload } from './tokenCounter';
 
 /**
- * The cheap model used for routing downgrades and history summaries, and the default that replaces Opus,
- * until the proxy has asked Anthropic for the newest ones (`ModelCatalog`). These are only the fallback:
- * they stand for the family when pricing a summary, and for the model when the lookup has not answered.
+ * The cheap model that short, mechanical turns are routed to, and the default that replaces Opus, until the proxy has
+ * asked Anthropic for the newest ones (`ModelCatalog`). These are only the fallback, for when the lookup has not answered.
  */
 export const HAIKU_MODEL_ID = FALLBACK_MODELS.haiku;
 
@@ -37,58 +38,22 @@ export const SONNET_MODEL_ID = FALLBACK_MODELS.sonnet;
 const HAIKU_MAX_OUTPUT_TOKENS = 64_000;
 const HAIKU_SAFE_INPUT_TOKENS = 180_000;
 
-/** Smallest and largest manifest one summarizer call may write, and its share of what it summarizes. */
-export const MANIFEST_MIN_TOKENS = 150;
-export const MANIFEST_MAX_TOKENS = 4_000;
-const MANIFEST_SHARE = 0.02;
-
 /**
- * Target size of the manifest for a chunk of `inputTokens`. It grows with what is being
- * summarized (about 2%) so a 100K history keeps paths, decisions and open threads in
- * detail, but stays bounded: Haiku's output tokens cost more than its input, so an
- * unbounded manifest could cost more than the history it replaces saves.
- */
-export function manifestTargetTokens(inputTokens: number): number {
-  return Math.min(MANIFEST_MAX_TOKENS, Math.max(MANIFEST_MIN_TOKENS, Math.round(inputTokens * MANIFEST_SHARE)));
-}
-
-/** `max_tokens` for the summarizer call: enforces the target, which the prompt only asks for. */
-export function manifestMaxOutputTokens(inputTokens: number): number {
-  return Math.round(manifestTargetTokens(inputTokens) * 1.5);
-}
-
-/**
- * Below this many tokens, the "older" segment being compacted can't pay for a
- * Haiku summarization call. The call bills the summarizer's own prompt overhead
- * plus a manifest priced at Haiku's (higher) output rate; when `older` is this
- * thin, that fixed cost alone can exceed the raw tokens even a minimal manifest
- * would prune, making compaction a net loss regardless of how tight the summary is.
+ * Below this many tokens, the "older" segment being compacted cannot pay for itself: the summary has a note and headings
+ * of its own, and what is left of a thin segment after that is too little to be worth replacing it.
  */
 const MIN_COMPACTABLE_TOKENS = 1_500;
 
 /** Unsummarized history that clears a conversation's `resumed` flag, so a later cold cache may compact again. */
 const RESUMED_RESET_TOKENS = 50_000;
 
-/**
- * The summarizer is billed on `JSON.stringify(messages)`, which the local estimator
- * undercounts. Measured on a real session: 9.84K NCU of Haiku input for a segment the
- * estimator sized at ~13K tokens, a ratio of ~2.1. Used to price the Haiku call before
- * making it, so the estimate errs towards "not worth it".
- */
-const SUMMARIZER_INPUT_INFLATION = 2;
-
-/** ~150k tokens at a pessimistic 2.5 chars/token (tool JSON tokenizes densely): the most one summarizer call receives; a bigger segment is split into several calls. */
-export const SUMMARIZER_CHUNK_CHARS = 375_000;
-
 /** What compacting a segment is expected to cost and save, in NCU (Sonnet input = 1.0). */
 export interface CompactionEconomics {
-  /** Haiku call: its (inflated) input plus a maximum-length manifest at Haiku's output rate. */
-  haikuCost: number;
   /** One-off cache rewrite of everything after the manifest (0 when the cache is already cold). */
   rewriteCost: number;
   /** Input cost avoided across `expectedRequests` requests by not resending the pruned tokens. */
   savings: number;
-  /** `savings - haikuCost - rewriteCost`; compact only when this is positive. */
+  /** `savings - rewriteCost`; compact only when this is positive. The summary is built locally, so it costs no tokens. */
   net: number;
 }
 
@@ -100,8 +65,14 @@ export interface CompactionDecision extends CompactionEconomics {
   expectedRequests: number;
 }
 
+/** The longest a local summary can be, in tokens, at about 3.5 characters each. */
+const LOCAL_SUMMARY_MAX_TOKENS = Math.ceil(LOCAL_SUMMARY_MAX_CHARS / 3.5);
+
 /**
  * Expected economics of summarizing `olderTokens` while keeping `keptTokens` verbatim.
+ *
+ * The summary is built locally (`localSummary.ts`): it costs no tokens, is never longer than `LOCAL_SUMMARY_MAX_CHARS`, and cannot be
+ * more than half of what it replaces.
  *
  * Warm cache: the old history is read at 0.10x, so each pruned token only saves 0.10x
  * per request, and the kept tail plus manifest must be rewritten once at 1.25x.
@@ -114,28 +85,18 @@ export function estimateCompactionEconomics(input: {
   keptTokens: number;
   cacheWarm: boolean;
   expectedRequests: number;
-  /** `JSON.stringify` length of the segment; sets how many summarizer calls (each with its own manifest) it takes. */
-  serializedChars?: number;
   /** Model whose cache rates apply; the table's default when omitted. */
   model?: string;
 }): CompactionEconomics {
   const requests = Math.max(1, input.expectedRequests);
   const { read: readRate, write: writeRate, unpriced } = cacheMultipliers(input.model);
-  const calls = Math.max(1, Math.ceil((input.serializedChars ?? 0) / SUMMARIZER_CHUNK_CHARS));
-  // One manifest per chunk, each sized to its share of the segment (worst case: the cap).
-  const manifestTokens = calls * manifestMaxOutputTokens(input.olderTokens / calls);
+  const manifestTokens = Math.min(LOCAL_SUMMARY_MAX_TOKENS, Math.ceil(input.olderTokens / 2));
   const pruned = Math.max(0, input.olderTokens - manifestTokens);
-
-  // Each chunk is its own request, so the Haiku tier is decided by one chunk's prompt, not by the sum.
-  const chunkPromptTokens = (input.olderTokens * SUMMARIZER_INPUT_INFLATION) / calls;
-  const haikuCost =
-    input.olderTokens * SUMMARIZER_INPUT_INFLATION * modelWeight(HAIKU_MODEL_ID, chunkPromptTokens) +
-    manifestTokens * modelOutputWeight(HAIKU_MODEL_ID, chunkPromptTokens);
 
   // Without the model's cache rates the saving cannot be estimated, and a guess would decide a real
   // spend: do not compact until the pricing table has them.
   if (unpriced?.includes('read') || unpriced?.includes('write')) {
-    return { haikuCost, rewriteCost: 0, savings: 0, net: -haikuCost };
+    return { rewriteCost: 0, savings: 0, net: 0 };
   }
 
   const rewriteCost = input.cacheWarm
@@ -145,7 +106,7 @@ export function estimateCompactionEconomics(input: {
     ? pruned * readRate * requests
     : pruned * (writeRate + readRate * (requests - 1));
 
-  return { haikuCost, rewriteCost, savings, net: savings - haikuCost - rewriteCost };
+  return { rewriteCost, savings, net: savings - rewriteCost };
 }
 
 /**
@@ -215,10 +176,17 @@ export interface OptimizerConfig {
   enableStartupSonnetDefault: boolean;
   /** Cumulative history size that triggers a Cache Reset Optimization. */
   slidingThresholdTokens: number;
+  /**
+   * History size, in tokens, from which a summary is made even while the cache is warm (a keep-alive can hold it warm for
+   * a long time, and a huge history is read on every request). The economics gate still has to find a positive net. 0 turns it off.
+   */
+  warmCacheCompactionTokens: number;
   /** Fraction of the oldest history replaced by the manifest. */
   compactionFraction: number;
     /** Requests assumed to follow a compaction when judging whether it pays for itself. */
   expectedRequestsAfterCompaction: number;
+  /** Write compaction summaries with a `claude -p` agent; the local summary is the fallback when it fails. */
+  agentSummary: boolean;
 }
 
 export const DEFAULT_OPTIMIZER_CONFIG: OptimizerConfig = {
@@ -229,8 +197,10 @@ export const DEFAULT_OPTIMIZER_CONFIG: OptimizerConfig = {
   cacheTtl: '5m',
   enableStartupSonnetDefault: true,
   slidingThresholdTokens: 15_000,
+  warmCacheCompactionTokens: 300_000,
   compactionFraction: 0.75,
   expectedRequestsAfterCompaction: 10,
+  agentSummary: true,
 };
 
 export interface OptimizationTelemetry {
@@ -256,6 +226,10 @@ export interface OptimizationTelemetry {
   compactionEconomics?: CompactionDecision;
   /** True when this conversation's previous request was on an earlier local day: its history is yesterday's and gets summarized whole. */
   dayChange?: boolean;
+  /** The day change was owed from an earlier request that could not be dealt with (its summary failed): this one is a retry. */
+  dayChangeOwed?: boolean;
+  /** The cache Anthropic holds is warm because a keep-alive ping touched it within its lifetime, whatever the client's own model says. */
+  realCacheWarm?: boolean;
   /** True while summaries are waiting in the `PendingHistoryStore` for this project: the UI asks the user to `/clear`, and the next chat gets them. */
   clearSuggested?: boolean;
   /** True when this request was the first of a fresh chat and carried the pending summaries from the previous one. */
@@ -285,18 +259,16 @@ export interface OptimizationTelemetry {
   /** Role and block kinds of the last messages sent, kept only when the request opens a turn, to audit why it did. */
   newTurnShape?: string;
   /**
-   * Usage of the Haiku call that produced the compaction manifest, when compaction
-   * ran (3.2). No cache fields: the summarizer's own request never sets
-   * `cache_control`, so there is nothing to read read/write on that call.
-   */
-  summarizerUsage?: SummarizerUsage;
-  /**
-   * True when this request reused summaries the proxy already paid for, with no
-   * Haiku call. `compactionTriggered` stays false on such a turn: it counts
-   * summarizer calls, while `prunedByCompaction` still reports the tokens this
+   * True when this request reused summaries the proxy already built, with nothing
+   * new to build. `compactionTriggered` stays false on such a turn: it counts
+   * new summaries, while `prunedByCompaction` still reports the tokens this
    * request did not have to send.
    */
   summaryReused?: boolean;
+  /** Who wrote the summary this turn made: the proxy itself, from the messages. Unset when none was made, and in rows from before 1 Nov 2026, when Haiku wrote them. */
+  summaryKind?: 'local' | 'agent';
+  /** Billed units the agent that wrote the summary cost (`claude -p` runs outside the proxy, so this is its own `usage`). Unset when the local summary was used. */
+  summarizerUnitCost?: number;
   /** True when a stored summary no longer matched the incoming history and was discarded. */
   summaryMismatch?: boolean;
   /**
@@ -331,49 +303,11 @@ export interface OptimizationResult {
   telemetry: OptimizationTelemetry;
 }
 
-export interface SummarizerUsage {
-  inputTokens: number;
-  outputTokens: number;
-  /**
-   * The part of `inputTokens` / `outputTokens` that belongs to calls whose prompt was over the Haiku
-   * long-prompt threshold, which bill at the higher tier. The usage adds up several chunk calls, so
-   * the total alone cannot say which of them crossed it. Absent or 0 when none did.
-   */
-  longPromptInputTokens?: number;
-  longPromptOutputTokens?: number;
-}
-
-/** Adds one summarizer call's usage to the running total, remembering whether that call's prompt was over the long-prompt threshold. */
-export function addSummarizerUsage(total: SummarizerUsage | undefined, call: { inputTokens: number; outputTokens: number }): SummarizerUsage {
-  const long = longPromptFactor(HAIKU_MODEL_ID, call.inputTokens) > 1;
-  return {
-    inputTokens: (total?.inputTokens ?? 0) + call.inputTokens,
-    outputTokens: (total?.outputTokens ?? 0) + call.outputTokens,
-    longPromptInputTokens: (total?.longPromptInputTokens ?? 0) + (long ? call.inputTokens : 0),
-    longPromptOutputTokens: (total?.longPromptOutputTokens ?? 0) + (long ? call.outputTokens : 0),
-  };
-}
-
 /**
- * Callback used by Stage 2 to summarize old history. Injected rather than imported
- * so the engine stays testable without a network or credentials. Returns the usage
- * of that Haiku call alongside the manifest text so its real cost can be counted
- * (3.2) instead of vanishing into an untracked side effect.
+ * Callback used by Stage 2 to build the summary of old history. Injected rather than imported so the engine stays testable;
+ * the proxy passes `buildLocalSummary`, which asks nothing of any model.
  */
-export type SummarizeFn = (
-  messages: Array<Record<string, unknown>>
-) => Promise<{ text: string; usage: SummarizerUsage | undefined }>;
-
-/** The prompt that turns dropped history into a dense technical state manifest. */
-export function manifestSystemPrompt(targetTokens: number): string {
-  return [
-    'You compress software-engineering conversation history into a technical state manifest.',
-    `Produce at most ${targetTokens} tokens of bulleted Markdown under exactly these headings:`,
-    '**Active Stack**, **Code Inventory**, **Resolved Bugs**, **Open Threads**.',
-    'Record only durable facts: file paths, symbol names, decisions made, bugs fixed, and work still outstanding.',
-    'Omit pleasantries, restated questions, and anything already superseded. No preamble, no closing remarks.',
-  ].join(' ');
-}
+export type SummarizeFn = (messages: Array<Record<string, unknown>>) => Promise<{ text: string; kind?: 'local' | 'agent'; units?: number }>;
 
 // ---------------------------------------------------------------------------
 // Stage 0: one-time startup model default
@@ -545,7 +479,7 @@ export function isFreshUserTurn(message: Record<string, unknown> | undefined): b
  * would summarize the same old turns again each time. This remembers, for one
  * conversation, the summaries produced so far and which leading messages they
  * replace. A later request whose leading messages hash the same reuses them with
- * no Haiku call, and the summary text stays byte-identical, so the provider's
+ * nothing new to build, and the summary text stays byte-identical, so the provider's
  * prompt cache keeps matching that prefix.
  */
 export interface SummaryState {
@@ -557,7 +491,7 @@ export interface SummaryState {
   summaries: string[];
   /**
    * True once a cold cache already triggered a compaction for this conversation. A later
-   * cold cache then reuses the stored summary instead of paying Haiku again, until 50K tokens
+   * cold cache then reuses the stored summary instead of building another, until 50K tokens
    * of new history pile up after the summary (RESUMED_RESET_TOKENS).
    */
   resumed?: boolean;
@@ -611,8 +545,9 @@ export class SummaryStore {
           }
         }
       }
-    } catch {
+    } catch (error) {
       // No file yet, or unreadable: start empty.
+      recordUnlessMissing('optimizer.load', error);
     }
   }
 
@@ -625,8 +560,9 @@ export class SummaryStore {
       const tempPath = `${this.filePath}.tmp`;
       fs.writeFileSync(tempPath, JSON.stringify({ version: 1, states: Object.fromEntries(this.states) }), 'utf8');
       fs.renameSync(tempPath, this.filePath);
-    } catch {
+    } catch (error) {
       // Persistence is best effort: a failed write costs a re-summarize, never a request.
+      recordError('optimizer.summaries_write', error);
     }
   }
 
@@ -766,8 +702,9 @@ export class BaselineMemory {
           });
         }
       }
-    } catch {
+    } catch (error) {
       // No file yet, or unreadable: start empty.
+      recordUnlessMissing('optimizer.load', error);
     }
   }
 
@@ -780,14 +717,41 @@ export class BaselineMemory {
       const tempPath = `${this.filePath}.tmp`;
       fs.writeFileSync(tempPath, JSON.stringify({ version: 1, last: Object.fromEntries(this.last) }), 'utf8');
       fs.renameSync(tempPath, this.filePath);
-    } catch {
+    } catch (error) {
       // A failed write only makes the next restart treat the cache as cold.
+      recordError('optimizer.baseline_write', error);
     }
   }
 
   /** Epoch ms of this conversation's previous request, or undefined when none is remembered. Call before `cachedTokens`, which overwrites it. */
   lastRequestAt(key: string): number | undefined {
     return this.last.get(key)?.at;
+  }
+
+  /**
+   * Chats whose new day was detected but not dealt with: the summary could not be made (the summarizer failed) or the
+   * request was not a new user turn. The request that detects a new day also records "last used: today", so without this
+   * the next request would no longer see a day change and a single failure would lose it for good. In memory only.
+   */
+  private readonly owedDayChange = new Set<string>();
+
+  owesDayChange(key: string): boolean {
+    return this.owedDayChange.has(key);
+  }
+
+  oweDayChange(key: string): void {
+    this.owedDayChange.add(key);
+    while (this.owedDayChange.size > this.maxConversations) {
+      const oldest = this.owedDayChange.values().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.owedDayChange.delete(oldest);
+    }
+  }
+
+  settleDayChange(key: string): void {
+    this.owedDayChange.delete(key);
   }
 
   /**
@@ -1010,7 +974,9 @@ function applyPendingHistory(
   now: number
 ): MessagesPayload | undefined {
   const messages = payload.messages ?? [];
-  if (!pending || messages.length !== 1 || !telemetry.isNewUserTurn || !isUserChatOpening(messages[0], telemetry.originalModel)) {
+  // The opening comes with a `role: "system"` note after it (14 of the 15 real openings in the ledger do), so "one message" counts the others only.
+  const conversation = messages.filter((message) => message?.['role'] !== 'system');
+  if (!pending || conversation.length !== 1 || !telemetry.isNewUserTurn || !isUserChatOpening(conversation[0], telemetry.originalModel)) {
     return undefined;
   }
   const summaries = pending.take(project, now);
@@ -1049,15 +1015,15 @@ function pickDayChangeCutoff(messages: Array<Record<string, unknown>>): number {
  * stays identical from one request to the next.
  *
  * With a `store`, the proxy remembers those summaries per conversation and reuses
- * them on later requests, including tool-result continuations, without another
- * Haiku call. Without one it behaves statelessly: every trigger summarizes the
+ * them on later requests, including tool-result continuations, without building
+ * another. Without one it behaves statelessly: every trigger summarizes the
  * whole older history, as it did before the store existed.
  *
  * A new summary is only ever *created* on a fresh user turn (`telemetry.isNewUserTurn`),
  * never on a tool_result continuation: within one agentic loop the unsummarized
- * slice only grows, and summarizing it on every round trip cost more in Haiku
- * tokens than it pruned (real session data: 93% of triggers fired on a
- * continuation). Reusing a stored summary is free, so it applies on every turn.
+ * slice only grows, and summarizing it on every round trip cost more than it
+ * pruned when a model wrote the summaries (real session data: 93% of triggers
+ * fired on a continuation). Reusing a stored summary is free, so it applies on every turn.
  *
  * The newest turn is never compacted, and the rebuilt history always starts on a
  * fresh `user` turn (never a `tool_result` continuation) so a `tool_use` never ends
@@ -1103,7 +1069,12 @@ async function applyCompaction(
     const storedTokens = summaries.length ? estimatePayloadTokens({ messages: buildManifestTurns(summaries) }) : 0;
     const historyTokens = storedTokens + estimatePayloadTokens({ messages: unsummarized });
 
-    const cacheWarm = (telemetry.baselineCachedTokens ?? 0) > 0;
+    // A retry of an owed day change is not made to wait: the cache is warm only because the request that failed wrote it, and
+    // the retry keeps just the newest turn, so there is no large rewrite to avoid (waiting never ends while the user keeps chatting).
+    const cacheWarmNow = ((telemetry.baselineCachedTokens ?? 0) > 0 || telemetry.realCacheWarm === true) && telemetry.dayChangeOwed !== true;
+    // A warm cache normally makes compaction wait; but a history this big is read, and paid for, on every request.
+    const hugeWarm = cacheWarmNow && config.warmCacheCompactionTokens > 0 && historyTokens >= config.warmCacheCompactionTokens;
+    const cacheWarm = cacheWarmNow && !hugeWarm;
     const unsummarizedTokens = estimatePayloadTokens({ messages: unsummarized });
     // A new local day summarizes the whole earlier history regardless of its size or an earlier resume.
     const dayChange = telemetry.dayChange === true;
@@ -1111,12 +1082,15 @@ async function applyCompaction(
     const triggerTokens = config.slidingThresholdTokens;
     const eligible = dayChange || historyTokens >= triggerTokens;
     telemetry.historyTokens = historyTokens;
-    telemetry.compactionTriggerTokens = cacheWarm ? undefined : triggerTokens;
+    telemetry.compactionTriggerTokens = cacheWarm ? undefined : hugeWarm ? config.warmCacheCompactionTokens : triggerTokens;
 
     // Every turn that was big enough to consider leaves a reason (the sizes are in
     // `historyTokens` / `compactionTriggerTokens`), so a missing compaction is never silent.
     if (eligible && cacheWarm) {
-      telemetry.compactionSkippedReason = 'cache is warm; compaction waits for a cold cache';
+      telemetry.compactionSkippedReason =
+        (telemetry.baselineCachedTokens ?? 0) === 0 && telemetry.realCacheWarm === true
+          ? 'cache is warm (kept warm by the keep-alive); compaction waits for a cold cache'
+          : 'cache is warm; compaction waits for a cold cache';
     } else if (eligible && alreadyResumed) {
       telemetry.compactionSkippedReason = 'cache is cold again; this conversation was already resumed on an earlier pause';
     } else if (eligible && unsummarized.length < 4) {
@@ -1128,16 +1102,15 @@ async function applyCompaction(
       const older = cutoff === -1 ? [] : unsummarized.slice(0, cutoff);
       const olderTokens = cutoff === -1 ? 0 : estimatePayloadTokens({ messages: older });
 
-      // Never call Haiku unless the expected saving beats what the call and the
-      // cache rewrite cost; a loss here is spent before any request can recoup it.
+      // Never replace history unless the expected saving beats the cache rewrite it
+      // causes; a loss here is spent before any request can recoup it.
       let worthIt = cutoff !== -1 && olderTokens >= MIN_COMPACTABLE_TOKENS;
       if (worthIt) {
         const inputs = {
           olderTokens,
           keptTokens: estimatePayloadTokens({ messages: unsummarized.slice(cutoff) }),
-          cacheWarm,
+          cacheWarm: cacheWarmNow,
           expectedRequests: config.expectedRequestsAfterCompaction,
-          serializedChars: JSON.stringify(older).length,
           model: telemetry.effectiveModel,
         };
         const economics = estimateCompactionEconomics(inputs);
@@ -1146,8 +1119,14 @@ async function applyCompaction(
           worthIt = false;
           telemetry.compactionSkippedReason =
             `expected net ${Math.round(economics.net)} NCU: saves ${Math.round(economics.savings)}, ` +
-            `costs ${Math.round(economics.haikuCost + economics.rewriteCost)}`;
+            `costs ${Math.round(economics.rewriteCost)}`;
         }
+      }
+
+      if (cutoff === -1) {
+        telemetry.compactionSkippedReason = 'no valid cut point: no earlier user turn leaves a recent tail to keep';
+      } else if (olderTokens < MIN_COMPACTABLE_TOKENS) {
+        telemetry.compactionSkippedReason = `only ${Math.round(olderTokens)} tokens would be summarized (minimum ${MIN_COMPACTABLE_TOKENS})`;
       }
 
       if (worthIt) {
@@ -1159,7 +1138,8 @@ async function applyCompaction(
             summaries = [...summaries, result.text];
             coveredCount += cutoff;
             summarizedNow = true;
-            telemetry.summarizerUsage = result.usage;
+            telemetry.summaryKind = result.kind ?? 'local';
+            telemetry.summarizerUnitCost = (telemetry.summarizerUnitCost ?? 0) + (result.units ?? 0);
             if (store && key) {
               store.set(key, {
                 coveredCount,
@@ -1172,6 +1152,8 @@ async function applyCompaction(
         } catch (error) {
           // A failed summarization must never drop the user's history.
           telemetry.compactionError = error instanceof Error ? error.message : String(error);
+          recordError('optimizer.compaction', error);
+          telemetry.compactionSkippedReason = `the summary could not be made: ${telemetry.compactionError.slice(0, 160)}`;
         }
       }
     }
@@ -1271,6 +1253,12 @@ export function hasToolResults(payload: MessagesPayload): boolean {
   const messages = (payload.messages ?? []) as Record<string, unknown>[];
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index];
+    if (message?.['role'] === 'system') {
+      // Claude Code closes a request with `role: "system"` notes ("# Environment update", a SessionStart hook's output).
+      // They carry no prompt, so they neither open a turn nor end one: 289 tool_result continuations of the ledger were
+      // counted as new turns because the scan stopped at the note.
+      continue;
+    }
     if (message?.['role'] !== 'user') {
       return false;
     }
@@ -1567,6 +1555,8 @@ export async function optimizePayload(
     now?: () => number;
     /** The newest Sonnet and Haiku (see `ModelCatalog`); the fallback ones when the caller has none. */
     models?: LatestModels;
+    /** When the cache of this chat was last used (epoch ms), a keep-alive ping included: the optimizer's own record only has real requests. */
+    cacheLastUsedAt?: number;
     /** Called as each figure becomes known: raw, then cleanup, then compression, then sent. */
     onStage?: (stage: { rawTokens?: number; prunedByNormalization?: number; prunedByCompaction?: number; summaryCreated?: boolean; optimizedTokens?: number }) => void;
   } = {}
@@ -1599,16 +1589,27 @@ export async function optimizePayload(
   };
 
   const now = options.now?.() ?? Date.now();
+  let baselineKey: string | undefined;
   if (options.baselineMemory) {
     const key = hashMessages((original.messages ?? []).slice(0, 1));
+    baselineKey = key;
     // Read before `cachedTokens` overwrites the previous request's time.
     const previousAt = options.baselineMemory.lastRequestAt(key);
-    telemetry.dayChange = previousAt !== undefined && isEarlierLocalDay(previousAt, now);
+    const owed = options.baselineMemory.owesDayChange(key);
+    telemetry.dayChange = (previousAt !== undefined && isEarlierLocalDay(previousAt, now)) || owed;
+    if (owed) {
+      telemetry.dayChangeOwed = true;
+    }
     if (hasClientCacheControl(original)) {
       telemetry.clientCacheTtlMs = cacheTtlMs(config.cacheTtl);
       telemetry.floorCachedTokens = options.baselineMemory.warmCachedTokens(key, rawTokens, now);
       telemetry.baselineCachedTokens = options.baselineMemory.cachedTokens(key, rawTokens, now, telemetry.clientCacheTtlMs);
     }
+  }
+
+  // The cache Anthropic holds can be warmer than the client's own model says: a keep-alive ping renews it with no request passing here.
+  if (options.cacheLastUsedAt !== undefined) {
+    telemetry.realCacheWarm = now - options.cacheLastUsedAt <= cacheTtlMs(config.cacheTtl);
   }
 
   options.onStage?.({ rawTokens });
@@ -1639,6 +1640,16 @@ export async function optimizePayload(
   if (config.enableCompaction) {
     const handedOver = applyPendingHistory(payload, telemetry, options.pendingStore, options.summaryStore, projectKey, now);
     payload = handedOver ?? (await applyCompaction(payload, config, options.summarize, telemetry, options.summaryStore));
+  }
+  if (options.baselineMemory && baselineKey !== undefined && telemetry.dayChange) {
+    // A request that is not a new user turn cannot be summarized, and a failed summary produced nothing: ask again later.
+    if (!telemetry.isNewUserTurn || telemetry.compactionError) {
+      options.baselineMemory.oweDayChange(baselineKey);
+    } else if (telemetry.compactionTriggered || !telemetry.compactionSkippedReason?.startsWith('cache is warm')) {
+      // Done, or ended for a reason that will not change (too small, not worth it). A warm cache is the exception: it
+      // waits, so a debt left by an earlier failure stays until the cache is cold and the summary can be made.
+      options.baselineMemory.settleDayChange(baselineKey);
+    }
   }
   if (options.pendingStore && telemetry.dayChange && telemetry.compactionTriggered) {
     const saved = options.summaryStore?.get(compactionKey);

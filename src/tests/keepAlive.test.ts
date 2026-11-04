@@ -154,3 +154,21 @@ test('a ping that had to write the cache found it already gone: it is the last o
   alive.stop();
   assert.ok(warm >= 3, `warm pings ${warm}`);
 });
+
+test('lastTouchedAt says when the cache of a chat was last used: its real request, then each ping, and nothing once it is not kept warm', async () => {
+  const ka = new KeepAlive({ maxMinutes: 1, intervalMs: 20, send: async () => ({ status: 200 }) });
+  assert.equal(ka.lastTouchedAt('p'), undefined, 'a chat the keep-alive does not know');
+  const before = Date.now();
+  ka.remember('p', snapshot());
+  const first = ka.lastTouchedAt('p');
+  assert.ok(first !== undefined && first >= before && first <= Date.now(), 'the real request');
+  await sleep(70);
+  const afterPings = ka.lastTouchedAt('p');
+  assert.ok(afterPings !== undefined && afterPings > first!, 'a ping renewed the cache and moved it on');
+  assert.equal(ka.lastTouchedAt('other'), undefined, 'each chat has its own');
+  ka.stop();
+  assert.equal(ka.lastTouchedAt('p'), undefined, 'stopped: nothing is being kept warm');
+  const off = new KeepAlive({ maxMinutes: 0, intervalMs: 20, send: async () => ({ status: 200 }) });
+  off.remember('p', snapshot());
+  assert.equal(off.lastTouchedAt('p'), undefined, 'keep-alive off');
+});

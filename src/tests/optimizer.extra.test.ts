@@ -209,7 +209,6 @@ test('compaction economics read the cache multipliers of the model that serves t
     getPricingTable().rates['claude-sonnet-5'] = { input: 3e-6, output: 15e-6, cacheRead: 0.3e-6, cacheWrite: 6e-6 };
     const repriced = estimateCompactionEconomics({ ...base, model: 'claude-sonnet-5' });
     assert.ok(repriced.savings > normal.savings);
-    assert.equal(repriced.haikuCost, normal.haikuCost);
   } finally {
     resetPricing();
   }
@@ -256,4 +255,19 @@ test('optimizePayload reports prefix changes per conversation and ignores cache_
   const second = await run(turn([reply], false));
   assert.equal(second.telemetry.clientPrefixChange, 'none');
   assert.equal(second.telemetry.sentPrefixChange, 'none');
+});
+
+test('hasToolResults ignores the role "system" notes Claude Code appends, in either position', () => {
+  const has = (messages: unknown[]): boolean => hasToolResults({ messages } as MessagesPayload);
+  const result = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: '' }] };
+  const note = { role: 'system', content: [{ type: 'text', text: '# Environment Update' }] };
+  const prompt = { role: 'user', content: [{ type: 'text', text: 'a new prompt' }] };
+  const toolUse = { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'Bash', input: {} }] };
+
+  assert.equal(has([prompt, toolUse, result, note]), true, 'the note after a tool_result');
+  assert.equal(has([prompt, toolUse, result, note, note]), true, 'several notes');
+  assert.equal(has([prompt, toolUse, note, result]), true, 'a note between the call and the result');
+  assert.equal(has([prompt, note]), false, 'a prompt followed by a note is still a new turn');
+  assert.equal(has([note]), false);
+  assert.equal(has([prompt, toolUse, result, { role: 'assistant', content: 'done' }, note]), false, 'a note does not hide that the loop ended');
 });

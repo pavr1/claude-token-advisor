@@ -13,8 +13,6 @@
  *                      + cacheWrite    * actualWeight * 1.25
  *                      + cacheRead     * actualWeight * 0.10
  *                      + outputTokens  * actualModelOutputWeight
- *                      + summarizerInputTokens  * haikuWeight
- *                      + summarizerOutputTokens * haikuOutputWeight
  *   Savings %          = (1 - actual / baseline) * 100
  *
  * Baseline is deliberately the *unoptimized* request on the *originally requested*
@@ -22,23 +20,22 @@
  * Output tokens are the same count on both sides (nothing about generation length
  * is optimized) but priced at each side's own model rate, so a downgrade's effect
  * on output pricing shows up too, not just its effect on input pricing. The
- * compaction summarizer's own Haiku call (3.2) is real spend the optimizer alone
- * caused — it belongs only on the *actual* side; the baseline scenario never runs
- * compaction, so it never pays for a summary either.
+ * summary is built by the proxy itself, so it adds no tokens to either side. (Rows up to
+ * 1 Nov 2026 hold what Haiku charged for writing one, folded into the *actual* side.)
  */
 
+import { recordError, recordUnlessMissing } from '../errorLog';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
   CacheMultipliers,
   cacheMultipliers,
-  LONG_PROMPT_THRESHOLD_TOKENS,
   modelOutputWeight,
   modelWeight,
   usdPerNormalizedUnit,
 } from '../proxy/pricing';
 import { anchorEntries, PromptIndex } from './promptIndex';
-import { CompactionDecision, HAIKU_MODEL_ID, OptimizationTelemetry } from '../proxy/optimizer';
+import { CompactionDecision, OptimizationTelemetry } from '../proxy/optimizer';
 
 /** Filename of the single-file ledger used before monthly files; migrated on first load, then kept as a backup. */
 export const LEDGER_FILENAME = 'claude_token_improver_history.json';
@@ -91,6 +88,11 @@ export interface LedgerEntry {
   routingReason?: string;
   rawTokens: number;
   optimizedTokens: number;
+  /**
+   * What the proxy estimated it would send, kept as the estimate: `optimizedTokens` is rebased on what
+   * Anthropic received. Optional: rows written before this field have only the rebased figure.
+   */
+  estimatedTokens?: number;
   prunedByNormalization: number;
   prunedByCompaction: number;
   compactionTriggered: boolean;
@@ -115,11 +117,13 @@ export interface LedgerEntry {
   /** True when `rawTokens` came from `count_tokens`, false for the local estimate. Absent on older rows. */
   rawTokensExact?: boolean;
   /**
-   * True when this hit reused summaries the proxy already paid for, with no Haiku
-   * call (`compactionTriggered` counts summarizer calls only). Optional: ledgers
+   * True when this hit reused summaries the proxy already built, with nothing
+   * new to build (`compactionTriggered` counts new summaries only). Optional: ledgers
    * written before summaries were stored have no such turns.
    */
   summaryReused?: boolean;
+  /** Who wrote the summary this turn made: the proxy itself (`local`). Unset for rows from before 1 Nov 2026, when Haiku wrote them. */
+  summaryKind?: 'local' | 'agent';
   /** True when this chat's previous request was on an earlier local day, so its history was summarized whole. */
   dayChange?: boolean;
   /** True when the status bar asked the user to `/compact` a large client-side history the proxy is already summarizing. */
@@ -165,7 +169,7 @@ export interface LedgerEntry {
   cacheNoCacheUnitCost: number;
   /** What cacheWriteTokens + cacheReadTokens actually cost with the 1.25x/0.10x multipliers. */
   cacheActualUnitCost: number;
-  /** Cost of the Haiku call that produced the compaction manifest, already folded into `actualUnitCost`. Zero when compaction didn't run. */
+  /** What a model charged for writing the summary, in rows from before 1 Nov 2026 (Haiku); 0 since, when the proxy builds it locally. Already folded into `actualUnitCost`. */
   summarizerUnitCost: number;
   /** True when a `*caveman*` skill folder was found under `~/.claude/skills` at activation. */
   cavemanAvailable: boolean;
@@ -229,7 +233,7 @@ export interface TurnCost {
   cacheNoCacheUnitCost: number;
   /** Those same tokens at their real, multiplier-adjusted price. */
   cacheActualUnitCost: number;
-  /** Cost of the compaction summarizer's own Haiku call, already folded into `actualUnitCost`. Zero when compaction didn't run. */
+  /** Always 0: the summary is built locally and costs no tokens. Rows from before 1 Nov 2026 hold what Haiku charged. */
   summarizerUnitCost: number;
 }
 
@@ -243,7 +247,7 @@ export interface TurnCost {
 export function computeTurnCost(telemetry: OptimizationTelemetry, usage: ApiUsage | undefined): TurnCost {
   // No `usage` means Anthropic never answered (status 0, a cut stream). Nothing is known about
   // billing, so the local estimate is not charged as if it had been: the turn counts for neither
-  // side of the savings figure. Only the summarizer's Haiku call, which did return, is still paid.
+  // side of the savings figure.
   const uncachedInputTokens = usage ? usage.input_tokens ?? telemetry.optimizedTokens : 0;
   const cacheWriteTokens = usage?.cache_creation_input_tokens ?? 0;
   const cacheReadTokens = usage?.cache_read_input_tokens ?? 0;
@@ -300,23 +304,12 @@ export function computeTurnCost(telemetry: OptimizationTelemetry, usage: ApiUsag
     cacheReadTokens * actualWeight * actualCache.read;
   const cacheNoCacheUnitCost = (cacheWriteTokens + cacheReadTokens) * actualWeight;
 
-  // Always priced at Haiku's own rate: the summarizer is a fixed-model call the
-  // optimizer makes on its own, independent of whichever model this turn used.
-  const summarizerUsage = telemetry.summarizerUsage;
-  // The calls whose prompt was over the Haiku threshold are billed at the long tier; the rest at the base one.
-  const longIn = summarizerUsage?.longPromptInputTokens ?? 0;
-  const longOut = summarizerUsage?.longPromptOutputTokens ?? 0;
-  const summarizerUnitCost = summarizerUsage
-    ? (summarizerUsage.inputTokens - longIn) * modelWeight(HAIKU_MODEL_ID) +
-      (summarizerUsage.outputTokens - longOut) * modelOutputWeight(HAIKU_MODEL_ID) +
-      longIn * modelWeight(HAIKU_MODEL_ID, LONG_PROMPT_THRESHOLD_TOKENS + 1) +
-      longOut * modelOutputWeight(HAIKU_MODEL_ID, LONG_PROMPT_THRESHOLD_TOKENS + 1)
-    : 0;
-
   const cacheReadUnits = cacheReadTokens * actualWeight * actualCache.read;
   const cacheWriteUnits = cacheActualUnitCost - cacheReadUnits;
   const regularInputUnits = uncachedInputTokens * actualWeight;
   const outputUnits = outputTokens * actualOutputWeight;
+  // A summary written by the agent (`claude -p`) is spend of the same account, paid this turn.
+  const summarizerUnitCost = telemetry.summarizerUnitCost ?? 0;
   const actualUnitCost = regularInputUnits + cacheActualUnitCost + outputUnits + summarizerUnitCost;
 
   // A zero baseline means there was nothing to save; report 0% rather than dividing by zero.
@@ -387,8 +380,8 @@ function promptTokensOf(entry: UsageLike): number {
 /**
  * What the sent tokens actually billed at, applying the 0.10x read / 1.25x write
  * multipliers directly to the real API usage — no assumption about what a client
- * without the proxy would or wouldn't have cached on its own. The compaction
- * summarizer's own Haiku call is real spend too, so it is counted here.
+ * without the proxy would or wouldn't have cached on its own. A summary a model wrote (rows up
+ * to 1 Nov 2026) is real spend too, so it is counted here.
  */
 export function billedUnits(entry: UnitsInput): number {
   const units = entryUnits(entry);
@@ -519,8 +512,9 @@ function parseJsonl(raw: string): LedgerEntry[] {
     }
     try {
       entries.push(backfillCacheCosts(JSON.parse(line) as LedgerEntry));
-    } catch {
+    } catch (error) {
       // A line cut short by a crash is skipped; every other row still loads.
+      recordError('ledger.damaged_line', error);
     }
   }
   return entries;
@@ -597,7 +591,8 @@ export class AnalyticsTracker {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.legacyPath, 'utf8')) as { entries?: LedgerEntry[] };
       rows = Array.isArray(parsed.entries) ? parsed.entries : [];
-    } catch {
+    } catch (error) {
+      recordUnlessMissing('ledger.legacy_read', error);
       return; // unreadable: leave it untouched and start clean
     }
     try {
@@ -613,8 +608,9 @@ export class AnalyticsTracker {
         fs.writeFileSync(this.monthFile(month), lines.join('\n') + '\n', 'utf8');
       }
       fs.renameSync(this.legacyPath, `${this.legacyPath}.migrated.bak`);
-    } catch {
+    } catch (error) {
       // Best effort: the legacy file is still there for the next start.
+      recordError('ledger.legacy_migration', error);
     }
   }
 
@@ -707,8 +703,9 @@ export class AnalyticsTracker {
         await fs.promises.writeFile(temp, JSON.stringify({ version: SUMMARY_VERSION, days } satisfies SummaryFile), 'utf8');
         await fs.promises.rename(temp, this.summaryPath);
         await fs.promises.unlink(this.monthFile(oldMonth));
-      } catch {
+      } catch (error) {
         // Leave the month on disk; the next run retries it.
+        recordError('ledger.rollup', error, { month: oldMonth });
       }
     }
   }
@@ -786,7 +783,7 @@ export class AnalyticsTracker {
   }
 
   private scheduleAppend(entry: LedgerEntry): void {
-    this.writeChain = this.writeChain.then(() => this.append(entry)).catch(() => undefined);
+    this.writeChain = this.writeChain.then(() => this.append(entry)).catch((error) => recordError('ledger.write', error));
   }
 
   private async append(entry: LedgerEntry): Promise<void> {
@@ -809,6 +806,8 @@ export interface AggregateStats {
   turns: number;
   rawTokens: number;
   optimizedTokens: number;
+  /** Sum of the proxy's own estimates (a row's `optimizedTokens` when it predates the estimate). */
+  estimatedTokens: number;
   prunedByNormalization: number;
   prunedByCompaction: number;
   /** Input tokens Anthropic billed at the plain 1x rate (neither cache read nor cache write). */
@@ -846,7 +845,7 @@ export interface AggregateStats {
   /** Savings from caching alone, isolated from normalization/compaction/model routing. */
   cacheSavingsPercent: number;
   cacheSavedUsd: number;
-  /** Cost of the compaction summarizer's Haiku calls, already folded into `actualUnitCost`. */
+  /** What a model charged for the summaries of these rows (rows up to 1 Nov 2026), already folded into `actualUnitCost`. */
   summarizerUnitCost: number;
   /** Billed units per kind of input, model-weighted; see `inputUnits`. */
   cacheReadUnits: number;
@@ -866,6 +865,7 @@ export function emptyStats(): AggregateStats {
     turns: 0,
     rawTokens: 0,
     optimizedTokens: 0,
+    estimatedTokens: 0,
     prunedByNormalization: 0,
     prunedByCompaction: 0,
     uncachedInputTokens: 0,
@@ -930,6 +930,7 @@ export function aggregate(entries: readonly LedgerEntry[]): AggregateStats {
     if (!isFailedHit(entry)) {
       stats.rawTokens += entry.rawTokens;
       stats.optimizedTokens += entry.optimizedTokens;
+      stats.estimatedTokens += entry.estimatedTokens ?? entry.optimizedTokens;
       stats.prunedByNormalization += entry.prunedByNormalization;
       stats.prunedByCompaction += entry.prunedByCompaction;
     }

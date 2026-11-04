@@ -170,11 +170,12 @@ test('a range with no requests still renders, with an empty trend chart', () => 
   assert.match(html, /No requests yet/);
 });
 
-test('a Haiku summary is listed in the Billed tooltip when the turn paid for one', () => {
-  const html = render([
-    row({ read: 0, write: 20_000 }, { tel: { compactionTriggered: true, summarizerUsage: { inputTokens: 10_000, outputTokens: 800 } } }),
-  ]);
-  assert.match(html, /Haiku summary [\d.]+K?\./);
+test('a summary a model wrote (a row up to 1 Nov 2026) is listed in the Billed tooltip, and a local one adds nothing', () => {
+  const old = row({ read: 0, write: 20_000 }, { tel: { compactionTriggered: true } });
+  old.summarizerUnitCost = 4_000;
+  assert.match(render([old]), /summary written by a model [\d.]+K?\./);
+  const local = row({ read: 0, write: 20_000 }, { tel: { compactionTriggered: true, summaryKind: 'local' } });
+  assert.doesNotMatch(render([local]), /summary written by a model/);
 });
 
 test('settings are read through the vscode configuration', () => {
@@ -240,4 +241,46 @@ test('the trend charts draw one line, label the time along the bottom, and toolt
     assert.match(tip, /^\d\d:00 · -?\d+\.\d%$/);
   }
   assert.match(svg, /class="trend-axis"[^>]*>\d\d:00</);
+});
+
+test('a row with one model shows that model and the plain "× rate" tooltip', () => {
+  const html = render([row({ input: 4, output: 100 })]);
+  assert.match(html, /<td title="Sonnet 5">Sonnet 5<\/td>/);
+  assert.match(html, /RI: 4 t × 1 = 4 u/);
+  assert.doesNotMatch(html, /mixed models/);
+});
+
+test('the Out column shows output tokens and units', () => {
+  const html = render([row({ output: 1_000 })]);
+  assert.match(html, /<th class="cache-col">Out</);
+  assert.match(html, /title="OUT: 1\.00K t"/);
+  assert.match(html, /OUT: 1\.00K t × 5 = 5\.00K u/);
+});
+
+test('a turn that mixed models shows both, drops the blended multiplier and lists each model', () => {
+  const haiku = row({ input: 4 }, { tel: { effectiveModel: HAIKU_MODEL_ID, modelDowngraded: true } });
+  const sonnet = row({ input: 4 });
+  const html = render([haiku, sonnet]);
+  // The turn row (and the totals) show the pair; the per-request rows show one model each.
+  assert.match(html, /<td title="Haiku 5\.5 → Sonnet 5">Haiku 5\.5 → Sonnet 5<\/td>/);
+  assert.match(html, /RI: 8 t → [\d.,]+ u \(mixed models\)/);
+  assert.doesNotMatch(html, /RI: 8 t ×/);
+  assert.match(html, /Haiku 5\.5: 4 t × 0\.\d+ = [\d.,]+ u/);
+  assert.match(html, /Sonnet 5: 4 t × 1 = 4 u/);
+});
+
+test('Estimate keeps the proxy estimate while the saving still uses what Anthropic received', () => {
+  const kept = { ...row({ input: 4, read: 50_000 }), optimizedTokens: 50_004, estimatedTokens: 77_000 };
+  const html = render([kept]);
+  // The Estimate cell (its tooltip starts "Sent = …") shows the estimate, not the rebased figure.
+  assert.match(html, /title="Sent = [^"]*77\D000 t[^"]*">77\.00K</);
+  assert.doesNotMatch(html, /title="Sent = [^"]*">50\.00K</);
+  // Received is still the real figure.
+  assert.match(html, /<td class="num" title="Received = [^"]*">50\.00K<\/td>/);
+});
+
+test('a row written before estimatedTokens existed shows its stored figure in Estimate', () => {
+  const old = { ...row({ input: 4, read: 50_000 }), optimizedTokens: 50_004 };
+  delete (old as { estimatedTokens?: number }).estimatedTokens;
+  assert.match(render([old]), /title="Sent = [^"]*">50\.00K</);
 });

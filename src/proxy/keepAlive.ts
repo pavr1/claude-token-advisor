@@ -1,3 +1,4 @@
+import { recordError } from '../errorLog';
 /**
  * Cache keep-alive (F-43).
  *
@@ -158,6 +159,15 @@ export class KeepAlive {
     this.arm(key, entry);
   }
 
+  /**
+   * When the cache of chat `key` was last used, by a real request or by one of this keep-alive's pings (epoch ms); undefined when
+   * the chat is not being kept warm. A ping renews Anthropic's cache without any request passing through the optimizer, so the
+   * optimizer's own record of the last request cannot tell that the cache is still alive.
+   */
+  lastTouchedAt(key: string): number | undefined {
+    return this.entries.get(key)?.touchedAt;
+  }
+
   /** Forget everything (shutdown, or keep-alive switched off). */
   stop(): void {
     for (const entry of this.entries.values()) {
@@ -216,11 +226,13 @@ export class KeepAlive {
       }
       if (result.status !== 200) {
         this.options.log?.(`keep-alive: ping answered HTTP ${result.status}, stopping for [${entry.snapshot.project ?? '-'}]`);
+        recordError('keepalive.ping', `ping answered HTTP ${result.status}`, { status: result.status, project: entry.snapshot.project });
         this.entries.delete(key);
         return;
       }
     } catch (error) {
       this.options.log?.(`keep-alive: ping failed (${error instanceof Error ? error.message : String(error)}), stopping`);
+      recordError('keepalive.ping', error, { project: entry.snapshot.project });
       this.entries.delete(key);
       return;
     } finally {

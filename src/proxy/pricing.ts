@@ -12,6 +12,7 @@
  * the happy path. No second hand-guessed `$/MTok` table lives here anymore.
  */
 
+import { recordError, recordUnlessMissing } from '../errorLog';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -240,8 +241,9 @@ function readCache(storageDir: string): CacheFile | undefined {
     if (parsed && typeof parsed.savedAt === 'number' && parsed.rates && typeof parsed.rates === 'object') {
       return parsed;
     }
-  } catch {
+  } catch (error) {
     // No cache yet, or an unreadable one. Either is "no cache" to the caller.
+    recordUnlessMissing('pricing.cache_load', error);
   }
   return undefined;
 }
@@ -254,7 +256,8 @@ async function writeCache(storageDir: string, rates: Record<string, ModelRates>)
     const tempPath = `${target}.tmp`;
     await fs.promises.writeFile(tempPath, JSON.stringify(file), 'utf8');
     await fs.promises.rename(tempPath, target);
-  } catch {
+  } catch (error) {
+    recordError('pricing.cache_write', error);
     // A failed cache write must not fail pricing itself — the fetched table is
     // already active in memory regardless.
   }
@@ -305,10 +308,12 @@ async function fetchLiteLLMPricing(url: string, timeoutMs: number): Promise<Reco
   try {
     const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) {
+      recordError('pricing.fetch', `the price list answered HTTP ${response.status}`, { url });
       return undefined;
     }
     return extractAnthropicRates(await response.json());
-  } catch {
+  } catch (error) {
+    recordError('pricing.fetch', error, { url });
     return undefined;
   } finally {
     clearTimeout(timer);

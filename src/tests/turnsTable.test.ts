@@ -11,7 +11,7 @@ import { InFlightProject, InFlightTracker, IN_FLIGHT_EXPIRY_MS } from '../analyt
 import { groupTurns, LedgerEntry } from '../analytics/tracker';
 import { compact } from '../ui/shared';
 import { dailySeries, historyChartsHtml, hourlySeries } from '../ui/historyChart';
-import { haikuSummaryCell, liveRow, pendingTotals } from '../ui/liveTurnRow';
+import { summaryColumnCell, liveRow, pendingTotals } from '../ui/liveTurnRow';
 
 function hit(project: string, newUserTurn?: boolean): LedgerEntry {
   return { project, newUserTurn } as unknown as LedgerEntry;
@@ -138,28 +138,28 @@ test('pendingTotals sums the stages in flight and flags which ones were reported
   assert.deepEqual(pendingTotals(undefined).known, { raw: false, pruned: false, compacted: false, sent: false });
 });
 
-/** The cells of a live row after Time, Repo, Status and Hits: raw, cleanup, haiku summary, sent. */
+/** The cells of a live row after Time, Repo, Status, Turns, Hits and Model: raw, cleanup, summarized, sent. */
 function liveFigureCells(preflight: InFlightProject['preflight']): string[] {
   const html = liveRow('repo', { count: 1, newTurn: true, since: 0, preflight }, 0).split('</tr>')[0];
   const cells = html.match(/<td[\s\S]*?<\/td>/g) ?? [];
-  // Raw, Cleanup, Haiku summary, Sent.
-  return cells.slice(5, 9);
+  // Raw, Cleanup, Summarized, Sent.
+  return cells.slice(6, 10);
 }
 
 test('liveRow has one cell per header column and keeps the arrow column constant', () => {
   const html = liveRow('repo', { count: 1, newTurn: true, since: 0, preflight: [{ rawTokens: 1000, optimizedTokens: 700 }] }, 0).split('</tr>')[0];
   const cells = html.match(/<td[\s\S]*?<\/td>/g) ?? [];
 
-  // Time, Repo, Status, Turns, Hits, Raw, Cleanup, Haiku summary, Sent, arrow, Total received, CR, CW, RI, Billed.
-  assert.equal(cells.length, 15);
+  // Time, Repo, Status, Turns, Hits, Model, Raw, Cleanup, Summarized, Sent, arrow, Total received, CR, CW, RI, Out, Billed.
+  assert.equal(cells.length, 17);
   // Optimized and on its way: the arrow flies until the answer replaces the row.
-  assert.match(cells[9], /class="turn-arrow"><span class="arrow-fly"[^>]*>→<\/span>/);
+  assert.match(cells[10], /class="turn-arrow"><span class="arrow-fly"[^>]*>→<\/span>/);
   // Before the request leaves, the column stays empty.
   const before = liveRow('repo', { count: 1, newTurn: true, since: 0, preflight: [{ rawTokens: 1000 }] }, 0).split('</tr>')[0];
-  assert.equal((before.match(/<td[\s\S]*?<\/td>/g) ?? [])[9], '<td class="turn-arrow"></td>');
+  assert.equal((before.match(/<td[\s\S]*?<\/td>/g) ?? [])[10], '<td class="turn-arrow"></td>');
 });
 
-test('liveRow fills Raw request, Cleanup, Haiku summary and Sent one column at a time', () => {
+test('liveRow fills Raw request, Cleanup, Summarized and Sent one column at a time', () => {
   const dash = '<td class="num">—</td>';
 
   assert.deepEqual(liveFigureCells([]), [dash, dash, dash, dash]);
@@ -184,33 +184,37 @@ test('liveRow fills Raw request, Cleanup, Haiku summary and Sent one column at a
 
   // Compaction reported nothing to prune: the cell says no summary instead of staying blank.
   const none = liveFigureCells([{ rawTokens: 1000, prunedByNormalization: 100, prunedByCompaction: 0 }]);
-  assert.match(none[2], /No Haiku summary/);
+  assert.match(none[2], /No summary/);
 
   const done = liveFigureCells([{ rawTokens: 1000, prunedByNormalization: 100, prunedByCompaction: 200, optimizedTokens: 700 }]);
   assert.ok(done.every((cell) => cell !== dash));
 });
 
-test('haikuSummaryCell shows new and reused separately, counts hits, and keeps the numbers in the tooltip', () => {
-  const none = { hits: 0, before: 0, pruned: 0, haikuUnits: 0 };
+test('summaryColumnCell shows new and reused separately, counts hits, and keeps the numbers in the tooltip', () => {
+  const none = { hits: 0, before: 0, pruned: 0, costUnits: 0 };
 
-  assert.match(haikuSummaryCell(none, none), /No Haiku summary/);
+  assert.match(summaryColumnCell(none, none), /No summary/);
 
-  const created = { hits: 1, before: 10_000, pruned: 6_000, haikuUnits: 900 };
-  const reused = { hits: 3, before: 30_000, pruned: 18_000, haikuUnits: 0 };
+  const created = { hits: 1, before: 10_000, pruned: 6_000, costUnits: 900 };
+  const reused = { hits: 3, before: 30_000, pruned: 18_000, costUnits: 0 };
 
-  const onlyNew = haikuSummaryCell(created, none);
+  const onlyNew = summaryColumnCell(created, none);
   assert.match(onlyNew, /✓ new/);
   assert.doesNotMatch(onlyNew, /↻/);
   // The cell carries no token figures; they sit in the tooltip.
-  assert.match(onlyNew, /title="[^"]*Haiku wrote 1 summary\(ies\)[^"]*Cost/i);
+  // A row up to 1 Nov 2026 carries what the model charged; a summary the proxy built carries nothing to pay.
+  assert.match(onlyNew, /title="[^"]*A model wrote 1 summary\(ies\)[^"]*Cost 900 u/i);
+  const local = summaryColumnCell({ hits: 1, before: 10_000, pruned: 6_000, costUnits: 0 }, none);
+  assert.match(local, /title="The proxy built 1 summary\(ies\) itself: [^"]*No model, no cost\./);
+  assert.doesNotMatch(local, /Haiku/);
 
-  const both = haikuSummaryCell(created, reused);
+  const both = summaryColumnCell(created, reused);
   assert.match(both, /✓ new/);
   assert.match(both, /↻ 3 reused/);
-  assert.match(both, /No Haiku call/);
+  assert.match(both, /Nothing new to build/);
 });
 
-test('liveRow keeps the Haiku summary empty while an earlier stage is still missing', () => {
+test('liveRow keeps the Summarized cell empty while an earlier stage is still missing', () => {
   const dash = '<td class="num">—</td>';
   // Compaction is known but Raw is not (stages of another request): the summary cell stays empty.
   const cells = liveFigureCells([{ prunedByCompaction: 200 }]);
@@ -308,4 +312,17 @@ test('a hit that ends in tool_use keeps the project live while local tools run, 
   t.finish('p', 'end_turn', 's2', 7100);
   assert.ok(t.snapshot(8000).has('p'));
   assert.equal(t.snapshot(7000 + 11 * 60_000).has('p'), false);
+});
+
+test('live rows have one cell per header column, with Model (empty) right after Hits', () => {
+  const countCells = (html: string): number[] =>
+    html.split('<tr ').slice(1).map((row) => (row.match(/<td[ >]/g) ?? []).length);
+  for (const preflight of [[], [{ rawTokens: 1000, prunedByNormalization: 10, prunedByCompaction: 0, optimizedTokens: 900 }]]) {
+    const html = liveRow('p', { count: 2, newTurn: true, since: Date.now(), preflight } as never, 1);
+    assert.deepEqual(countCells(html), [17, 17, 17]);
+    // Cells 1-5 are Time, Repo, Status, Turns, Hits; cell 6 is Model and must be empty so Raw lands under Raw.
+    const first = html.split('<tr ')[1];
+    const cells = first.match(/<td[^>]*>[\s\S]*?<\/td>/g) ?? [];
+    assert.equal(cells[5], '<td></td>');
+  }
 });

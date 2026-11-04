@@ -1,12 +1,15 @@
 /**
- * More end-to-end proxy cases: compaction through the Haiku summarizer, exact token counting, upstream
+ * More end-to-end proxy cases: compaction with the locally built summary, exact token counting, upstream
  * failures, interrupted streams and the endpoints other windows use. Helpers are local on purpose, the
  * same convention as `proxy.test.ts`.
  */
 
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
 import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import test, { afterEach } from 'node:test';
 
 import { DEFAULT_OPTIMIZER_CONFIG, OptimizerConfig } from '../proxy/optimizer';
@@ -100,71 +103,51 @@ function longHistory(): Array<Record<string, unknown>> {
   return messages;
 }
 
-const COMPACTING: Partial<OptimizerConfig> = { slidingThresholdTokens: 3_000, compactionFraction: 0.5, expectedRequestsAfterCompaction: 20 };
+const COMPACTING: Partial<OptimizerConfig> = { slidingThresholdTokens: 3_000, compactionFraction: 0.5, expectedRequestsAfterCompaction: 20, agentSummary: false };
 
-const isSummarizerCall = (seen: Seen): boolean => (JSON.parse(seen.body) as { model?: string }).model?.includes('haiku') === true;
+const isHaikuCall = (seen: Seen): boolean => (JSON.parse(seen.body) as { model?: string }).model?.includes('haiku') === true;
 
-test('compaction summarizes old history with Haiku, forwards the manifest and records the summary cost', async () => {
-  const fake = await upstream((seen, res) => {
-    if (isSummarizerCall(seen)) {
-      jsonReply(res, { content: [{ type: 'text', text: 'MANIFEST: pipeline discussed' }], usage: { input_tokens: 4000, output_tokens: 300 } });
-    } else {
-      jsonReply(res, { usage: { input_tokens: 50, output_tokens: 10, cache_creation_input_tokens: 800 } });
-    }
+test('compaction summarizes old history locally: no call to any model, the summary is forwarded, and no model cost is recorded', async () => {
+  const fake = await upstream((_seen, res) => {
+    jsonReply(res, { usage: { input_tokens: 50, output_tokens: 10, cache_creation_input_tokens: 800 } });
   });
   const { turns, logs, url } = await startProxy(fake.url, { optimizer: COMPACTING });
 
-  const res = await post(url, { model: 'claude-sonnet-5', max_tokens: 64, messages: longHistory() });
+  const history = longHistory();
+  const res = await post(url, { model: 'claude-sonnet-5', max_tokens: 64, messages: history });
   assert.equal(res.status, 200);
 
-  const calls = fake.seen.map((s) => (JSON.parse(s.body) as { model: string }).model);
-  assert.equal(calls.filter((m) => m.includes('haiku')).length >= 1, true, 'the summarizer was called');
-  const forwarded = fake.seen.find((s) => !isSummarizerCall(s));
-  assert.ok(forwarded?.body.includes('MANIFEST: pipeline discussed'), 'the manifest replaced the old history');
-  assert.ok(!forwarded?.body.includes('step 0:'), 'the old turns were dropped');
+  assert.equal(fake.seen.length, 1, "one request upstream: the user's own, and no summarizer call");
+  assert.equal(fake.seen.some(isHaikuCall), false, 'no model was called');
+  const forwarded = (JSON.parse(fake.seen[0].body) as { messages: Array<Record<string, unknown>> }).messages[0];
+  const first = JSON.stringify(forwarded);
+  assert.match(first, /Compacted session state \(earlier history replaced\)/);
+  assert.match(first, /Built locally from the transcript, without a model/);
+  assert.match(first, /Asked: step 0:/, 'an excerpt of the first request is in the summary');
+  assert.ok(fake.seen[0].body.length < JSON.stringify(history).length / 2, 'the old history is not sent in full');
 
-  assert.equal(turns[0].telemetry.compactionTriggered, true);
-  assert.ok((turns[0].telemetry.summarizerUsage?.inputTokens ?? 0) > 0);
-  assert.ok(logs.some((l) => l.includes('compaction: summarized')));
+  const t = turns[0].telemetry;
+  assert.equal(t.compactionTriggered, true);
+  assert.equal(t.summaryKind, 'local');
+  assert.ok(logs.some((l) => /compaction: summarized \d+ messages \(~\d+ tokens\) locally into \d+ characters/.test(l)), logs.join('\n'));
 });
 
-test('a summarizer that says the prompt is too long is retried with smaller chunks', async () => {
-  let summarizerCalls = 0;
-  const fake = await upstream((seen, res) => {
-    if (isSummarizerCall(seen)) {
-      summarizerCalls += 1;
-      if (summarizerCalls === 1) {
-        jsonReply(res, { type: 'error', error: { message: 'prompt is too long: 250000 tokens' } }, 400);
-        return;
-      }
-      jsonReply(res, { content: [{ type: 'text', text: 'SMALLER MANIFEST' }], usage: { input_tokens: 10, output_tokens: 5 } });
-      return;
-    }
-    jsonReply(res, { usage: { input_tokens: 5, output_tokens: 1 } });
-  });
-  const { logs, url } = await startProxy(fake.url, { optimizer: COMPACTING });
-
-  assert.equal((await post(url, { model: 'claude-sonnet-5', max_tokens: 64, messages: longHistory() })).status, 200);
-  assert.ok(logs.some((l) => /summarizer input too long, retrying with \d+-char chunks/.test(l)), logs.join('\n'));
-  assert.ok(summarizerCalls >= 2);
-});
-
-test('a summarizer failure keeps the original history and still serves the turn', async () => {
-  const fake = await upstream((seen, res) => {
-    if (isSummarizerCall(seen)) {
-      jsonReply(res, { type: 'error', error: { message: 'overloaded' } }, 529);
-      return;
-    }
+test('a history that was summarized once keeps the same summary on the next request, with no call anywhere', async () => {
+  const fake = await upstream((_seen, res) => {
     jsonReply(res, { usage: { input_tokens: 5, output_tokens: 1 } });
   });
   const { turns, url } = await startProxy(fake.url, { optimizer: COMPACTING });
+  const history = longHistory();
+  await post(url, { model: 'claude-sonnet-5', max_tokens: 64, messages: history });
+  await post(url, { model: 'claude-sonnet-5', max_tokens: 64, messages: [...history, { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, { role: 'user', content: 'and then?' }] });
 
-  const res = await post(url, { model: 'claude-sonnet-5', max_tokens: 64, messages: longHistory() });
-  assert.equal(res.status, 200);
-  const forwarded = fake.seen.find((s) => !isSummarizerCall(s));
-  assert.ok(forwarded?.body.includes('step 0:'), 'history untouched');
-  assert.equal(turns[0].telemetry.compactionTriggered, false);
-  assert.match(turns[0].telemetry.compactionError ?? '', /summarizer returned HTTP 529/);
+  assert.equal(turns[1].telemetry.summaryReused, true);
+  assert.equal(fake.seen.length, 2, 'only the two requests of the user: nothing was asked of a model for a summary');
+  // The text is the same on both requests (the cache anchor is the proxy's and moves from one request to the next).
+  const summaryText = (i: number): string =>
+    ((JSON.parse(fake.seen[i].body) as { messages: Array<{ content: Array<{ text: string }> }> }).messages[0].content[0]).text;
+  assert.match(summaryText(0), /^Compacted session state/);
+  assert.equal(summaryText(0), summaryText(1), 'byte for byte, so the cache keeps matching it');
 });
 
 test('exact token counting asks count_tokens for the raw size and falls back to the estimate when it fails', async () => {
@@ -313,4 +296,83 @@ test('start() on a running proxy resolves, and the proxy reports its address and
   await proxy.stop();
   assert.equal(proxy.running, false);
   await proxy.stop();
+});
+
+// --- A new day, end to end: the real proxy, a fake Anthropic and a clock that jumps to the next morning ---
+
+/** `turns` alternating messages (user first) plus the `role: "system"` note Claude Code puts after the messages, with a cache breakpoint so the proxy remembers the chat. */
+function dayChat(turns: number): Record<string, unknown> {
+  const messages: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < turns; i += 1) {
+    messages.push({ role: i % 2 === 0 ? 'user' : 'assistant', content: [{ type: 'text', text: `turn ${i} `.repeat(250) }] });
+  }
+  messages.push({ role: 'system', content: [{ type: 'text', text: '# Environment Update\ncwd: C:/repo' }] });
+  return { model: 'claude-sonnet-5', max_tokens: 4096, system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral' } }], messages };
+}
+
+/** The opening of a cleared chat as the ledger shows it: the user's message, injected context first, then the system note. */
+function clearedOpening(text: string): Record<string, unknown> {
+  return {
+    model: 'claude-sonnet-5',
+    max_tokens: 4096,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '<system-reminder>context</system-reminder>' }, { type: 'text', text }] },
+      { role: 'system', content: [{ type: 'text', text: 'SessionStart:clear hook output' }] },
+    ],
+  };
+}
+
+test('a new day, through the real proxy: the earlier history is summarized and saved, and the cleared chat receives it once', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'new-day-'));
+  const pendingFile = path.join(dir, 'lastdayhistory.json');
+  const evening = new Date(2026, 10, 2, 22, 0, 0).getTime();
+  const morning = new Date(2026, 10, 3, 9, 0, 0).getTime();
+  t.mock.timers.enable({ apis: ['Date'], now: evening });
+  try {
+    const fake = await upstream((_seen, res) => {
+      jsonReply(res, { usage: { input_tokens: 50, output_tokens: 10, cache_creation_input_tokens: 800 } });
+    });
+    const { turns, url } = await startProxy(fake.url, { optimizer: { slidingThresholdTokens: 1_000_000, agentSummary: false }, proxy: { pendingHistoryPath: pendingFile } });
+    const forwarded = () => fake.seen.filter((s) => !isHaikuCall(s));
+
+    // The evening: an ordinary request of the old chat.
+    assert.equal((await post(url, dayChat(21))).status, 200);
+    assert.equal(turns[0].telemetry.dayChange, false);
+    assert.equal(turns[0].telemetry.clearSuggested, false);
+
+    // The next morning, the same chat sends its first request of the day.
+    t.mock.timers.reset();
+    t.mock.timers.enable({ apis: ['Date'], now: morning });
+    assert.equal((await post(url, dayChat(25))).status, 200);
+    const day = turns[1].telemetry;
+    assert.equal(day.dayChange, true);
+    assert.equal(day.compactionTriggered, true);
+    assert.equal(day.clearSuggested, true, 'the status bar asks for the /clear');
+    assert.equal(fake.seen.some(isHaikuCall), false, 'no model was asked for the summary');
+    assert.equal((JSON.parse(forwarded().at(-1)!.body) as { messages: unknown[] }).messages.length, 4, 'summary, acknowledgement, the new message and the system note: the old history is not sent again');
+    const saved = JSON.parse(fs.readFileSync(pendingFile, 'utf8')) as Record<string, unknown>;
+    assert.match(JSON.stringify(saved), /Built locally from the transcript, without a model/, 'the summary waits in the file');
+    assert.match(JSON.stringify(saved), /Asked: turn 0 /, 'and it says what was asked');
+
+    // The user clears the chat and sends the first message of the new one.
+    assert.equal((await post(url, clearedOpening('hello again'))).status, 200);
+    const delivered = turns[2].telemetry;
+    assert.equal(delivered.pendingInjected, true);
+    assert.equal(delivered.clearSuggested, false, 'the hint goes away once the new chat has the summary');
+    const sent = JSON.parse(forwarded().at(-1)!.body) as { messages: Array<Record<string, unknown>> };
+    assert.match(JSON.stringify(sent.messages[0]), /Built locally from the transcript/, 'the summary goes first, to Anthropic, in the same request');
+    assert.equal(sent.messages.length, 4, 'summary, acknowledgement, the opening and the system note');
+    assert.equal(sent.messages[3]['role'], 'system');
+    assert.doesNotMatch(fs.readFileSync(pendingFile, 'utf8'), /Built locally/, 'one-shot: it was taken out of the file');
+
+    // The cleared chat's next request still carries it, now remembered by the proxy.
+    const next = clearedOpening('hello again') as { messages: Array<Record<string, unknown>> } & Record<string, unknown>;
+    next.messages = [next.messages[0], { role: 'assistant', content: [{ type: 'text', text: 'hi' }] }, { role: 'user', content: [{ type: 'text', text: 'and then?' }] }];
+    assert.equal((await post(url, next)).status, 200);
+    assert.equal(turns[3].telemetry.pendingInjected, undefined);
+    assert.match(forwarded().at(-1)!.body, /Built locally from the transcript/);
+  } finally {
+    t.mock.timers.reset();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

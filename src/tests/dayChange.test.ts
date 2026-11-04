@@ -229,3 +229,161 @@ test('isUserChatOpening accepts only a user message that opens with injected con
   assert.equal(isUserChatOpening({ role: 'assistant', content: [] }, 'claude-sonnet-5'), false);
   assert.equal(isUserChatOpening(undefined, 'claude-sonnet-5'), false);
 });
+
+/** The note Claude Code puts after a request's messages (seen in 14 of the 15 real openings of the ledger). */
+const environmentNote = (text = '# Environment Update\ncwd: C:/x'): Record<string, unknown> => ({ role: 'system', content: [{ type: 'text', text }] });
+
+/** An opening exactly as the ledger shows it: the user's message (with the injected context first) followed by a system note. */
+function realOpening(text: string, note = environmentNote(), model = 'claude-sonnet-5'): MessagesPayload {
+  const base = fresh(text, model);
+  return { ...base, messages: [...(base.messages ?? []), note] };
+}
+
+test('the real opening, a user message followed by a system note, receives the pending summaries once', async () => {
+  const pending = new PendingHistoryStore();
+  pending.set('proj', ['yesterday state'], MORNING);
+  const deps = { pendingStore: pending, summaryStore: new SummaryStore(), project: 'proj', now: () => MORNING + 1000 };
+
+  const first = await optimizePayload(realOpening('hello again'), CFG, deps);
+  assert.equal(first.telemetry.isNewUserTurn, true);
+  assert.equal(first.telemetry.pendingInjected, true);
+  assert.equal(first.payload.messages?.length, 4, 'manifest pair, the opening, and the note');
+  assert.match(JSON.stringify(first.payload.messages?.[0]), /yesterday state/);
+  assert.equal(first.payload.messages?.[3]['role'], 'system', 'the note stays where the client put it');
+  assert.equal(pending.has('proj', MORNING + 2000), false, 'one-shot');
+
+  const again = await optimizePayload(realOpening('hello again'), CFG, { ...deps, now: () => MORNING + 2000 });
+  assert.equal(again.telemetry.pendingInjected, undefined, 'nothing left to hand over');
+});
+
+test('the opening that follows /clear, whose note is the SessionStart output, is claimed too', async () => {
+  const pending = new PendingHistoryStore();
+  pending.set('proj', ['state'], MORNING);
+  const opening = realOpening('hola', environmentNote('SessionStart:clear hook output'));
+  const result = await optimizePayload(opening, CFG, { pendingStore: pending, summaryStore: new SummaryStore(), project: 'proj', now: () => MORNING + 1000 });
+  assert.equal(result.telemetry.pendingInjected, true);
+});
+
+test('a system note does not turn an automatic call or a longer chat into an opening', async () => {
+  const pending = new PendingHistoryStore();
+  pending.set('proj', ['state'], MORNING);
+  const run = (payload: MessagesPayload) =>
+    optimizePayload(payload, DEFAULT_OPTIMIZER_CONFIG, { pendingStore: pending, summaryStore: new SummaryStore(), project: 'proj', now: () => MORNING + 1000 });
+
+  // The Haiku probe of the ledger: system-reminders, "Reply with only the word ok", then a note. Haiku and two-message shape.
+  const probe = realOpening('Reply with only the word ok', environmentNote(), 'claude-haiku-5-5');
+  assert.equal((await run(probe)).telemetry.pendingInjected, undefined);
+  // Automatic one-message calls, with a note after them as well.
+  for (const kind of ['quota', 'title', 'webfetch'] as const) {
+    const auto = automatic(kind);
+    assert.equal((await run({ ...auto, messages: [...(auto.messages ?? []), environmentNote()] })).telemetry.pendingInjected, undefined, kind);
+  }
+  // A chat that already has two real messages is not an opening, note or not.
+  const longer = chat(4);
+  assert.equal((await run({ ...longer, messages: [...(longer.messages ?? []), environmentNote()] })).telemetry.pendingInjected, undefined);
+  assert.equal(pending.has('proj', MORNING + 1000), true, 'still waiting for the right chat');
+});
+
+test('a tool_result continuation followed by a system note is a continuation, not a new turn', async () => {
+  const toolUse = { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] };
+  const toolResult = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] };
+  const opening = (fresh('do it').messages ?? [])[0];
+  const run = (messages: unknown[]) => optimizePayload({ ...fresh('x'), messages } as unknown as MessagesPayload, CFG, {});
+
+  assert.equal((await run([opening, toolUse, toolResult, environmentNote()])).telemetry.isNewUserTurn, false, 'the note after the result');
+  assert.equal((await run([opening, toolUse, toolResult])).telemetry.isNewUserTurn, false, 'without the note, as before');
+  assert.equal((await run([opening, environmentNote()])).telemetry.isNewUserTurn, true, 'a real prompt followed by a note still opens a turn');
+});
+
+/** A summarizer that fails with `message` the first `failures` times and then answers. */
+function flaky(failures: number, message = 'summarizer returned HTTP 429: {"type":"error","error":{"type":"rate_limit_error"}}') {
+  const state = { calls: 0 };
+  return {
+    state,
+    summarize: async () => {
+      state.calls += 1;
+      if (state.calls <= failures) {
+        throw new Error(message);
+      }
+      return { text: 'recovered state', usage: undefined };
+    },
+  };
+}
+
+test('a failed summary on the first request of the day is asked again on the next turn, not lost', async () => {
+  const pending = new PendingHistoryStore();
+  const deps = { ...flaky(1), summaryStore: new SummaryStore(), baselineMemory: new BaselineMemory(), pendingStore: pending, project: 'proj' };
+
+  await optimizePayload(chat(21), CFG, { ...deps, now: () => EVENING });
+  const failed = await optimizePayload(chat(25), CFG, { ...deps, now: () => MORNING });
+  assert.equal(failed.telemetry.dayChange, true);
+  assert.equal(failed.telemetry.compactionTriggered, false);
+  assert.match(failed.telemetry.compactionError ?? '', /HTTP 429/);
+  assert.match(failed.telemetry.compactionSkippedReason ?? '', /^the summary could not be made: summarizer returned HTTP 429/, 'the failure shows where a skipped compaction is explained');
+  assert.equal(failed.telemetry.clearSuggested, false, 'nothing to hand over yet');
+  assert.equal(pending.has('proj', MORNING), false);
+
+  // The next message, a minute later. The cache is warm only because the failed request wrote it, so it does not make the retry wait.
+  const later = MORNING + 60_000;
+  const again = await optimizePayload(chat(27), CFG, { ...deps, now: () => later });
+  assert.equal(again.telemetry.dayChange, true, 'still the first successful turn of the new day');
+  assert.equal(again.telemetry.dayChangeOwed, true, 'and it says it is a retry');
+  assert.ok((again.telemetry.baselineCachedTokens ?? 0) > 0, 'precondition: the cache really is warm');
+  assert.equal(again.telemetry.compactionTriggered, true);
+  assert.equal(again.telemetry.clearSuggested, true);
+  assert.equal(pending.has('proj', later), true);
+
+  // Dealt with: the turn after that is an ordinary one.
+  const settled = await optimizePayload(chat(31), CFG, { ...deps, now: () => later + 10 * 60_000 });
+  assert.equal(settled.telemetry.dayChange, false);
+});
+
+test('a day change that arrives on a tool_result continuation is owed to the next new user turn', async () => {
+  const toolUse = { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] };
+  const toolResult = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] };
+  const deps = { ...counting('state'), summaryStore: new SummaryStore(), baselineMemory: new BaselineMemory(), pendingStore: new PendingHistoryStore(), project: 'proj' };
+
+  await optimizePayload(chat(21), CFG, { ...deps, now: () => EVENING });
+  const base = chat(25);
+  const continuation = { ...base, messages: [...(base.messages ?? []), toolUse, toolResult] } as MessagesPayload;
+  const first = await optimizePayload(continuation, CFG, { ...deps, now: () => MORNING });
+  assert.equal(first.telemetry.dayChange, true);
+  assert.equal(first.telemetry.isNewUserTurn, false);
+  assert.equal(first.telemetry.compactionTriggered, false, 'a continuation is never summarized');
+
+  const next = await optimizePayload(chat(29), CFG, { ...deps, now: () => MORNING + 60_000 });
+  assert.equal(next.telemetry.dayChange, true, 'owed until a new user turn can be summarized');
+  assert.equal(next.telemetry.compactionTriggered, true);
+});
+
+test('a day change skipped for an ordinary reason is not owed: a warm cache waits, it does not retry all day', async () => {
+  const deps = { ...counting('state'), summaryStore: new SummaryStore(), baselineMemory: new BaselineMemory(), pendingStore: new PendingHistoryStore(), project: 'proj' };
+  const nearMidnight = new Date(2026, 9, 29, 23, 58).getTime();
+  const afterMidnight = new Date(2026, 9, 30, 0, 2).getTime();
+
+  await optimizePayload(chat(21), CFG, { ...deps, now: () => nearMidnight });
+  const waiting = await optimizePayload(chat(25), CFG, { ...deps, now: () => afterMidnight });
+  assert.equal(waiting.telemetry.dayChange, true);
+  assert.match(waiting.telemetry.compactionSkippedReason ?? '', /cache is warm/);
+  assert.equal(waiting.telemetry.compactionError, undefined);
+
+  const later = await optimizePayload(chat(27), CFG, { ...deps, now: () => afterMidnight + 60_000 });
+  assert.equal(later.telemetry.dayChange, false, 'the wait is the design; only a failure or a continuation is owed');
+});
+
+test('a retry that fails again stays owed, and the user chatting without pause does not stop it being tried', async () => {
+  const pending = new PendingHistoryStore();
+  const deps = { ...flaky(2), summaryStore: new SummaryStore(), baselineMemory: new BaselineMemory(), pendingStore: pending, project: 'proj' };
+
+  await optimizePayload(chat(21), CFG, { ...deps, now: () => EVENING });
+  const first = await optimizePayload(chat(25), CFG, { ...deps, now: () => MORNING });
+  const second = await optimizePayload(chat(27), CFG, { ...deps, now: () => MORNING + 60_000 });
+  assert.equal(first.telemetry.compactionTriggered, false);
+  assert.equal(second.telemetry.compactionTriggered, false, 'the second attempt failed too');
+  assert.match(second.telemetry.compactionSkippedReason ?? '', /^the summary could not be made/);
+  assert.equal(pending.has('proj', MORNING + 60_000), false);
+
+  const third = await optimizePayload(chat(29), CFG, { ...deps, now: () => MORNING + 2 * 60_000 });
+  assert.equal(third.telemetry.compactionTriggered, true, 'a message every minute, and still it is retried each time');
+  assert.equal(third.telemetry.clearSuggested, true);
+});
