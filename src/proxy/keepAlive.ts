@@ -48,6 +48,8 @@ export interface KeepAliveSnapshot {
   headers: Record<string, string>;
   project: string | undefined;
   sessionId?: string;
+  /** The terminal the chat runs in (shell pid and start), when the proxy could tell. */
+  terminalKey?: string;
   /**
    * When the request went upstream (epoch ms). The cache lives 5 minutes from its last use, which is
    * when the request arrived, not when its answer finished: a long answer must not push the ping later.
@@ -64,6 +66,8 @@ export interface KeepAliveOptions {
   intervalMs?: number;
   /** How long the cache lives after its last use (5 minutes, or 1 hour when the proxy asks for it). Read at every ping. */
   lifetimeMs?: () => number;
+  /** Asked before every ping; false stops keeping this chat warm (its terminal is closed). */
+  shouldPing?: (snapshot: KeepAliveSnapshot) => boolean;
   send: (snapshot: KeepAliveSnapshot, body: string) => Promise<PingResult>;
   onPing?: (snapshot: KeepAliveSnapshot, result: PingResult, count: number) => void;
   log?: (message: string) => void;
@@ -116,6 +120,8 @@ function wroteCache(usage: Record<string, unknown> | undefined): boolean {
 
 export class KeepAlive {
   private readonly entries = new Map<string, Entry>();
+  /** Real requests currently upstream, per chat. */
+  private readonly inflight = new Map<string, number>();
   private readonly intervalMs: number;
   private readonly now: () => number;
 
@@ -132,6 +138,30 @@ export class KeepAlive {
     this.options = { ...this.options, maxMinutes: minutes };
     if (!this.enabled) {
       this.stop();
+    }
+  }
+
+  /**
+   * A real request for chat `key` starts: it renews the cache itself, so the pending ping is cancelled and no ping is
+   * scheduled or sent until every request in flight for the chat has ended (`end`). Concurrent requests (agents, parallel
+   * tool turns) share a chat key, so a plain cancel would be undone by whichever of them finishes first.
+   */
+  begin(key: string): void {
+    this.inflight.set(key, (this.inflight.get(key) ?? 0) + 1);
+    this.cancel(key);
+  }
+
+  /** A request started with `begin` has ended (any outcome). The countdown restarts once none is left in flight. */
+  end(key: string): void {
+    const left = (this.inflight.get(key) ?? 0) - 1;
+    if (left > 0) {
+      this.inflight.set(key, left);
+      return;
+    }
+    this.inflight.delete(key);
+    const entry = this.entries.get(key);
+    if (entry && !entry.timer && !entry.busy) {
+      this.arm(key, entry);
     }
   }
 
@@ -176,9 +206,13 @@ export class KeepAlive {
       }
     }
     this.entries.clear();
+    this.inflight.clear();
   }
 
   private arm(key: string, entry: Entry): void {
+    if ((this.inflight.get(key) ?? 0) > 0) {
+      return; // a turn is being processed: `end` re-arms when it finishes
+    }
     const deadline = entry.lastRealAt + this.options.maxMinutes * 60_000;
     if (this.now() + this.intervalMs > deadline) {
       this.entries.delete(key); // the next ping would land past the cap
@@ -206,6 +240,11 @@ export class KeepAlive {
     const age = this.now() - entry.touchedAt;
     if (age >= lifetime - KEEP_ALIVE_SAFETY_MS) {
       this.options.log?.(`keep-alive: the cache of [${entry.snapshot.project ?? '-'}] is ${Math.round(age / 1000)}s old (it lasts ${Math.round(lifetime / 1000)}s), not pinging`);
+      this.entries.delete(key);
+      return;
+    }
+    if (this.options.shouldPing && !this.options.shouldPing(entry.snapshot)) {
+      this.options.log?.(`keep-alive: the terminal of [${entry.snapshot.project ?? '-'}] is closed, not pinging`);
       this.entries.delete(key);
       return;
     }

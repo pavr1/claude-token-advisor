@@ -265,7 +265,7 @@ test('the page script wires the hooks the host relies on', () => {
     assert.ok(html.includes(hook), `page script should contain ${hook}`);
   }
   // Both filters the host understands are listened for.
-  assert.match(html, /\['project', 'status', 'range', 'from', 'to'\]/);
+  assert.match(html, /\['project', 'terminal', 'status', 'range', 'from', 'to'\]/);
 });
 
 test('the Tips button sits at the end of the tab bar, and the page script opens and closes the popup', () => {
@@ -320,6 +320,24 @@ test('the /clear banner is remembered while the panel is closed, and an unchange
     assert.equal(updates().length, 0, 'same state: nothing to repaint');
   } finally {
     DashboardPanel.setClearPending(false);
+  }
+});
+
+test('the green "summary delivered" banner shows after delivery, and goes away when turned off', () => {
+  DashboardPanel.setClearDone(true);
+  try {
+    DashboardPanel.show(tracker, undefined, 'budget');
+    const html = String(panelFake().webview.html);
+    assert.match(html, /clear-banner done[^>]*data-clear-banner-done/);
+    assert.match(html, /Summary delivered/);
+    assert.ok(html.indexOf('data-clear-banner-done') < html.indexOf('<div class="tabs">'));
+    send({ type: 'ready' });
+    panelFake().webview.messages.length = 0;
+    DashboardPanel.setClearDone(false);
+    assert.equal(updates().length, 1);
+    assert.doesNotMatch(updates()[0], /data-clear-banner-done/);
+  } finally {
+    DashboardPanel.setClearDone(false);
   }
 });
 

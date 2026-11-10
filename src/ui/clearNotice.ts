@@ -64,6 +64,22 @@ export function clearBannerHtml(since?: number): string {
   </div>`;
 }
 
+/** How long the "summary delivered" confirmation stays up (ms). */
+export const CLEAR_DONE_MS = 10_000;
+
+/** The status bar tooltip's paragraph confirming the new chat received the summary. */
+export function clearDoneTooltipMarkdown(): string {
+  return '\n$(check) **Summary delivered:** the new chat received the saved summary of the earlier history, so Claude keeps the thread.\n';
+}
+
+/** The green banner on top of the dashboard confirming the same thing; it replaces the "run /clear" banner for CLEAR_DONE_MS. */
+export function clearDoneBannerHtml(): string {
+  return `<div class="clear-banner done" role="status" data-clear-banner-done>
+    <strong>Summary delivered.</strong>
+    <p>The new chat received the saved summary of the earlier history, so Claude keeps the thread and nothing was lost.</p>
+  </div>`;
+}
+
 /**
  * Shows the popup once per wait: when the summary starts waiting, not on every turn while it keeps waiting,
  * and again only after it was delivered and a later day leaves a new one. Dismissing it does not bring it back;

@@ -52,3 +52,17 @@ test('a corrupt file starts empty and malformed entries are ignored', () => {
   assert.equal(new PendingHistoryStore(file).size, 1);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('a different terminal never sees, nor takes, a summary made in another one', () => {
+  const store = new PendingHistoryStore();
+  store.set('p', ['a'], 1000, '10@1');
+  assert.equal(store.has('p', 1000, '10@1'), true, '/clear keeps the terminal');
+  assert.equal(store.has('p', 1000, '20@2'), false, 'Claude Code was restarted: the notice is not for this chat');
+  assert.equal(store.take('p', 1000, '10@1'), undefined, 'and the stale summary is gone, not merely hidden');
+});
+
+test('an entry saved without a terminal (older file) goes stale once a terminal is known', () => {
+  const store = new PendingHistoryStore();
+  store.set('p', ['a'], 1000);
+  assert.equal(store.has('p', 1000, '20@2'), false);
+});

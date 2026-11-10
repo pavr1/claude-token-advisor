@@ -2,7 +2,7 @@
   "name": "claude-budget-advisor",
   "displayName": "Claude Budget Advisor & Token Improver",
   "description": "Tracks Claude Code project token pacing and monthly budget health, and runs a local optimizing proxy that prunes outgoing Anthropic Messages API traffic.",
-  "version": "0.2.109",
+  "version": "0.2.124",
   "publisher": "pablo-villalobos",
   "engines": {
     "vscode": "^1.95.0"
@@ -158,7 +158,7 @@
             ],
             "default": "5m",
             "enumDescriptions": [
-              "Writes cost 1.25x; the cache expires after 5 minutes without a request.",
+              "Writes cost 1.25x. A keep-alive ping every ~4.5 minutes renews the cache for up to 30 minutes after your last request (setting keepAliveMaxMinutes), so it does not expire during normal pauses.",
               "Writes cost 2x; the cache lasts 1 hour."
             ],
             "description": "Cache lifetime the proxy sets on every request. 1 h costs more per write but survives longer pauses."
@@ -375,6 +375,7 @@
     "@types/node": "^22.7.5",
     "@types/vscode": "^1.95.0",
     "@vscode/vsce": "^3.6.0",
+    "jsdom": "^24.1.3",
     "typescript": "^5.6.3"
   },
   "dependencies": {

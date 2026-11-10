@@ -4,6 +4,7 @@ import './helpers/fakeVscode';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { clearDoneBannerHtml, clearDoneTooltipMarkdown, CLEAR_DONE_MS } from '../ui/clearNotice';
 import { chatFirstSeen, CLEAR_NOTICE_ACTION, ClearNotifier, clearBannerHtml, clearNoticeMessage, clearTooltipMarkdown, formatChatSince } from '../ui/clearNotice';
 
 /** A notifier whose popup answers with `choice`, recording every popup and every dashboard opening. */
@@ -129,4 +130,11 @@ test('the chat started when the ledger first saw its session, and not knowing th
   assert.equal(chatFirstSeen(entries, 'missing'), undefined);
   assert.equal(chatFirstSeen(entries, undefined), undefined);
   assert.equal(chatFirstSeen([{ sessionId: 'a', timestamp: 'not a date' }], 'a'), undefined, 'an unreadable time is not a date');
+});
+
+test('the delivered confirmation lasts 10 seconds and says the new chat has the summary', () => {
+  assert.equal(CLEAR_DONE_MS, 10_000);
+  assert.match(clearDoneTooltipMarkdown(), /Summary delivered/);
+  assert.match(clearDoneBannerHtml(), /class="clear-banner done"/);
+  assert.match(clearDoneBannerHtml(), /new chat received the saved summary/);
 });

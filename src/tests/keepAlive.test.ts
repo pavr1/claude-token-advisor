@@ -43,6 +43,39 @@ test('a real request cancels the pending ping, and remember restarts it', async 
   ka.stop();
 });
 
+test('no ping while any request of the chat is in flight: a concurrent request finishing does not re-arm it', async () => {
+  let sent = 0;
+  const ka = new KeepAlive({ maxMinutes: 1, intervalMs: 20, send: async () => (sent++, { status: 200 }) });
+  ka.begin('p'); // request A
+  ka.begin('p'); // request B, same chat
+  ka.remember('p', snapshot()); // A finishes first
+  ka.end('p');
+  await sleep(80);
+  assert.equal(sent, 0); // B is still being processed
+  ka.end('p'); // B finishes: the countdown resumes (timed from the last cache use, so it may be due at once)
+  await sleep(50);
+  assert.ok(sent >= 1);
+  ka.stop();
+});
+
+test('a request arriving while a ping is in flight stops the ping chain until it ends', async () => {
+  let sent = 0;
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => (release = r));
+  const ka = new KeepAlive({ maxMinutes: 1, intervalMs: 10, send: async () => (sent++, await gate, { status: 200 }) });
+  ka.remember('p', snapshot());
+  await sleep(30); // first ping is now in flight
+  assert.equal(sent, 1);
+  ka.begin('p'); // real request starts; cancel finds no timer
+  release();
+  await sleep(60);
+  assert.equal(sent, 1); // the finished ping did not re-arm during the turn
+  ka.end('p');
+  await sleep(40);
+  assert.ok(sent >= 2);
+  ka.stop();
+});
+
 test('disabled keep-alive and non-200 answers send nothing further', async () => {
   let sent = 0;
   const off = new KeepAlive({ maxMinutes: 0, intervalMs: 5, send: async () => (sent++, { status: 200 }) });
@@ -171,4 +204,23 @@ test('lastTouchedAt says when the cache of a chat was last used: its real reques
   const off = new KeepAlive({ maxMinutes: 0, intervalMs: 20, send: async () => ({ status: 200 }) });
   off.remember('p', snapshot());
   assert.equal(off.lastTouchedAt('p'), undefined, 'keep-alive off');
+});
+
+test('a chat whose terminal is closed is not pinged, and the others still are', async () => {
+  const sent: Array<string | undefined> = [];
+  const logs: string[] = [];
+  const ka = new KeepAlive({
+    maxMinutes: 1,
+    intervalMs: 15,
+    log: (m) => logs.push(m),
+    shouldPing: (s) => s.terminalKey !== '1@1',
+    send: async (s) => (sent.push(s.terminalKey), { status: 200 }),
+  });
+  ka.remember('closed', { ...snapshot(), terminalKey: '1@1' });
+  ka.remember('open', { ...snapshot(), terminalKey: '2@2' });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  ka.stop();
+  assert.ok(sent.length >= 1);
+  assert.ok(sent.every((key) => key === '2@2'));
+  assert.ok(logs.some((m) => /terminal of \[p\] is closed/.test(m)));
 });

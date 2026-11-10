@@ -87,8 +87,9 @@ test('a recorded turn renders the table, the history charts and the saving headl
   assert.match(html, /1 optimized requests/);
   assert.match(html, /History/);
   assert.match(html, /<svg /);
-  // The rows carry a floor baseline, so the headline is the guaranteed one.
-  assert.match(html, /Saving, at least/);
+  // The rows carry the typical baseline, so that is the headline; the floor stays as the second line.
+  assert.match(html, /Saving, typical case/);
+  assert.match(html, /at least [\d.,]+% vs\. the best possible client cache/);
 });
 
 test('rows without a floor baseline fall back to the estimated saving and say so', () => {
@@ -96,7 +97,7 @@ test('rows without a floor baseline fall back to the estimated saving and say so
   delete (old as Partial<LedgerEntry>).floorBaselineUnitCost;
   const html = render([old]);
   assert.match(html, /Estimated saving/);
-  assert.doesNotMatch(html, /Saving, at least/);
+  assert.doesNotMatch(html, /Saving, typical case/);
 });
 
 test('the cache cells say their share of Received in t, and the Billed tooltip adds up the units', () => {
@@ -108,19 +109,21 @@ test('the cache cells say their share of Received in t, and the Billed tooltip a
 
 test('tooltip multipliers are the effective rate of the hit, not constants', () => {
   const sonnet = render([row({ read: 10_000, write: 2_000 })]);
-  assert.match(sonnet, /CR: 10\.00K t × 0\.1 = 1\D000 u/);
-  assert.match(sonnet, /CW: 2\.00K t × 1\.25 = 2\.50K u/);
+  assert.match(sonnet, /CR = 10\.00K t × 1 × 0\.1 = 1\D000 u/);
+  assert.match(sonnet, /CW = 2\.00K t × 1 × 1\.25 = 2\.50K u/);
 
   // Haiku weighs a third of Sonnet, so the same tokens bill at a third of the rate.
   const haiku = render([
     row({ read: 10_000, write: 2_000 }, { tel: { effectiveModel: HAIKU_MODEL_ID, modelDowngraded: true } }),
   ]);
-  assert.doesNotMatch(haiku, /CR: 10\.00K t × 0\.1 =/);
-  assert.match(haiku, /CR: 10\.00K t × 0\.0\d+ =/);
+  // The model weight is its own factor and the cache multiplier stays 0.1 (read) / 1.25 (write) for every model.
+  assert.doesNotMatch(haiku, /CR = 10\.00K t × 1 × /);
+  assert.match(haiku, /CR = 10\.00K t × 0\.\d+ × 0\.1 =/);
+  assert.match(haiku, /CW = 2\.00K t × 0\.\d+ × 1\.25 =/);
 
   // A 1h write bills above 1.25x, and the tooltip shows the blended rate.
   const oneHour = render([row({ read: 0, write: 2_000, write1h: 2_000 })]);
-  assert.match(oneHour, /CW: 2\.00K t × 2 = 4\.00K u/);
+  assert.match(oneHour, /CW = 2\.00K t × 1 × 2 = 4\.00K u/);
 });
 
 test('the Cached cell is tinted green when reads outweigh writes and red when writes do', () => {
@@ -136,16 +139,19 @@ test('the Cached cell is tinted green when reads outweigh writes and red when wr
 test('the units row is judged by what the cache did: green when reads saved more than writes cost over full price', () => {
   // 30K read vs 20K written: writes outweigh reads in raw units, yet reading saves 0.9x per token and writing costs 0.25x extra.
   const html = render([row({ read: 30_000, write: 20_000 })]);
-  assert.match(html, /CR: \d+% CW: \d+%/);
-  const [cr, cw] = /CR: (\d+)% CW: (\d+)%/.exec(html)!.slice(1).map(Number);
+  // Each cell names only its own share, never both.
+  const cr = Number(/CR = [^"]*\. CR: (\d+)%/.exec(html)![1]);
+  const cw = Number(/CW = [^"]*\. CW: (\d+)%/.exec(html)![1]);
   assert.equal(cr + cw, 100);
   assert.deepEqual([cr, cw], [60, 40], 'share of the cached tokens that were read and written');
-  assert.ok(html.includes('title="CR: ') && /<div class="cache-val" style="background:rgba\(63,185,80,0\.16\)" title="CR: [^"]*CR: \d+% CW: \d+%/.test(html));
+  assert.doesNotMatch(html, /CR: \d+% CW: \d+%/);
+  assert.ok(/<div class="cache-val" style="background:rgba\(63,185,80,0\.16\)" title="CR = [^"]*CR: \d+%/.test(html));
 
   // Only a cold write: the cache cost more than not using it, so the units row is red.
   const cold = render([row({ write: 90_000 })]);
-  assert.match(cold, /CR: 0% CW: 100%/);
-  assert.match(cold, /<div class="cache-val" style="background:rgba\(229,83,75,0\.16\)" title="CW: [^"]*CR: 0% CW: 100%/);
+  assert.match(cold, /CW = [^"]*\. CW: 100%/);
+  assert.doesNotMatch(cold, /CR: \d+% CW: \d+%/);
+  assert.match(cold, /<div class="cache-val" style="background:rgba\(229,83,75,0\.16\)" title="CW = [^"]*CW: 100%/);
 });
 
 test('the project filter narrows the table, and an unknown project falls back to all repos', () => {
@@ -212,17 +218,19 @@ test('the table help texts do not quote fixed cache multipliers', () => {
 test('a range that cost more than its baseline gets a warning, and a saving range does not', () => {
   const losing = row({ read: 0, write: 90_000, input: 100, output: 400 });
   losing.floorBaselineUnitCost = 1_000;
+  losing.centralBaselineUnitCost = 1_000;
   losing.actualUnitCost = 5_000;
   assert.match(render([losing]), /The proxy cost [\d.]+K? <abbr[^>]*>u<\/abbr> more than the baseline/);
   const saving = row({ read: 0, write: 900, input: 100, output: 400 });
   saving.floorBaselineUnitCost = 5_000;
+  saving.centralBaselineUnitCost = 5_000;
   saving.actualUnitCost = 1_000;
   assert.doesNotMatch(render([saving]), /more than the baseline/);
 });
 
 test('the stats grid has four cards: saving, cache, pruning and downgrades', () => {
   const html = render([row({ read: 80_000, write: 5_000, input: 100, output: 400 })]);
-  for (const label of ['Saving, at least', 'Cache', 'Pruning &amp; compaction', 'Model downgrades']) {
+  for (const label of ['Saving, typical case', 'Cache', 'Pruning &amp; compaction', 'Model downgrades']) {
     assert.ok(html.includes(`<div class="stat-label">${label}</div>`), label);
   }
   assert.doesNotMatch(html, /Typical saving|Baseline vs actual|Tokens pruned/);
@@ -245,7 +253,9 @@ test('the trend charts draw one line, label the time along the bottom, and toolt
 
 test('a row with one model shows that model and the plain "× rate" tooltip', () => {
   const html = render([row({ input: 4, output: 100 })]);
-  assert.match(html, /<td title="Sonnet 5">Sonnet 5<\/td>/);
+  const turnsHead = /<table class="turns-table">[\s\S]*?<\/thead>/.exec(html)![0];
+  assert.doesNotMatch(turnsHead, /Model/);
+  assert.match(html, /↳ hit 1<div class="turn-sub">Sonnet 5<\/div>/);
   assert.match(html, /RI: 4 t × 1 = 4 u/);
   assert.doesNotMatch(html, /mixed models/);
 });
@@ -261,8 +271,9 @@ test('a turn that mixed models shows both, drops the blended multiplier and list
   const haiku = row({ input: 4 }, { tel: { effectiveModel: HAIKU_MODEL_ID, modelDowngraded: true } });
   const sonnet = row({ input: 4 });
   const html = render([haiku, sonnet]);
-  // The turn row (and the totals) show the pair; the per-request rows show one model each.
-  assert.match(html, /<td title="Haiku 5\.5 → Sonnet 5">Haiku 5\.5 → Sonnet 5<\/td>/);
+  // Each hit shows its own model under its label; the turn row has no Model column.
+  assert.match(html, /↳ hit \d+<div class="turn-sub">Haiku 5\.5<\/div>/);
+  assert.match(html, /↳ hit \d+<div class="turn-sub">Sonnet 5<\/div>/);
   assert.match(html, /RI: 8 t → [\d.,]+ u \(mixed models\)/);
   assert.doesNotMatch(html, /RI: 8 t ×/);
   assert.match(html, /Haiku 5\.5: 4 t × 0\.\d+ = [\d.,]+ u/);

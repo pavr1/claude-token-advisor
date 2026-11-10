@@ -12,9 +12,10 @@
  * reading about in the tooltip, but it must not mask an over-budget warning.
  */
 
-import { clearTooltipMarkdown } from './clearNotice';
+import { clearDoneTooltipMarkdown, clearTooltipMarkdown } from './clearNotice';
 import * as vscode from 'vscode';
 import { AggregateStats, billedUnits } from '../analytics/tracker';
+import { headlineSavingPercent } from './historyChart';
 import { paceLabel, renderEmbeddedProgressBar, statusFromPercent, statusLabel, statusToIcon, Summary } from './budgetDashboard';
 import { compact, formatUsd, progressBarText } from './shared';
 import {
@@ -64,6 +65,8 @@ export class StatusBar {
   private lastTurn: AggregateStats | undefined;
   /** Summaries are waiting for the user's `/clear`: the tooltip asks for it and explains nothing is lost. */
   private clearHint = false;
+  /** The summary was just delivered to the new chat: confirmation shown for a few seconds. */
+  private clearDone = false;
   /** When the chat the summary belongs to started (epoch ms), when it is known. */
   private clearSince: number | undefined;
   private todayStats: AggregateStats | undefined;
@@ -336,6 +339,12 @@ export class StatusBar {
     this.clearSince = value ? since : undefined;
   }
 
+  /** The new chat just received the saved summary: a check icon and a tooltip line, until the caller turns it off. */
+  setClearDone(value: boolean): void {
+    this.clearDone = value;
+    this.render();
+  }
+
   reportProxyError(message: string): void {
     this.proxyError = message;
     this.render();
@@ -383,7 +392,7 @@ export class StatusBar {
 
   private buildGaugeText(): string {
     // The warning rides on the gauge item (the one on screen with a live budget) and only adds an icon: the colour stays the budget's.
-    const warning = this.clearHint ? ' $(warning)' : '';
+    const warning = this.clearHint ? ' $(warning)' : this.clearDone ? ' $(check)' : '';
     if (!this.gaugeTimer) {
       return (this.isBusy ? `$(claude-budget-gauge-${GAUGE_REST})` : '$(claude-budget-gauge)') + warning;
     }
@@ -439,6 +448,8 @@ export class StatusBar {
     // Without a gauge the text item is the one on screen: the same icon, unless a proxy error already put one.
     if (this.clearHint && !this.gaugeVisible && (busy || !this.proxyError)) {
       segments.push('$(warning)');
+    } else if (this.clearDone && !this.gaugeVisible) {
+      segments.push('$(check)');
     }
     // Idle with a completed last turn: no segment here anymore — the same
     // per-turn savings % is already the top row of the tooltip's Improver table,
@@ -512,6 +523,8 @@ export class StatusBar {
     this.appendBudgetSection(md);
     if (this.clearHint) {
       md.appendMarkdown(clearTooltipMarkdown(this.clearSince));
+    } else if (this.clearDone) {
+      md.appendMarkdown(clearDoneTooltipMarkdown());
     }
     md.appendMarkdown('\nClick for dashboards (savings breakdown is in the Token Improver tab).');
     return md;
@@ -569,8 +582,9 @@ export class StatusBar {
           return `| ${label} | No data yet |\n`;
         }
         const billed = billedUnits(stats);
-        const reduction = stats.rawTokens > 0 ? ((stats.rawTokens - billed) / stats.rawTokens) * 100 : 0;
-        return `| ${label} | ${reduction.toFixed(1)}% — ${compact(stats.rawTokens)} → ${compact(billed)} u |\n`;
+        // Same figure the charts headline (billed saving vs. the no-proxy baseline), not raw tokens vs. units.
+        const saving = headlineSavingPercent(stats);
+        return `| ${label} | ~${saving.toFixed(2)}% — ${compact(stats.rawTokens)} t → ${compact(billed)} u |\n`;
       };
       md.appendMarkdown(row('Today', this.todayStats));
       md.appendMarkdown(row('All repos, this month', this.monthStats));

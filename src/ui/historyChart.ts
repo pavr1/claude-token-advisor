@@ -4,7 +4,7 @@
  * of `vscode` imports so it can be unit tested.
  */
 
-import { aggregate, LedgerEntry, localDayKey, sentTokens } from '../analytics/tracker';
+import { aggregate, AggregateStats, CLIENT_PREFIX_REUSE, LedgerEntry, localDayKey, sentTokens } from '../analytics/tracker';
 import { CHART, compact, escapeHtml } from './shared';
 
 /**
@@ -414,15 +414,17 @@ export function historyChartsHtml(
 // Saving trend: the percentage the header donuts used to show, over time
 // ---------------------------------------------------------------------------
 
-/** The headline percentage of a set of turns: at least vs. the best client cache, else the estimate. */
+/** The headline percentage of a set of turns: the typical case vs. a client reusing most of its cache, else the estimate. */
 function savingPercentOf(entries: readonly LedgerEntry[]): { percent: number; mark: string } | undefined {
   if (entries.length === 0) {
     return undefined;
   }
-  const stats = aggregate(entries);
-  return stats.floorTurns > 0
-    ? { percent: stats.floorSavingsPercent, mark: '≥ ' }
-    : { percent: stats.savingsPercent, mark: '~' };
+  return { percent: headlineSavingPercent(aggregate(entries)), mark: '~' };
+}
+
+/** The figure the charts headline, shared with the status bar tooltip so both always agree. */
+export function headlineSavingPercent(stats: AggregateStats): number {
+  return stats.floorTurns > 0 ? stats.centralSavingsPercent : stats.savingsPercent;
 }
 
 /** The headline percentage worked out step by step, so every figure in it can be checked against the table. */
@@ -434,8 +436,8 @@ function savingFormula(entries: readonly LedgerEntry[]): string {
   const n = (value: number): string => Math.round(value).toLocaleString();
   const floor = stats.floorTurns > 0;
   const billed = floor ? stats.floorActualUnitCost : stats.actualUnitCost;
-  const without = floor ? stats.floorBaselineUnitCost : stats.baselineUnitCost;
-  const percent = floor ? stats.floorSavingsPercent : stats.savingsPercent;
+  const without = floor ? stats.centralBaselineUnitCost : stats.baselineUnitCost;
+  const percent = floor ? stats.centralSavingsPercent : stats.savingsPercent;
   const rows = floor ? entries.filter((e) => e.floorBaselineUnitCost !== undefined) : entries;
   const sum = (pick: (e: LedgerEntry) => number | undefined): number => rows.reduce((total, e) => total + (pick(e) ?? 0), 0);
   const exact = rows.filter((e) => e.rawTokensExact === true).length;
@@ -453,10 +455,10 @@ function savingFormula(entries: readonly LedgerEntry[]): string {
     `  raw (size before the proxy) = ${n(sum((e) => e.rawTokens))} t`,
     `    exact count on ${exact.toLocaleString()} of ${rows.length.toLocaleString()} requests, rest estimated locally`,
     cachedKnown
-      ? `  cached (prefix the client cache still holds, ≤ 1 h) = ${n(sum((e) => e.floorCachedTokens))} t`
+      ? `  cached (prefix the client cache still holds, ≤ 1 h, × ${CLIENT_PREFIX_REUSE}) = ${n(sum((e) => e.floorCachedTokens) * CLIENT_PREFIX_REUSE)} t`
       : `  cached (prefix the client cache still holds) is not stored on older requests`,
     `  output = ${n(sum((e) => e.outputTokens))} t; rates are the original model's price per token`,
-    floor ? '  best-case client cache, so the saving is at least this' : '',
+    floor ? `  typical client: reuses ${(CLIENT_PREFIX_REUSE * 100).toFixed(0)}% of its prefix from cache (measured without the proxy)` : '',
     '',
     `1 − ${n(billed)} ÷ ${n(without)} = ${percent.toFixed(2)}%`,
   ];

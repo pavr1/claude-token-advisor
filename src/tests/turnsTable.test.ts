@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { InFlightProject, InFlightTracker, IN_FLIGHT_EXPIRY_MS } from '../analytics/inflight';
-import { groupTurns, LedgerEntry } from '../analytics/tracker';
+import { aggregate, groupTurns, LedgerEntry } from '../analytics/tracker';
 import { compact } from '../ui/shared';
 import { dailySeries, historyChartsHtml, hourlySeries } from '../ui/historyChart';
 import { summaryColumnCell, liveRow, pendingTotals } from '../ui/liveTurnRow';
@@ -138,25 +138,25 @@ test('pendingTotals sums the stages in flight and flags which ones were reported
   assert.deepEqual(pendingTotals(undefined).known, { raw: false, pruned: false, compacted: false, sent: false });
 });
 
-/** The cells of a live row after Time, Repo, Status, Turns, Hits and Model: raw, cleanup, summarized, sent. */
+/** The cells of a live row after Time, Repo, Status, Turns and Hits: raw, cleanup, summarized, sent. */
 function liveFigureCells(preflight: InFlightProject['preflight']): string[] {
   const html = liveRow('repo', { count: 1, newTurn: true, since: 0, preflight }, 0).split('</tr>')[0];
   const cells = html.match(/<td[\s\S]*?<\/td>/g) ?? [];
   // Raw, Cleanup, Summarized, Sent.
-  return cells.slice(6, 10);
+  return cells.slice(5, 9);
 }
 
 test('liveRow has one cell per header column and keeps the arrow column constant', () => {
   const html = liveRow('repo', { count: 1, newTurn: true, since: 0, preflight: [{ rawTokens: 1000, optimizedTokens: 700 }] }, 0).split('</tr>')[0];
   const cells = html.match(/<td[\s\S]*?<\/td>/g) ?? [];
 
-  // Time, Repo, Status, Turns, Hits, Model, Raw, Cleanup, Summarized, Sent, arrow, Total received, CR, CW, RI, Out, Billed.
-  assert.equal(cells.length, 17);
+  // Time, Repo, Status, Turns, Hits, Raw, Cleanup, Summarized, Sent, arrow, Total received, CR, CW, RI, Out, Billed.
+  assert.equal(cells.length, 16);
   // Optimized and on its way: the arrow flies until the answer replaces the row.
-  assert.match(cells[10], /class="turn-arrow"><span class="arrow-fly"[^>]*>→<\/span>/);
+  assert.match(cells[9], /class="turn-arrow"><span class="arrow-fly"[^>]*>→<\/span>/);
   // Before the request leaves, the column stays empty.
   const before = liveRow('repo', { count: 1, newTurn: true, since: 0, preflight: [{ rawTokens: 1000 }] }, 0).split('</tr>')[0];
-  assert.equal((before.match(/<td[\s\S]*?<\/td>/g) ?? [])[10], '<td class="turn-arrow"></td>');
+  assert.equal((before.match(/<td[\s\S]*?<\/td>/g) ?? [])[9], '<td class="turn-arrow"></td>');
 });
 
 test('liveRow fills Raw request, Cleanup, Summarized and Sent one column at a time', () => {
@@ -314,15 +314,36 @@ test('a hit that ends in tool_use keeps the project live while local tools run, 
   assert.equal(t.snapshot(7000 + 11 * 60_000).has('p'), false);
 });
 
-test('live rows have one cell per header column, with Model (empty) right after Hits', () => {
+test('live rows have one cell per header column', () => {
   const countCells = (html: string): number[] =>
     html.split('<tr ').slice(1).map((row) => (row.match(/<td[ >]/g) ?? []).length);
   for (const preflight of [[], [{ rawTokens: 1000, prunedByNormalization: 10, prunedByCompaction: 0, optimizedTokens: 900 }]]) {
     const html = liveRow('p', { count: 2, newTurn: true, since: Date.now(), preflight } as never, 1);
-    assert.deepEqual(countCells(html), [17, 17, 17]);
-    // Cells 1-5 are Time, Repo, Status, Turns, Hits; cell 6 is Model and must be empty so Raw lands under Raw.
-    const first = html.split('<tr ')[1];
-    const cells = first.match(/<td[^>]*>[\s\S]*?<\/td>/g) ?? [];
-    assert.equal(cells[5], '<td></td>');
+    assert.deepEqual(countCells(html), [16, 16, 16]);
   }
+});
+
+test('aggregate bills a keep-alive ping but keeps it out of every savings figure', () => {
+  const real = {
+    routingReason: 'turn carries tool results', rawTokens: 1000, optimizedTokens: 800,
+    baselineUnitCost: 200, floorBaselineUnitCost: 150, centralBaselineUnitCost: 180, actualUnitCost: 100,
+    cacheNoCacheUnitCost: 400, cacheActualUnitCost: 100, cacheReadTokens: 300, cacheWriteTokens: 0,
+  };
+  // Older rows hold a ping against an uncached baseline: 78K tokens "saving" 95%.
+  const ping = {
+    routingReason: 'cache keep-alive ping', rawTokens: 80000, optimizedTokens: 80000,
+    baselineUnitCost: 80000, floorBaselineUnitCost: 80000, centralBaselineUnitCost: 80000, actualUnitCost: 4000,
+    cacheNoCacheUnitCost: 80000, cacheActualUnitCost: 4000, cacheReadTokens: 80000, cacheWriteTokens: 0,
+  };
+  const withPing = aggregate([real, ping] as unknown as LedgerEntry[]);
+  const alone = aggregate([real] as unknown as LedgerEntry[]);
+
+  assert.equal(withPing.savingsPercent, alone.savingsPercent);
+  assert.equal(withPing.floorSavingsPercent, alone.floorSavingsPercent);
+  assert.equal(withPing.centralSavingsPercent, alone.centralSavingsPercent);
+  assert.equal(withPing.cacheSavingsPercent, alone.cacheSavingsPercent);
+  assert.equal(withPing.cacheReadSavedUnits, alone.cacheReadSavedUnits);
+  // Billed includes the ping, and the units saved do not change.
+  assert.equal(withPing.actualUnitCost, 4100);
+  assert.equal(withPing.baselineUnitCost - withPing.actualUnitCost, alone.baselineUnitCost - alone.actualUnitCost);
 });

@@ -10,6 +10,7 @@ import { paceForecast, paceForecastIcon } from '../ui/planView';
 import { compact, formatUsd, progressBarText } from '../ui/shared';
 import { statusLabel, paceLabel } from '../ui/budgetDashboard';
 import { StatusBar } from '../ui/statusBar';
+import { headlineSavingPercent } from '../ui/historyChart';
 import { fake, FakeMarkdownString, FakeStatusBarItem, FakeThemeColor } from './helpers/fakeVscode';
 
 const MENU = 'claudeTokenImprover.menu';
@@ -394,19 +395,23 @@ test('Enterprise without a spend limit shows the reduction for today and for all
   assert.equal(text(), `$(claude-budget-gauge) ${compact(month.rawTokens)}/${compact(billed)}`);
   assert.equal(color(), undefined, 'there is no real limit to warn about');
   const t = tip();
-  const reduction = ((month.rawTokens - billed) / month.rawTokens) * 100;
-  assert.ok(t.includes(`| All repos, this month | ${reduction.toFixed(1)}% — ${compact(month.rawTokens)} → ${compact(billed)} u |`));
+  // The tooltip must quote the same saving the charts headline, not raw tokens vs. units.
+  const saving = headlineSavingPercent(month);
+  assert.ok(t.includes(`| All repos, this month | ~${saving.toFixed(2)}% — ${compact(month.rawTokens)} t → ${compact(billed)} u |`));
   assert.match(t, /\| Today \| No data yet \|/);
   assert.doesNotMatch(t, /Raw request|Billed input|No account spend limit/);
   // No fixed cache multipliers quoted.
   assert.doesNotMatch(t, /0\.10x|1\.25x/);
 });
 
-test('with zero raw tokens the reduction is 0.0% rather than a division by zero', () => {
+test('the tooltip saving for today and this month is the charts headline figure (central when floor turns exist)', () => {
   const { bar, tip } = make();
   bar.setBudget(tokensSummary({ plan: enterprisePlan }));
-  bar.restoreHistory(undefined, undefined, stats({ rawTokens: 0 }), 'm');
-  assert.match(tip(), /\| All repos, this month \| 0\.0% — 0 → /);
+  const day = { ...stats(), floorTurns: 2, centralSavingsPercent: 41.234, savingsPercent: 12 };
+  const month = { ...stats(), floorTurns: 0, savingsPercent: 33.456, centralSavingsPercent: 50 };
+  bar.restoreHistory(undefined, day, month, 'm');
+  assert.match(tip(), /\| Today \| ~41\.23% — /);
+  assert.match(tip(), /\| All repos, this month \| ~33\.46% — /);
 });
 
 test('dispose releases the item', () => {
@@ -437,6 +442,22 @@ test('a summarized history waiting for /clear puts a warning icon on the gauge i
   bar.setClearHint(false);
   bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
   assert.equal(gauge.text, '$(claude-budget-gauge)');
+});
+
+test('after the summary is delivered the gauge shows a check and the tooltip confirms it, until it is turned off', () => {
+  const { bar, gauge, bg } = make();
+  bar.setBudget(tokensSummary());
+  bar.setClearHint(true);
+  bar.reportTurn(stats(), stats(), stats(), 'claude-sonnet-5');
+  bar.setClearHint(false);
+  bar.setClearDone(true);
+  assert.equal(gauge.text, '$(claude-budget-gauge) $(check)');
+  assert.match(String((gauge.tooltip as { value?: string }).value), /Summary delivered/);
+  assert.equal(bg(), undefined, 'the budget keeps the colour');
+
+  bar.setClearDone(false);
+  assert.equal(gauge.text, '$(claude-budget-gauge)');
+  assert.doesNotMatch(String((gauge.tooltip as { value?: string }).value), /Summary delivered/);
 });
 
 test('the warning icon does not change the budget colour, and stays while the gauge needle moves', (t) => {

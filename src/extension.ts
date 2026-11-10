@@ -37,6 +37,8 @@ import { detectPython, MIN_PYTHON, PythonMissingError, PythonRuntime } from './b
 import { BypassMonitor } from './proxy/bypassMonitor';
 import { checkInstall, readFingerprint, readInstallTime } from './proxy/installWatch';
 import { DEFAULT_OPTIMIZER_CONFIG } from './proxy/optimizer';
+import { resolveClientProcess } from './proxy/clientProcess';
+import { setLiveTerminalPids } from './ui/terminals';
 import { getPricingTable, LITELLM_PRICING_URL, loadPricing } from './proxy/pricing';
 import {
   DEFAULT_PROXY_PORT,
@@ -52,7 +54,7 @@ import {
 } from './proxy/server';
 import { newestInstalledVersion } from './proxy/installedVersions';
 import { announceVersion, EventSubscription, probeProxy, ProbeResult, subscribeToEvents } from './proxy/coordinator';
-import { chatFirstSeen, ClearNotifier } from './ui/clearNotice';
+import { chatFirstSeen, CLEAR_DONE_MS, ClearNotifier } from './ui/clearNotice';
 import { DashboardPanel, DashboardTab } from './ui/dashboardPanel';
 import { Summary } from './ui/budgetDashboard';
 import { StatusBar } from './ui/statusBar';
@@ -348,6 +350,11 @@ function readProxyConfig(): ProxyConfig {
     upstreamBaseUrl: (upstream || DEFAULT_UPSTREAM_BASE_URL).replace(/\/+$/, ''),
     exactTokenCounting: config.get<boolean>('exactTokenCounting', false) ?? false,
     keepAliveMaxMinutes: Math.max(0, config.get<number>('keepAliveMaxMinutes', 30) ?? 30),
+    terminalPids: async () =>
+      (await Promise.all(vscode.window.terminals.map((terminal) => terminal.processId))).filter(
+        (pid): pid is number => typeof pid === 'number'
+      ),
+    identifyClient: resolveClientProcess,
     optimizer: {
       enableNormalization: config.get<boolean>('stage1Normalization', true) ?? true,
       enableCompaction: config.get<boolean>('stage2Compaction', true) ?? true,
@@ -806,6 +813,22 @@ const clearNotifier = new ClearNotifier(
   () => void vscode.commands.executeCommand(`${BUDGET_SECTION}.showMenu`)
 );
 
+let clearDoneTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** The new chat just received the saved summary: confirm it in green for CLEAR_DONE_MS, then take it down. */
+function showClearDone(): void {
+  if (clearDoneTimer) {
+    clearTimeout(clearDoneTimer);
+  }
+  statusBar?.setClearDone(true);
+  DashboardPanel.setClearDone(true);
+  clearDoneTimer = setTimeout(() => {
+    clearDoneTimer = undefined;
+    statusBar?.setClearDone(false);
+    DashboardPanel.setClearDone(false);
+  }, CLEAR_DONE_MS);
+}
+
 /** Add a turn from this window's project to the current group and refresh the status bar. */
 function showTurn(entry: LedgerEntry): void {
   if (!tracker) {
@@ -840,6 +863,9 @@ function showTurn(entry: LedgerEntry): void {
     statusBar?.setClearHint(clearPending, clearSince);
     DashboardPanel.setClearPending(clearPending, clearSince);
     clearNotifier.update(clearPending, clearSince);
+    if (entry.pendingInjected === true && !clearPending) {
+      showClearDone();
+    }
   }
   statusBar?.reportTurn(lastTurnStats, todayStats, monthStats, entry.servedModel);
 
@@ -847,12 +873,12 @@ function showTurn(entry: LedgerEntry): void {
 }
 
 /** Owner only: a cache keep-alive ping goes into the ledger like any turn, so Billed adds up. */
-function onKeepAlivePing(ping: { project: string | undefined; sessionId?: string; model: string; usage: ApiUsage | undefined; status: number }): void {
+function onKeepAlivePing(ping: { project: string | undefined; sessionId?: string; terminalKey?: string; model: string; usage: ApiUsage | undefined; status: number }): void {
   const telemetry = fallbackTelemetry({ model: ping.model });
   const input = (ping.usage?.input_tokens ?? 0) + (ping.usage?.cache_read_input_tokens ?? 0) + (ping.usage?.cache_creation_input_tokens ?? 0);
   // A ping saves nothing: size it as sent, so it books its own cost against a like-for-like baseline.
   onTurnCompleted(
-    { telemetry: { ...telemetry, rawTokens: input, optimizedTokens: input, isNewUserTurn: false }, usage: ping.usage, status: ping.status, project: ping.project, sessionId: ping.sessionId },
+    { telemetry: { ...telemetry, rawTokens: input, optimizedTokens: input, isNewUserTurn: false }, usage: ping.usage, status: ping.status, project: ping.project, sessionId: ping.sessionId, terminalKey: ping.terminalKey },
     true
   );
 }
@@ -907,9 +933,10 @@ function onTurnCompleted(record: TurnRecord, isKeepAlivePing = false): void {
     regularInputUnits: cost.regularInputUnits,
     outputUnits: cost.outputUnits,
     cacheMultipliers: cost.cacheMultipliers,
-    baselineUnitCost: cost.baselineUnitCost,
+    // A keep-alive ping saves nothing: it is recorded at its own cost, not against an uncached baseline.
+    baselineUnitCost: isKeepAlivePing ? cost.actualUnitCost : cost.baselineUnitCost,
     actualUnitCost: cost.actualUnitCost,
-    savingsPercent: cost.savingsPercent,
+    savingsPercent: isKeepAlivePing ? 0 : cost.savingsPercent,
     floorBaselineUnitCost: cost.floorBaselineUnitCost,
     centralBaselineUnitCost: cost.centralBaselineUnitCost,
     cacheNoCacheUnitCost: cost.cacheNoCacheUnitCost,
@@ -922,6 +949,7 @@ function onTurnCompleted(record: TurnRecord, isKeepAlivePing = false): void {
     failure: record.failure,
     accountId: tracker.getActiveAccountId(),
     sessionId: record.sessionId,
+    terminalKey: record.terminalKey,
     startedAt: record.startedAt,
     stopReason: record.stopReason,
     anthropicRequestId: record.anthropicRequestId,
@@ -1490,6 +1518,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   output.appendLine(`installed: ${installedAt ? new Date(installedAt).toLocaleString() : 'unknown'} (no data cutoff)`);
 
   terminalEnv = context.environmentVariableCollection;
+  // The numbers in "Terminal #N" count the terminals open right now, so opening or closing one redraws the table.
+  const syncLiveTerminals = (): void => {
+    void Promise.all(vscode.window.terminals.map((terminal) => terminal.processId)).then((pids) => {
+      setLiveTerminalPids(pids.filter((pid): pid is number => typeof pid === 'number'));
+      DashboardPanel.refreshIfOpen();
+    });
+  };
+  context.subscriptions.push(vscode.window.onDidOpenTerminal(syncLiveTerminals), vscode.window.onDidCloseTerminal(syncLiveTerminals));
+  syncLiveTerminals();
   bypassMonitor = new BypassMonitor((line) => output.appendLine(line), ensurePython);
   context.subscriptions.push(
     bypassMonitor,

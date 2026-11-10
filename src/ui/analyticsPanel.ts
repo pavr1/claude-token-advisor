@@ -26,6 +26,8 @@ import { RealCostTracker } from '../analytics/realCostTracker';
 import { InFlightProject, inFlightRequests } from '../analytics/inflight';
 import { RANGE_LABELS, RangeId, resolveRange } from './dateRange';
 import { processingIcon } from './shared';
+import { isShellRunning } from '../proxy/clientProcess';
+import { describeTerminals, liveTerminalPids, TerminalInfo, terminalLabel } from './terminals';
 import { ARROW_CELL, ARROW_FLYING_CELL, liveHitRows, liveRow,  pendingTotals, savingsTone, SummaryUse, summaryColumnCell, timeCell } from './liveTurnRow';
 import { CLIENT_PREFIX_REUSE, isFailedHit, sentTokens } from '../analytics/tracker';
 import { Balance, HitBalance, hitBalanceOf } from './hitBalance';
@@ -33,7 +35,7 @@ import { tipsPopupHtml } from './tips';
 import { historyChartsHtml, savingTrendsHtml } from './historyChart';
 import { PlanInfo, planLabel, planViewMode } from './planView';
 import { DEFAULT_OPTIMIZER_CONFIG } from '../proxy/optimizer';
-import { getPricingTable } from '../proxy/pricing';
+import { getPricingTable, modelWeight } from '../proxy/pricing';
 import {
   barRow,
   CATEGORICAL_PALETTE,
@@ -57,6 +59,8 @@ export interface AnalyticsFilters {
   range: RangeId;
   /** Turn status filter: ALL, or one of done / warning / failed / processing. */
   status?: string;
+  /** Terminal filter: ALL, or the `terminalKey` of one terminal (every chat that ran in it, pings included). */
+  terminal?: string;
   from?: string;
   to?: string;
   /** How many chats the table draws; a wide range has thousands of hits, so it starts at CHATS_PAGE and grows on request. Totals always cover every row. */
@@ -142,19 +146,19 @@ function buildReport(
   const subscriptionPlan = planViewMode(plan) !== 'dollar';
   const baselineSub = 'normalized cost units (input-token equivalents), unoptimized vs actual';
   const percentPlan = planViewMode(plan) === 'percent';
-  // Headline = the floor: what the proxy saved against a client with the best possible cache (one hour, no misses).
-  // Rows from before the floor existed have no such baseline, so until a row carries one the
+  // Headline = the typical case: what the proxy saved against a client reusing CLIENT_PREFIX_REUSE of its prefix from
+  // cache (measured on turns that did not go through the proxy, F-03). The floor (best possible client cache) stays as
+  // a second line. Rows from before the floor existed have neither baseline, so until a row carries one the
   // headline falls back to the modelled estimate and says so.
   const hasFloor = stats.floorTurns > 0;
-  const savingLabel = hasFloor ? 'Saving, at least' : 'Estimated saving';
-  const headBaseline = hasFloor ? stats.floorBaselineUnitCost : stats.baselineUnitCost;
+  const savingLabel = hasFloor ? 'Saving, typical case' : 'Estimated saving';
+  const headBaseline = hasFloor ? stats.centralBaselineUnitCost : stats.baselineUnitCost;
   const headActual = hasFloor ? stats.floorActualUnitCost : stats.actualUnitCost;
   const savedNcu = headBaseline - headActual;
-  const savingsPercent = hasFloor ? stats.floorSavingsPercent : stats.savingsPercent;
-  const typicalNote = `Typical case: a client reusing ${(CLIENT_PREFIX_REUSE * 100).toFixed(0)}% of its prompt from cache.`;
-  const savingsPrefix = hasFloor ? 'at least ' : 'est. ';
+  const savingsPercent = hasFloor ? stats.centralSavingsPercent : stats.savingsPercent;
+  const floorNote = 'Lower bound: vs. a client whose cache never misses (the whole previous prompt cached for up to an hour).';
   const savingsNote = hasFloor
-    ? `Worst case: vs. a client with the best possible cache. The real saving can be higher.`
+    ? `Typical case: a client reusing ${(CLIENT_PREFIX_REUSE * 100).toFixed(0)}% of its prompt from cache, the share measured on Claude Code turns that did not go through the proxy.`
     : 'Estimate vs. what Claude would have used without the proxy.';
 
   // The selected range can be a single day with few turns: a compaction turn pays the whole summary
@@ -195,10 +199,10 @@ function buildReport(
       <div>
         <div class="stat-label">${savingLabel}</div>
         <div class="stat-value" style="color:${savingsTone(savedNcu)}">${compact(savedNcu)} ${UNITS_ABBR}</div>
-        <div class="stat-sub" title="${escapeHtml(savingsNote)}">${hasFloor ? 'worst case, vs. the best possible client cache' : 'avoided vs. baseline'}</div>
+        <div class="stat-sub" title="${escapeHtml(savingsNote)}">${hasFloor ? `typical, vs. a client reusing ${(CLIENT_PREFIX_REUSE * 100).toFixed(0)}% of its cache` : 'avoided vs. baseline'}</div>
         ${
           hasFloor
-            ? `<div class="stat-sub" style="color:${savingsTone(stats.centralSavingsPercent)}" title="${escapeHtml(typicalNote)}">typical ~${formatPercent(stats.centralSavingsPercent)} vs. a client reusing ${(CLIENT_PREFIX_REUSE * 100).toFixed(0)}% of its cache</div>`
+            ? `<div class="stat-sub" style="color:${savingsTone(stats.floorSavingsPercent)}" title="${escapeHtml(floorNote)}">at least ${formatPercent(stats.floorSavingsPercent)} vs. the best possible client cache</div>`
             : ''
         }
         <div class="stat-sub" title="${escapeHtml(baselineSub)}">${compact(headBaseline)} → ${compact(headActual)} ${UNITS_ABBR}</div>
@@ -279,7 +283,15 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
   const projects = [...new Set(inRange.map((entry) => entry.project))].sort();
   const project = filters.project === ALL || projects.includes(filters.project) ? filters.project : ALL;
   const status = STATUS_OPTIONS.some(([id]) => id === filters.status) ? (filters.status as string) : ALL;
-  const groups = groupTurns(inRange).filter((group) => (project === ALL || group.project === project) && (status === ALL || turnStatus(group) === status));
+  const terminals = describeTerminals(all, liveTerminalPids(), (key) => isShellRunning(key));
+  // Terminals of the chosen repo (or of every repo), oldest first; one that has no rows in this range is not offered.
+  const terminalKeys = [...new Set(inRange.filter((entry) => entry.terminalKey && (project === ALL || entry.project === project)).map((entry) => entry.terminalKey as string))].sort(
+    (x, y) => (terminals.get(x)?.firstAt ?? 0) - (terminals.get(y)?.firstAt ?? 0)
+  );
+  const terminal = filters.terminal !== undefined && terminalKeys.includes(filters.terminal) ? filters.terminal : ALL;
+  const groups = groupTurns(inRange).filter(
+    (group) => (project === ALL || group.project === project) && (terminal === ALL || group.terminalKey === terminal) && (status === ALL || turnStatus(group) === status)
+  );
   // In-flight requests belong to now, so they only show when the range reaches today.
   const live = new Map(range.includesNow && (status === ALL || status === 'processing') ? [...inFlight].filter(([name]) => project === ALL || name === project) : []);
   // Other ranges number their turns under their own prefix so an expanded turn of one range
@@ -348,10 +360,10 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
   const done = sortedGroups.slice(0, limit).map((group) => {
     const ordinal = ordinals.get(group) ?? '0';
     if (group.ping) {
-      return pingRow(group, ordinal, withDate);
+      return pingRow(group, ordinal, withDate, terminals);
     }
     const state = liveOf(group);
-    return turnRow(group, state, ordinal, withDate, undefined, settled(group, state));
+    return turnRow(group, state, ordinal, withDate, undefined, settled(group, state), terminals);
   });
 
   const rangeOptions = (Object.keys(RANGE_LABELS) as RangeId[])
@@ -368,7 +380,7 @@ function lastTurnsTable(all: readonly LedgerEntry[], filters: AnalyticsFilters, 
       ? `<div class="range-custom">From <input type="date" id="from" value="${escapeHtml(filters.from ?? todayKey)}"> to <input type="date" id="to" value="${escapeHtml(filters.to ?? filters.from ?? todayKey)}"></div>`
       : '';
   const more = hidden > 0
-    ? `<tr class="more-row"><td colspan="17"><button type="button" data-more>Show ${Math.min(CHATS_PAGE, hidden)} more rows (${hidden.toLocaleString()} hidden; the totals above already include them)</button></td></tr>`
+    ? `<tr class="more-row"><td colspan="16"><button type="button" data-more>Show ${Math.min(CHATS_PAGE, hidden)} more rows (${hidden.toLocaleString()} hidden; the totals above already include them)</button></td></tr>`
     : '';
   const body = [...started, ...done].join('') + more;
   // The totals follow the table: they add up exactly the rows the filters leave in, and sit under
@@ -391,12 +403,12 @@ ${s.turns.toLocaleString()} finished + ${liveHits.toLocaleString()} running = ${
   return `<h2>${title}</h2>
   ${custom}
   <div class="turns-scroll turns-main"><table class="turns-table">
-    <colgroup><col style="width:12%"><col style="width:9.5%"><col style="width:4%"><col style="width:5%"><col style="width:5%"><col style="width:8%"><col style="width:7%"><col style="width:8%"><col style="width:6%"><col style="width:9%"><col style="width:8%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:9%"><col style="width:8%"></colgroup>
+    <colgroup><col style="width:12%"><col style="width:12%"><col style="width:4%"><col style="width:5%"><col style="width:5%"><col style="width:8%"><col style="width:7%"><col style="width:9.2%"><col style="width:6.8%"><col style="width:8%"><col style="width:8%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6.5%"><col style="width:6%"></colgroup>
     <thead><tr>
-      <th class="filter-th">${withDate ? 'Date' : 'Time'}<select id="range" title="Filter by date">${rangeOptions}</select></th><th class="filter-th">Repo<select id="project" title="Filter by repo">${projectOptions}</select></th><th class="filter-th">Status<select id="status" title="Filter by status">${statusOptions}</select></th><th class="num">Turns</th><th class="num">Hits${HEADER_HELP.hits}</th><th>Model${HEADER_HELP.model}</th><th class="num">Raw request${HEADER_HELP.raw}</th><th class="num">Cleanup${HEADER_HELP.cleanup}</th><th class="num">Summarized${HEADER_HELP.summary}</th>
+      <th class="filter-th">${withDate ? 'Date' : 'Time'}<select id="range" title="Filter by date">${rangeOptions}</select></th><th class="filter-th">Repo<select id="project" title="Filter by repo">${projectOptions}</select></th><th class="filter-th">Status<select id="status" title="Filter by status">${statusOptions}</select></th><th class="num">Turns</th><th class="num">Hits${HEADER_HELP.hits}</th><th class="num">Raw${HEADER_HELP.raw}</th><th class="num">Cleanup${HEADER_HELP.cleanup}</th><th class="num">Summarized${HEADER_HELP.summary}</th>
       <th class="num">Estimate${HEADER_HELP.estimate}</th><th></th><th class="num">Received${HEADER_HELP.received}</th><th class="cache-col">CR${HEADER_HELP.cr}</th><th class="cache-col">CW${HEADER_HELP.cw}</th><th class="cache-col">RI${HEADER_HELP.ri}</th><th class="cache-col">Out${HEADER_HELP.out}</th><th class="num">Billed${HEADER_HELP.billed}</th>
     </tr>${totals}</thead>
-    <tbody>${body || '<tr><td colspan="17" class="empty">No optimized turns in this selection.</td></tr>'}</tbody>
+    <tbody>${body || '<tr><td colspan="16" class="empty">No optimized turns in this selection.</td></tr>'}</tbody>
   </table></div>`;
 }
 
@@ -449,7 +461,6 @@ const HEADER_HELP = {
   cw: helpIcon('Cache write: tokens stored in cache, billed above input. Top row t = tokens, bottom row u = units.'),
   ri: helpIcon('Regular input: tokens sent without caching. Top row t = tokens, bottom row u = units.'),
   out: helpIcon('Output: tokens the model wrote. Top row t = tokens, bottom row u = units.'),
-  model: helpIcon('Model that served the request. A turn that switched models shows both; hover a figure for the split.'),
   billed: helpIcon('What Anthropic charged, in units: input, cache, output and summary. Hover for the breakdown.'),
 };
 
@@ -494,18 +505,9 @@ function modelBreakdown(entries: readonly LedgerEntry[], pick: (s: AggregateStat
     .join('\n');
 }
 
-function modelCell(entries: readonly LedgerEntry[]): string {
-  const models = modelsOf(entries);
-  if (models.length === 0) {
-    return '<td>—</td>';
-  }
-  const label = models.length <= 2 ? models.map(shortModel).join(' → ') : `${models.length} models`;
-  return `<td title="${escapeHtml(models.map(shortModel).join(' → '))}">${escapeHtml(label)}</td>`;
-}
-
 function flowCells(
   s: AggregateStats,
-  flow: { rawTokens: number; prunedNorm: number; comp: SummaryUse; reused: SummaryUse; sent: number; skipped?: string; flying?: boolean; hitBalance?: HitBalance; entries?: readonly LedgerEntry[] }
+  flow: { rawTokens: number; prunedNorm: number; comp: SummaryUse; reused: SummaryUse; sent: number; skipped?: string; flying?: boolean; hitBalance?: HitBalance; entries?: readonly LedgerEntry[]; plain?: boolean }
 ): string {
   const entries = flow.entries ?? [];
   const mixed = modelsOf(entries).length > 1;
@@ -532,7 +534,7 @@ function flowCells(
     'Received is the real figure',
   ].join('\n');
   const step = (value: number, pruned: number, base: number): string =>
-    `<td class="num" title="${escapeHtml(cleanupTitle)}">${compact(value)}<div class="turn-sub" style="color:${savingsTone(pruned)}">−${compact(pruned)} (${formatShare(pruned, base)})</div></td>`;
+    `<td class="num" title="${escapeHtml(cleanupTitle)}">${compact(value)}<div class="turn-sub"${flow.plain ? '' : ` style="color:${savingsTone(pruned)}"`}>−${compact(pruned)} (${formatShare(pruned, base)})</div></td>`;
   // Short labels so no figure gets clipped; the full name and meaning live in the tooltip.
   // The cell shows each kind's billed units; tokens and their share of the received total live in the tooltip.
   // A hit can mix kinds, so the hit counts need not add up to the total.
@@ -551,7 +553,10 @@ function flowCells(
   }
   // Of the cached tokens, how many were read and how many written.
   const cached = s.cacheReadTokens + s.cacheWriteTokens;
-  const effectNote = cached > 0 ? `CR: ${Math.round((s.cacheReadTokens / cached) * 100)}% CW: ${Math.round((s.cacheWriteTokens / cached) * 100)}%` : '';
+  const pct = (tokens: number): string => `${Math.round((tokens / cached) * 100)}%`;
+  const effectNotes: Record<string, string> =
+    cached > 0 ? { CR: `CR: ${pct(s.cacheReadTokens)}`, CW: `CW: ${pct(s.cacheWriteTokens)}` } : {};
+  const singleModel = modelsOf(entries)[0];
   const cacheCell = (
     abbr: string,
     tokens: number,
@@ -560,13 +565,16 @@ function flowCells(
     pick: (s: AggregateStats) => { tokens: number; units: number } = () => ({ tokens, units }),
     tinted = true
   ): string => {
-    const note = abbr === 'RI' || abbr === 'OUT' ? '' : effectNote;
-    const tokensStyle = tinted ? tokensBalance.style : '';
-    const unitsStyle = tinted ? unitsBalance.style : '';
+    const note = effectNotes[abbr] ?? '';
+    const tokensStyle = tinted && !flow.plain ? tokensBalance.style : '';
+    const unitsStyle = tinted && !flow.plain ? unitsBalance.style : '';
     // A row that mixes models has no single rate: show tokens → units and one line per model.
     const how = mixed
       ? `${abbr}: ${compact(tokens)} t → ${compact(units)} u (mixed models)\n${modelBreakdown(entries, pick)}`
-      : `${abbr}: ${compact(tokens)} t × ${effectiveRate(units, tokens)} = ${compact(units)} u`;
+      : (abbr === 'CR' || abbr === 'CW') && singleModel && tokens > 0
+        ? // units = tokens × model weight × cache multiplier; the multiplier is what is left of the billed rate.
+          `${abbr} = ${compact(tokens)} t × ${Number(modelWeight(singleModel).toPrecision(3))} × ${effectiveRate(units / modelWeight(singleModel), tokens)} = ${compact(units)} u`
+        : `${abbr}: ${compact(tokens)} t × ${effectiveRate(units, tokens)} = ${compact(units)} u`;
     const tokensTitle = `${abbr}: ${compact(tokens)} t ${tokensStyle === AMBER_STYLE ? AMBER_NOTE : ''}`.trim();
     const unitsTitle = `${how}. ${note} ${unitsStyle === AMBER_STYLE ? AMBER_NOTE : ''} ${unpricedNote(unpriced)}`.replace(/[^\S\n]+/g, ' ').trim();
     return `<td class="cache-col"><div class="cache-val"${tokensStyle} title="${escapeHtml(tokensTitle)}">${compact(tokens)} ${TOKENS_ABBR}</div><div class="cache-val"${unitsStyle} title="${escapeHtml(unitsTitle)}">${compact(units)} ${UNITS_ABBR}</div></td>`;
@@ -579,7 +587,7 @@ function flowCells(
   );
   const rawTitle = escapeHtml(`Raw = the requests as Claude Code built them, before the proxy\n= ${full(flow.rawTokens)} t`);
 
-  return `${modelCell(entries)}<td class="num" title="${rawTitle}">${compact(flow.rawTokens)}</td>
+  return `<td class="num" title="${rawTitle}">${compact(flow.rawTokens)}</td>
     ${step(afterCleanup, flow.prunedNorm, flow.rawTokens)}
     ${summaryColumnCell(flow.comp, flow.reused, flow.skipped)}
     <td class="num" title="${escapeHtml(sentTitle)}">${compact(flow.sent)}</td>
@@ -613,7 +621,27 @@ function cacheBalanceStyle(reads: number, writes: number, basis: string): { styl
   return { style: '', note: '' };
 }
 
-function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: number | string, withDate = false, chatId?: string, holdDone = false): string {
+/**
+ * What sits under the repo name: the terminal the turn ran in (`Terminal #N`), with the chat as its tooltip, or just the chat
+ * (`chat 2710`) for rows from before terminals were recorded. `extra` goes in front (a ping's own label).
+ */
+export function sourceSub(group: Pick<TurnGroup, 'sessionId' | 'terminalKey'>, terminals: ReadonlyMap<string, TerminalInfo> | undefined, extra?: string): string {
+  const chat = group.sessionId ? `chat ${group.sessionId.slice(0, 4)}` : undefined;
+  const chatTitle = group.sessionId ? `${chat} · Claude Code chat ${group.sessionId}` : undefined;
+  if (group.terminalKey) {
+    const info = terminals?.get(group.terminalKey);
+    const label = terminalLabel(info);
+    const title = [chatTitle, info?.number === undefined ? 'This terminal is no longer open (or belongs to another window).' : undefined].filter(Boolean).join('\n');
+    return `<div class="turn-sub"${title ? ` title="${escapeHtml(title)}"` : ''}>${extra ? `${escapeHtml(extra)} · ` : ''}${escapeHtml(label)}</div>`;
+  }
+  // A ping from before terminals were recorded never showed its chat; it keeps showing just its own label.
+  if (extra) {
+    return `<div class="turn-sub">${escapeHtml(extra)}</div>`;
+  }
+  return chat ? `<div class="turn-sub" title="${escapeHtml(chatTitle as string)}">${escapeHtml(chat)}</div>` : '';
+}
+
+function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: number | string, withDate = false, chatId?: string, holdDone = false, terminals?: ReadonlyMap<string, TerminalInfo>): string {
   // `holdDone`: the turn already finished; its live request shows as a hit but the row stays done.
   const isLive = live !== undefined && !holdDone;
   const s = aggregate(group.entries);
@@ -657,7 +685,7 @@ function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: n
   const parent = chatId ? ` data-parent="${escapeHtml(chatId)}"` : '';
   return `<tr${classes ? ` class="${classes}"` : ''}${parent} data-row="${key}" data-toggle="${key}">
     ${timeCell(Date.parse(group.entries[group.entries.length - 1].timestamp), isLive ? live?.since : undefined, true, withDate)}
-    <td>${escapeHtml(group.project)}${group.sessionId ? `<div class="turn-sub" title="${escapeHtml(`Claude Code chat ${group.sessionId}`)}">chat ${escapeHtml(group.sessionId.slice(0, 4))}</div>` : ''}</td>
+    <td>${escapeHtml(group.project)}${sourceSub(group, terminals)}</td>
     <td>${statusCell}</td>
     <td class="num">1</td>
     <td class="num">${hits}</td>
@@ -666,7 +694,7 @@ function turnRow(group: TurnGroup, live: InFlightProject | undefined, ordinal: n
 }
 
 /** A cache keep-alive ping: one turn of one hit, marked with a pulse so it is not mistaken for a prompt. */
-function pingRow(group: TurnGroup, ordinal: number | string, withDate: boolean): string {
+function pingRow(group: TurnGroup, ordinal: number | string, withDate: boolean, terminals?: ReadonlyMap<string, TerminalInfo>): string {
   const entry = group.entries[0];
   const s = aggregate([entry]);
   const flow = flowCells(s, {
@@ -677,12 +705,13 @@ function pingRow(group: TurnGroup, ordinal: number | string, withDate: boolean):
     skipped: skippedOf([entry]),
     sent: s.estimatedTokens,
     entries: [entry],
+    plain: true, // a ping is upkeep, not a turn: no tint on its figures
   });
   const failed = isFailedHit(entry);
   const title = failed ? 'Cache keep-alive ping failed' : 'Cache keep-alive ping: a one-token request that keeps the prompt cache from expiring';
   return `<tr class="ping-row" data-row="${escapeHtml(group.project)}#${ordinal}">
     ${timeCell(Date.parse(entry.timestamp), undefined, true, withDate)}
-    <td>${escapeHtml(group.project)}<div class="turn-sub">keep-alive ping</div></td>
+    <td>${escapeHtml(group.project)}${sourceSub(group, terminals, 'Ping')}</td>
     <td><span class="ping-icon${failed ? ' ping-failed' : ''}" title="${escapeHtml(title)}"></span></td>
     <td class="num">1</td>
     <td class="num">1</td>
@@ -708,7 +737,7 @@ function hitRow(entry: LedgerEntry, turnKey: string, index: number, chatId?: str
     : `<span style="color:${COLORS.good}" title="Done">✔</span>`;
   return `<tr class="hit-row" data-row="${turnKey}/h${index}" data-parent="${turnKey}"${chatId ? ` data-ancestors="${escapeHtml(chatId)}"` : ''}>
     <td></td>
-    <td class="hit-label" title="${escapeHtml(`${new Date(entry.timestamp).toLocaleString()} · ${entry.servedModel ?? ''}`)}">↳ hit ${index + 1}</td>
+    <td class="hit-label" title="${escapeHtml(`${new Date(entry.timestamp).toLocaleString()} · ${entry.servedModel ?? ''}`)}">↳ hit ${index + 1}<div class="turn-sub">${escapeHtml(shortModel(entry.servedModel))}</div></td>
     <td>${statusCell}</td>
     <td></td>
     <td class="num">1</td>
@@ -878,12 +907,12 @@ function compactionSection(entries: readonly LedgerEntry[]): string {
  */
 function savingView(stats: AggregateStats): { units: number; percent: number; mark: string } {
   return stats.floorTurns > 0
-    ? { units: stats.floorBaselineUnitCost - stats.floorActualUnitCost, percent: stats.floorSavingsPercent, mark: '≥ ' }
+    ? { units: stats.centralBaselineUnitCost - stats.floorActualUnitCost, percent: stats.centralSavingsPercent, mark: '~' }
     : { units: stats.baselineUnitCost - stats.actualUnitCost, percent: stats.savingsPercent, mark: '~' };
 }
 
 const SAVING_MARK_HELP =
-  '≥ at least, vs. the best client cache · ~ estimated';
+  '~ typical case, vs. a client reusing most of its cache';
 
 function recentTable(entries: readonly LedgerEntry[]): string {
   if (!entries.length) {

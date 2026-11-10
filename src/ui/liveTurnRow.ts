@@ -110,7 +110,7 @@ export function liveRow(project: string, live: InFlightProject, ordinal: number 
   const key = `${escapeHtml(project)}#${ordinal}`;
   const child = chatId ? ` turn-child" data-parent="${escapeHtml(chatId)}` : '';
   return (
-    `<tr class="turn-live${child}" data-row="${key}" data-toggle="${key}">${timeCell(undefined, live.since, true)}<td>${escapeHtml(project)}</td><td>${processingIcon(key)}</td><td class="num">1</td><td class="num">${live.count}</td><td></td>\n    ${liveCells(live)}</tr>` +
+    `<tr class="turn-live${child}" data-row="${key}" data-toggle="${key}">${timeCell(undefined, live.since, true)}<td>${escapeHtml(project)}</td><td>${processingIcon(key)}</td><td class="num">1</td><td class="num">${live.count}</td>\n    ${liveCells(live)}</tr>` +
     liveHitRows(key, live, chatId)
   );
 }
@@ -122,7 +122,7 @@ export function liveHitRows(turnKey: string, live: InFlightProject, chatId?: str
   for (let i = 0; i < live.count; i += 1) {
     const stage: InFlightStage | undefined = live.preflight[i];
     const one: InFlightProject = { count: 1, newTurn: false, since: live.since, preflight: stage ? [stage] : [] };
-    rows += `<tr class="hit-row turn-live" data-row="${turnKey}/L${i}" data-parent="${turnKey}"${ancestors}><td></td><td class="hit-label">↳ hit</td><td>${processingIcon(`${turnKey}/L${i}`)}</td><td></td><td class="num">1</td><td></td>\n    ${liveCells(one)}</tr>`;
+    rows += `<tr class="hit-row turn-live" data-row="${turnKey}/L${i}" data-parent="${turnKey}"${ancestors}><td></td><td class="hit-label">↳ hit</td><td>${processingIcon(`${turnKey}/L${i}`)}</td><td></td><td class="num">1</td>\n    ${liveCells(one)}</tr>`;
   }
   return rows;
 }

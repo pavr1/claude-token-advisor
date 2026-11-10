@@ -971,7 +971,8 @@ function applyPendingHistory(
   pending: PendingHistoryStore | undefined,
   store: SummaryStore | undefined,
   project: string,
-  now: number
+  now: number,
+  terminalKey?: string
 ): MessagesPayload | undefined {
   const messages = payload.messages ?? [];
   // The opening comes with a `role: "system"` note after it (14 of the 15 real openings in the ledger do), so "one message" counts the others only.
@@ -979,7 +980,7 @@ function applyPendingHistory(
   if (!pending || conversation.length !== 1 || !telemetry.isNewUserTurn || !isUserChatOpening(conversation[0], telemetry.originalModel)) {
     return undefined;
   }
-  const summaries = pending.take(project, now);
+  const summaries = pending.take(project, now, terminalKey);
   if (!summaries?.length) {
     return undefined;
   }
@@ -1551,6 +1552,8 @@ export async function optimizePayload(
     project?: string;
     /** Where a new day's summaries wait for the user's `/clear`. */
     pendingStore?: PendingHistoryStore;
+    /** Terminal that sent the request; a pending summary only follows the chat of the terminal that made it. */
+    terminalKey?: string;
     /** Clock for the cache and new-day checks (epoch ms); `Date.now` by default. */
     now?: () => number;
     /** The newest Sonnet and Haiku (see `ModelCatalog`); the fallback ones when the caller has none. */
@@ -1638,7 +1641,7 @@ export async function optimizePayload(
   // The SummaryStore is keyed by the first message as normalization left it, not as the client sent it.
   const compactionKey = hashMessages((payload.messages ?? []).slice(0, 1));
   if (config.enableCompaction) {
-    const handedOver = applyPendingHistory(payload, telemetry, options.pendingStore, options.summaryStore, projectKey, now);
+    const handedOver = applyPendingHistory(payload, telemetry, options.pendingStore, options.summaryStore, projectKey, now, options.terminalKey);
     payload = handedOver ?? (await applyCompaction(payload, config, options.summarize, telemetry, options.summaryStore));
   }
   if (options.baselineMemory && baselineKey !== undefined && telemetry.dayChange) {
@@ -1654,10 +1657,10 @@ export async function optimizePayload(
   if (options.pendingStore && telemetry.dayChange && telemetry.compactionTriggered) {
     const saved = options.summaryStore?.get(compactionKey);
     if (saved) {
-      options.pendingStore.set(projectKey, saved.summaries, now);
+      options.pendingStore.set(projectKey, saved.summaries, now, options.terminalKey);
     }
   }
-  telemetry.clearSuggested = options.pendingStore?.has(projectKey, now) === true;
+  telemetry.clearSuggested = options.pendingStore?.has(projectKey, now, options.terminalKey) === true;
   options.onStage?.({ prunedByCompaction: telemetry.prunedByCompaction, summaryCreated: telemetry.compactionTriggered });
 
   // Stage 3: smart model routing.

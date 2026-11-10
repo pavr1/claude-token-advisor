@@ -198,6 +198,8 @@ export interface LedgerEntry {
   accountId?: string;
   /** Claude Code's chat (`session_id`); absent on rows from before it was recorded. */
   sessionId?: string;
+  /** The terminal the chat ran in, as `<shellPid>@<shellStartMs>`; absent on rows from before it was recorded. One terminal can hold several chats (`/clear` starts a new one). */
+  terminalKey?: string;
   /** When the request reached the proxy (epoch ms). `timestamp` is when it finished, which can fall after a prompt the request never saw. */
   startedAt?: number;
   /** The model's `stop_reason`; `tool_use` means the turn goes on after local tools run. */
@@ -824,8 +826,12 @@ export interface AggregateStats {
   outputTokens: number;
   modelSwaps: number;
   compactions: number;
+  /** Billed cost incl. pings. A ping enters `baselineUnitCost` at its own cost, so it saves 0 units. */
   baselineUnitCost: number;
   actualUnitCost: number;
+  /** Baseline and actual of the rows that count toward savings (keep-alive pings left out); `savingsPercent` is computed from these. */
+  savingsBaselineUnitCost: number;
+  savingsActualUnitCost: number;
   savingsPercent: number;
   /** Turns that carry a floor baseline; the others predate it and are left out of the floor figures. */
   floorTurns: number;
@@ -880,6 +886,8 @@ export function emptyStats(): AggregateStats {
     compactions: 0,
     baselineUnitCost: 0,
     actualUnitCost: 0,
+    savingsBaselineUnitCost: 0,
+    savingsActualUnitCost: 0,
     savingsPercent: 0,
     floorTurns: 0,
     floorBaselineUnitCost: 0,
@@ -944,16 +952,26 @@ export function aggregate(entries: readonly LedgerEntry[]): AggregateStats {
     stats.outputTokens += entry.outputTokens;
     stats.modelSwaps += entry.modelSwapped ? 1 : 0;
     stats.compactions += entry.compactionTriggered ? 1 : 0;
-    stats.baselineUnitCost += entry.baselineUnitCost;
+    // A keep-alive ping is billed (it counts in `actualUnitCost`) but saves nothing: it keeps the cache warm, and the
+    // client would not have sent it. Older rows recorded it against an uncached baseline (~95% "saved"), so it is
+    // neutralized here, not in the ledger: baseline = its own cost, and out of every savings percentage.
+    const ping = isKeepAlivePing(entry);
+    stats.baselineUnitCost += ping ? entry.actualUnitCost : entry.baselineUnitCost;
     stats.actualUnitCost += entry.actualUnitCost;
-    if (entry.floorBaselineUnitCost !== undefined) {
+    if (!ping) {
+      stats.savingsBaselineUnitCost += entry.baselineUnitCost;
+      stats.savingsActualUnitCost += entry.actualUnitCost;
+    }
+    if (!ping && entry.floorBaselineUnitCost !== undefined) {
       stats.floorTurns += 1;
       stats.floorBaselineUnitCost += entry.floorBaselineUnitCost;
       stats.centralBaselineUnitCost += entry.centralBaselineUnitCost ?? entry.floorBaselineUnitCost;
       stats.floorActualUnitCost += entry.actualUnitCost;
     }
-    stats.cacheNoCacheUnitCost += entry.cacheNoCacheUnitCost;
-    stats.cacheActualUnitCost += entry.cacheActualUnitCost;
+    if (!ping) {
+      stats.cacheNoCacheUnitCost += entry.cacheNoCacheUnitCost;
+      stats.cacheActualUnitCost += entry.cacheActualUnitCost;
+    }
     stats.summarizerUnitCost += entry.summarizerUnitCost ?? 0;
     const units = entryUnits(entry);
     stats.cacheReadUnits += units.read;
@@ -961,7 +979,9 @@ export function aggregate(entries: readonly LedgerEntry[]): AggregateStats {
     // Full price per token of this hit's model, recovered from the no-cache figure it was recorded with.
     const cachedTokens = (entry.cacheReadTokens ?? 0) + (entry.cacheWriteTokens ?? 0);
     const fullPrice = cachedTokens > 0 ? entry.cacheNoCacheUnitCost / cachedTokens : 0;
-    stats.cacheReadSavedUnits += (entry.cacheReadTokens ?? 0) * fullPrice - units.read;
+    if (!ping) {
+      stats.cacheReadSavedUnits += (entry.cacheReadTokens ?? 0) * fullPrice - units.read;
+    }
     stats.cacheWritePremiumUnits += units.write - (entry.cacheWriteTokens ?? 0) * fullPrice;
     stats.regularInputUnits += units.regular;
     stats.outputUnits += units.output;
@@ -973,8 +993,8 @@ export function aggregate(entries: readonly LedgerEntry[]): AggregateStats {
     }
   }
 
-  if (stats.baselineUnitCost > 0) {
-    stats.savingsPercent = (1 - stats.actualUnitCost / stats.baselineUnitCost) * 100;
+  if (stats.savingsBaselineUnitCost > 0) {
+    stats.savingsPercent = (1 - stats.savingsActualUnitCost / stats.savingsBaselineUnitCost) * 100;
   }
   if (stats.floorBaselineUnitCost > 0) {
     stats.floorSavingsPercent = (1 - stats.floorActualUnitCost / stats.floorBaselineUnitCost) * 100;
@@ -1018,6 +1038,8 @@ export interface TurnGroup {
   project: string;
   /** The chat this turn belongs to, when the ledger recorded one. */
   sessionId?: string;
+  /** The terminal this turn ran in, when the ledger recorded one. */
+  terminalKey?: string;
   entries: LedgerEntry[];
   /** A cache keep-alive ping: a row of its own, one turn of one hit, never part of a typed prompt's turn. */
   ping?: boolean;
@@ -1037,7 +1059,7 @@ export function groupTurns(entries: readonly LedgerEntry[]): TurnGroup[] {
     // A ping never joins a prompt's turn, and does not end the one in progress: the next hit of that
     // prompt still lands in its own turn.
     if (isKeepAlivePing(entry)) {
-      groups.push({ project: entry.project, sessionId: entry.sessionId, entries: [entry], ping: true });
+      groups.push({ project: entry.project, sessionId: entry.sessionId, terminalKey: entry.terminalKey, entries: [entry], ping: true });
       continue;
     }
     const key = `${entry.project}|${entry.sessionId ?? ''}`;
@@ -1046,7 +1068,7 @@ export function groupTurns(entries: readonly LedgerEntry[]): TurnGroup[] {
       current.entries.push(entry);
       continue;
     }
-    const group: TurnGroup = { project: entry.project, sessionId: entry.sessionId, entries: [entry] };
+    const group: TurnGroup = { project: entry.project, sessionId: entry.sessionId, terminalKey: entry.terminalKey, entries: [entry] };
     groups.push(group);
     open.set(key, group);
   }

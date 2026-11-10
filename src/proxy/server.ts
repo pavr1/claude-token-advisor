@@ -20,6 +20,7 @@ import { upstreamFetch } from './upstreamClient';
 import { buildLocalSummary } from './localSummary';
 import { summarizeWithAgent, runClaudeAgent, type AgentRunner } from './agentSummary';
 import { chatKey, sessionIdOf, KeepAlive, KeepAliveSnapshot, PingResult } from './keepAlive';
+import { isShellRunning, type ClientProcess } from './clientProcess';
 import {
   DEFAULT_OPTIMIZER_CONFIG,
   hasToolResults,
@@ -137,6 +138,10 @@ export interface ProxyConfig {
   keepAliveMaxMinutes?: number;
   /** Test hook: time between pings. */
   keepAliveIntervalMs?: number;
+  /** Pids of this window's terminal shells, to check a request's client against (diagnostic log only). */
+  terminalPids?: () => Promise<number[]>;
+  /** Which process (and terminal) sent a request, from its source port. Unset: requests carry no terminal. */
+  identifyClient?: (srcPort: number, proxyPort: number) => Promise<ClientProcess | undefined>;
   /** Where the newest Sonnet and Haiku found last time are kept; in memory only when unset. */
   modelCatalogPath?: string;
   /** Ask Anthropic for the newest Sonnet and Haiku (default); false keeps the built-in ones. */
@@ -180,6 +185,8 @@ export interface TurnRecord {
   project: string | undefined;
   /** Claude Code's chat (`session_id`), when the request carried one. */
   sessionId?: string;
+  /** The terminal the chat runs in (shell pid and start time), when the proxy could work it out. */
+  terminalKey?: string;
   /** When the request reached the proxy (epoch ms); the ledger timestamp is when it finished. */
   startedAt?: number;
   /** Why the model stopped: `tool_use` means the client now runs local tools and sends another hit. */
@@ -266,7 +273,7 @@ export interface ProxyObserver {
   /** 5.3: a fresh session/weekly rate-limit reading arrived on a Messages response. */
   onRateLimitUpdate?: (info: UnifiedRateLimitSnapshot) => void;
   /** A cache keep-alive ping was sent on the user's behalf; `usage` is what it cost. */
-  onKeepAlive?: (ping: { project: string | undefined; sessionId?: string; model: string; usage: ApiUsage | undefined; status: number }) => void;
+  onKeepAlive?: (ping: { project: string | undefined; sessionId?: string; terminalKey?: string; model: string; usage: ApiUsage | undefined; status: number }) => void;
   /** A window running a newer extension version than any announced so far joined (or this proxy's own window announced). */
   onExtensionVersion?: (version: string) => void;
 }
@@ -462,6 +469,7 @@ export class TokenImproverProxy {
       intervalMs: config.keepAliveIntervalMs,
       lifetimeMs: () => cacheTtlMs(this.config.optimizer.cacheTtl),
       log,
+      shouldPing: (snapshot) => isShellRunning(snapshot.terminalKey),
       send: (snapshot, body) => this.sendPing(snapshot, body),
       onPing: (snapshot, result, count) => {
         const usage = result.usage as ApiUsage | undefined;
@@ -469,7 +477,7 @@ export class TokenImproverProxy {
           `keep-alive #${count} [${snapshot.project ?? '-'}]: cacheRead=${usage?.cache_read_input_tokens ?? 0} ` +
             `cacheWrite=${usage?.cache_creation_input_tokens ?? 0} uncached=${usage?.input_tokens ?? 0}`
         );
-        this.observer.onKeepAlive?.({ project: snapshot.project, sessionId: snapshot.sessionId, model: result.model ?? '', usage, status: result.status });
+        this.observer.onKeepAlive?.({ project: snapshot.project, sessionId: snapshot.sessionId, terminalKey: snapshot.terminalKey, model: result.model ?? '', usage, status: result.status });
       },
     });
     this.summaryStore = new SummaryStore(undefined, config.summaryStorePath);
@@ -617,7 +625,14 @@ export class TokenImproverProxy {
     const requestId = String(++this.requestSeq);
     res.locals['requestId'] = requestId;
     const startedAt = Date.now();
-    this.keepAlive.cancel(chatKey(original, project));
+    const keepAliveKey = chatKey(original, project);
+    this.keepAlive.begin(keepAliveKey);
+    // Which terminal sent it is worked out beside the request; a turn is reported once it is known (or known to be unknowable).
+    const clientReady = this.identifyClient(req, res, project, keepAliveKey);
+    let clientDone = !this.config.identifyClient;
+    void clientReady.then(() => {
+      clientDone = true;
+    });
     this.observer.onRequestStart?.(project, !hasToolResults(original), requestId, sessionIdOf(original));
 
     // Exactly one completion per start, whichever path the request takes out.
@@ -629,7 +644,20 @@ export class TokenImproverProxy {
       }
       settled = true;
       this.checkCacheLifetime(record.usage);
-      this.observer.onTurnComplete({ ...record, project, sessionId: sessionIdOf(original), startedAt, anthropicRequestId: res.locals['anthropicRequestId'] as string | undefined });
+      const deliver = (): void =>
+        this.observer.onTurnComplete({
+          ...record,
+          project,
+          sessionId: sessionIdOf(original),
+          terminalKey: res.locals['terminalKey'] as string | undefined,
+          startedAt,
+          anthropicRequestId: res.locals['anthropicRequestId'] as string | undefined,
+        });
+      if (clientDone) {
+        deliver();
+      } else {
+        void clientReady.then(deliver);
+      }
     };
 
     try {
@@ -651,6 +679,7 @@ export class TokenImproverProxy {
     } finally {
       // Backstop: a throw before any explicit settle still closes the turn.
       settle({ telemetry: telemetry ?? fallbackTelemetry(original), usage: undefined, status: 0 });
+      this.keepAlive.end(keepAliveKey);
     }
   }
 
@@ -692,6 +721,7 @@ export class TokenImproverProxy {
       summaryStore: this.summaryStore,
       baselineMemory: this.baselineMemory,
       pendingStore: this.pendingHistory,
+      terminalKey: res.locals['terminalKey'] as string | undefined,
       project: res.locals['project'] as string | undefined,
       cacheLastUsedAt: this.keepAlive.lastTouchedAt(chatKey(original, res.locals['project'] as string | undefined)),
       summarize: (messages) => this.summarizeHistory(messages),
@@ -750,6 +780,7 @@ export class TokenImproverProxy {
           headers: credentialHeaders(headers),
           project: res.locals['project'] as string | undefined,
           sessionId: sessionIdOf(original),
+          terminalKey: res.locals['terminalKey'] as string | undefined,
           usedAt,
         });
       }
@@ -795,6 +826,35 @@ export class TokenImproverProxy {
     settle({ telemetry, usage, status: upstream.status, stopReason });
     res.send(text);
     rememberForKeepAlive();
+  }
+
+  /**
+   * Work out which terminal sent this request and leave it in `res.locals['terminalKey']`; log what was found. Never rejects,
+   * and never holds the request back: the turn is reported to the ledger once this settles.
+   */
+  private async identifyClient(req: Request, res: Response, project: string | undefined, chat: string): Promise<void> {
+    try {
+      const srcPort = req.socket.remotePort;
+      if (!srcPort || !this.config.identifyClient) {
+        return;
+      }
+      const client = await this.config.identifyClient(srcPort, this.config.port);
+      if (client?.terminalKey) {
+        res.locals['terminalKey'] = client.terminalKey;
+      }
+      if (!client) {
+        this.log(`client [${project ?? '-'}] chat ${chat.slice(0, 4)}: srcPort=${srcPort} not resolved`);
+        return;
+      }
+      const terminals = this.config.terminalPids ? await this.config.terminalPids() : undefined;
+      const match = client.shellPid === undefined || !terminals ? 'n/a' : terminals.includes(client.shellPid) ? 'yes' : 'no';
+      this.log(
+        `client [${project ?? '-'}] chat ${chat.slice(0, 4)}: srcPort=${srcPort} claude=${client.claudePid ?? '-'} ` +
+          `shell=${client.shellPid ?? '-'} terminal=${client.terminalKey ?? '-'} terminal.processId match=${match} chain=${client.chain.join(' <- ')}`
+      );
+    } catch {
+      // no terminal for this request: the ledger falls back to the chat
+    }
   }
 
   /** Replay the last request with one output token to renew its cache; never touches the client. */

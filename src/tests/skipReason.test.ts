@@ -79,8 +79,8 @@ test('a hit with no recorded reason keeps the plain tooltip', () => {
 test('the arrow column is wider and centered, and Cached gave up the space', () => {
   const html = render([hit(1)]);
   const widths = [...(/<colgroup>([\s\S]*?)<\/colgroup>/.exec(html)?.[1] ?? '').matchAll(/width:([\d.]+)%/g)].map((m) => Number(m[1]));
-  assert.equal(widths.length, 17);
-  // Order: Date, Repo, Status, Turns, Hits, Raw, Cleanup, Summarized, Estimate, arrow, Received, CR, CW, RI, Out, Billed, Model.
+  assert.equal(widths.length, 16);
+  // Order: Date, Repo, Status, Turns, Hits, Raw, Cleanup, Summarized, Estimate, arrow, Received, CR, CW, RI, Out, Billed.
   assert.ok(widths[9] > 3, 'arrow column should be wider than before');
   assert.ok(widths[11] + widths[12] + widths[13] < 23, 'CR, CW and RI together should have given space up');
   assert.ok(widths[0] >= 12, 'Date must fit the time');

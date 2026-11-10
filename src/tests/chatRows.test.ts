@@ -82,13 +82,17 @@ test('a keep-alive ping is a row of its own, one turn and one hit, and never joi
   const html = render(entries);
   assert.equal((html.match(/class="ping-row"/g) ?? []).length, 1);
   assert.match(html, /class="ping-icon"/);
-  assert.match(html, /keep-alive ping<\/div>/);
+  assert.match(html, /Ping<\/div>/);
   const row = html.slice(html.indexOf('class="ping-row"'));
   const cells = cellsOf(row);
   assert.match(cells[3], />1</);
   assert.match(cells[4], />1</);
   // A ping has nothing to expand, and the prompt's row counts only its own two hits.
   assert.doesNotMatch(row.slice(0, row.indexOf('</tr>')), /data-toggle/);
+  // A ping carries no colour: its figures are never tinted, while the prompt's own row still is.
+  const pingHtml = row.slice(0, row.indexOf('</tr>'));
+  assert.doesNotMatch(pingHtml, /background:rgba/);
+  assert.doesNotMatch(pingHtml, /style="color:/);
   const prompt = html.slice(html.indexOf('data-row="repo#1"'));
   assert.match(cellsOf(prompt)[4], />2</);
 });

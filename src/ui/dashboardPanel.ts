@@ -6,7 +6,7 @@
  * independently.
  */
 
-import { clearBannerHtml } from './clearNotice';
+import { clearBannerHtml, clearDoneBannerHtml } from './clearNotice';
 import * as vscode from 'vscode';
 import { AnalyticsTracker } from '../analytics/tracker';
 import { RealCostTracker } from '../analytics/realCostTracker';
@@ -18,6 +18,77 @@ import { CHART_HIGHLIGHT_SCRIPT, HOVER_TOOLTIP_SCRIPT, htmlDocument, makeNonce, 
 
 export type DashboardTab = 'budget' | 'improver';
 
+/** The in-page patcher: makes the live DOM match new markup in place. Exported so a test can run it on a real DOM. Expects `document` and `CLIENT_CLASSES` in scope; defines `morphChildren`. */
+export const PATCH_SCRIPT = `
+  // ---- in-place patching: make the live DOM match the new markup without replacing untouched nodes ----
+  // What identifies an element across updates. A node that appears or disappears (the "New day" banner) shifts
+  // its siblings by one place, and without a key an element would be paired with a different one and keep its classes.
+  function keyOf(n) {
+    if (n.nodeType !== 1) return null;
+    return n.getAttribute('data-row') || n.getAttribute('data-panel') || n.getAttribute('data-tab') || (n.classList.contains('clear-banner') ? 'clear-banner' : null);
+  }
+  function sameNode(a, b) {
+    if (a.nodeType !== b.nodeType || a.nodeName !== b.nodeName) return false;
+    return a.nodeType !== 1 || keyOf(a) === keyOf(b);
+  }
+  function syncAttrs(a, b) {
+    Array.prototype.slice.call(a.attributes).forEach(function (attr) {
+      if (attr.name !== 'class' && !b.hasAttribute(attr.name)) a.removeAttribute(attr.name);
+    });
+    Array.prototype.forEach.call(b.attributes, function (attr) {
+      if (attr.name === 'class') return;
+      if (a.getAttribute(attr.name) !== attr.value) a.setAttribute(attr.name, attr.value);
+    });
+    // Tabs and panes are switched on the page itself; everything else takes the new classes plus its own client ones.
+    // Judged on the new markup: the attributes were just copied, so asking the live node would always say yes.
+    if (b.hasAttribute('data-tab') || b.hasAttribute('data-panel')) return;
+    const keep = CLIENT_CLASSES.filter(function (c) { return a.classList.contains(c); });
+    const cls = (b.getAttribute('class') || '').split(' ').filter(function (c) { return c && CLIENT_CLASSES.indexOf(c) < 0; }).concat(keep).join(' ');
+    if ((a.getAttribute('class') || '') !== cls) { if (cls) a.setAttribute('class', cls); else a.removeAttribute('class'); }
+  }
+  function morph(a, b) {
+    if (a.nodeType === 3 || a.nodeType === 8) {
+      if (a.nodeValue !== b.nodeValue) a.nodeValue = b.nodeValue;
+      return;
+    }
+    syncAttrs(a, b);
+    const tag = a.nodeName;
+    const focused = document.activeElement === a;
+    if (tag === 'INPUT') {
+      if (!focused) a.value = b.getAttribute('value') || '';
+      return;
+    }
+    if (tag === 'SELECT') {
+      // Rewriting the options of a dropdown that is open would close it: leave it alone unless they differ.
+      if (a.innerHTML === b.innerHTML) return;
+      const chosen = a.value;
+      morphChildren(a, b);
+      if (focused) a.value = chosen; else a.value = b.value;
+      return;
+    }
+    morphChildren(a, b);
+  }
+  function morphChildren(a, b) {
+    const want = Array.prototype.slice.call(b.childNodes);
+    for (let i = 0; i < want.length; i++) {
+      const next = want[i];
+      const cur = a.childNodes[i];
+      if (!cur) { a.appendChild(next.cloneNode(true)); continue; }
+      if (sameNode(cur, next)) { morph(cur, next); continue; }
+      // A keyed row that moved: pull the matching one forward instead of rebuilding it.
+      let match = null;
+      if (next.nodeType === 1 && keyOf(next)) {
+        for (let j = i + 1; j < a.childNodes.length; j++) {
+          if (sameNode(a.childNodes[j], next)) { match = a.childNodes[j]; break; }
+        }
+      }
+      if (match) { a.insertBefore(match, cur); morph(match, next); }
+      else a.insertBefore(next.cloneNode(true), cur);
+    }
+    while (a.childNodes.length > want.length) a.removeChild(a.lastChild);
+  }
+`;
+
 export class DashboardPanel {
   private static current: DashboardPanel | undefined;
   private static latestRateLimit: UnifiedRateLimitSnapshot | undefined;
@@ -25,6 +96,8 @@ export class DashboardPanel {
   private static clearPending = false;
   /** When the chat the summary belongs to started (epoch ms), when it is known. */
   private static clearSince: number | undefined;
+  /** The summary was just delivered: a green confirmation banner instead of the "run /clear" one. */
+  private static clearDone = false;
 
   private readonly panel: vscode.WebviewPanel;
   private readonly tracker: AnalyticsTracker;
@@ -57,7 +130,7 @@ export class DashboardPanel {
     );
 
     this.panel.webview.onDidReceiveMessage(
-      (message: { type?: string; project?: string; status?: string; range?: string; from?: string; to?: string; tab?: string; more?: boolean }) => {
+      (message: { type?: string; project?: string; terminal?: string; status?: string; range?: string; from?: string; to?: string; tab?: string; more?: boolean }) => {
         if (message?.type === 'more') {
           this.filters = { ...this.filters, chats: (this.filters.chats ?? CHATS_PAGE) + CHATS_PAGE };
           this.render();
@@ -65,6 +138,8 @@ export class DashboardPanel {
           const range = message.range;
           this.filters = {
             project: message.project ?? this.filters.project,
+            // A terminal belongs to the repo it was chosen under: changing the repo clears it.
+            terminal: message.project !== undefined && message.project !== this.filters.project ? ALL : message.terminal ?? this.filters.terminal,
             status: message.status ?? this.filters.status,
             range: range === 'today' || range === 'yesterday' || range === '7d' || range === 'month' || range === 'lastMonth' || range === 'custom' ? range : this.filters.range,
             from: message.from ?? this.filters.from,
@@ -149,6 +224,15 @@ export class DashboardPanel {
     DashboardPanel.current?.render();
   }
 
+  /** Show or take down the green "summary delivered" banner. Re-renders in place if the panel is open. */
+  static setClearDone(done: boolean): void {
+    if (DashboardPanel.clearDone === done) {
+      return;
+    }
+    DashboardPanel.clearDone = done;
+    DashboardPanel.current?.render();
+  }
+
   /** Fresh session/weekly rate-limit reading (Pro/Max/Team). Re-renders in place if the panel is open. */
   static updateRateLimit(info: UnifiedRateLimitSnapshot | undefined): void {
     // Remembered even while the panel is closed, so one opened later starts with it.
@@ -194,7 +278,7 @@ export class DashboardPanel {
     return `${loading ? `<div class="page-loading"><h1 class="page-welcome">Welcome to Claude Budget Advisor</h1>${processingIcon('page')}<div class="page-loading-text">Loading data<span class="dots"></span></div></div>` : ''}
   <div class="page-content${loading ? ' page-hidden' : ''}">
   ${buildAccountHeaderHtml(this.summary, this.rateLimit)}
-  ${DashboardPanel.clearPending ? clearBannerHtml(DashboardPanel.clearSince) : ''}
+  ${DashboardPanel.clearPending ? clearBannerHtml(DashboardPanel.clearSince) : DashboardPanel.clearDone ? clearDoneBannerHtml() : ''}
   <div class="tabs">
     ${showBudget ? `<button class="tab${budgetActive ? ' active' : ''}" data-tab="budget">Budget</button>` : ''}
     <button class="tab${budgetActive ? '' : ' active'}" data-tab="improver">Token Improver</button>
@@ -214,7 +298,7 @@ ${CHART_HIGHLIGHT_SCRIPT}
 (function () {
   const vscode = acquireVsCodeApi();
   const root = document.getElementById('root');
-  const FILTERS = ['project', 'status', 'range', 'from', 'to'];
+  const FILTERS = ['project', 'terminal', 'status', 'range', 'from', 'to'];
   // Classes the page itself toggles (expanded turns, the running flash): an update never takes them off.
   const CLIENT_CLASSES = ['open-turn', 'open', 'flash', 'tips-open'];
 
@@ -319,66 +403,7 @@ ${CHART_HIGHLIGHT_SCRIPT}
     if (event.target.classList) event.target.classList.remove('flash');
   });
 
-  // ---- in-place patching: make the live DOM match the new markup without replacing untouched nodes ----
-  function sameNode(a, b) {
-    if (a.nodeType !== b.nodeType || a.nodeName !== b.nodeName) return false;
-    return a.nodeType !== 1 || a.getAttribute('data-row') === b.getAttribute('data-row');
-  }
-  function syncAttrs(a, b) {
-    Array.prototype.slice.call(a.attributes).forEach(function (attr) {
-      if (attr.name !== 'class' && !b.hasAttribute(attr.name)) a.removeAttribute(attr.name);
-    });
-    Array.prototype.forEach.call(b.attributes, function (attr) {
-      if (attr.name === 'class') return;
-      if (a.getAttribute(attr.name) !== attr.value) a.setAttribute(attr.name, attr.value);
-    });
-    // Tabs and panes are switched on the page itself; everything else takes the new classes plus its own client ones.
-    if (a.hasAttribute('data-tab') || a.hasAttribute('data-panel')) return;
-    const keep = CLIENT_CLASSES.filter(function (c) { return a.classList.contains(c); });
-    const cls = (b.getAttribute('class') || '').split(' ').filter(function (c) { return c && CLIENT_CLASSES.indexOf(c) < 0; }).concat(keep).join(' ');
-    if ((a.getAttribute('class') || '') !== cls) { if (cls) a.setAttribute('class', cls); else a.removeAttribute('class'); }
-  }
-  function morph(a, b) {
-    if (a.nodeType === 3 || a.nodeType === 8) {
-      if (a.nodeValue !== b.nodeValue) a.nodeValue = b.nodeValue;
-      return;
-    }
-    syncAttrs(a, b);
-    const tag = a.nodeName;
-    const focused = document.activeElement === a;
-    if (tag === 'INPUT') {
-      if (!focused) a.value = b.getAttribute('value') || '';
-      return;
-    }
-    if (tag === 'SELECT') {
-      // Rewriting the options of a dropdown that is open would close it: leave it alone unless they differ.
-      if (a.innerHTML === b.innerHTML) return;
-      const chosen = a.value;
-      morphChildren(a, b);
-      if (focused) a.value = chosen; else a.value = b.value;
-      return;
-    }
-    morphChildren(a, b);
-  }
-  function morphChildren(a, b) {
-    const want = Array.prototype.slice.call(b.childNodes);
-    for (let i = 0; i < want.length; i++) {
-      const next = want[i];
-      const cur = a.childNodes[i];
-      if (!cur) { a.appendChild(next.cloneNode(true)); continue; }
-      if (sameNode(cur, next)) { morph(cur, next); continue; }
-      // A keyed row that moved: pull the matching one forward instead of rebuilding it.
-      let match = null;
-      if (next.nodeType === 1 && next.hasAttribute('data-row')) {
-        for (let j = i + 1; j < a.childNodes.length; j++) {
-          if (sameNode(a.childNodes[j], next)) { match = a.childNodes[j]; break; }
-        }
-      }
-      if (match) { a.insertBefore(match, cur); morph(match, next); }
-      else a.insertBefore(next.cloneNode(true), cur);
-    }
-    while (a.childNodes.length > want.length) a.removeChild(a.lastChild);
-  }
+  ${PATCH_SCRIPT}
 
   /** Flash the cells whose text changed since the last paint (Time, repo and status never flash). */
   function flashChanges() {

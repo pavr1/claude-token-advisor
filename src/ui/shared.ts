@@ -246,6 +246,7 @@ export const BASE_STYLES = `
   .tips li.tip-good { border-left-color: #3fc9b0; }
   .tips li.tip-info { border-left-color: #8a9bad; }
   .clear-banner { border: 1px solid #f2b84b; border-left-width: 4px; border-radius: 4px; padding: 8px 14px; margin: 10px 0; background: var(--vscode-inputValidation-warningBackground, rgba(242, 184, 75, 0.12)); }
+  .clear-banner.done { border-color: #3fb950; background: rgba(63, 185, 80, 0.14); }
   .clear-banner ol { margin: 6px 0 6px 20px; padding: 0; }
   .clear-banner code { font-family: var(--vscode-editor-font-family, monospace); background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.2)); padding: 0 4px; border-radius: 3px; }
   table { border-collapse: collapse; width: 100%; font-size: 0.8em; }
