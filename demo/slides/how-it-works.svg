@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" font-family="'Segoe UI', Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4a5a6a"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="900" fill="#ffffff"/>
+
+  <text x="800" y="58" text-anchor="middle" font-size="34" font-weight="700" fill="#1e2a35">What happens to one request, from Claude Code to Anthropic</text>
+  <text x="800" y="92" text-anchor="middle" font-size="19" fill="#5d6b78">A local proxy on this machine sits in between. Claude Code is only pointed at it; nothing else changes for the developer.</text>
+
+  <!-- Claude Code -->
+  <rect x="40" y="330" width="240" height="150" rx="16" fill="#eef3f7" stroke="#8a9bad" stroke-width="2"/>
+  <text x="160" y="378" text-anchor="middle" font-size="24" font-weight="700" fill="#1e2a35">Claude Code</text>
+  <text x="160" y="410" text-anchor="middle" font-size="16" fill="#4a5a6a">in the VS Code terminal</text>
+  <text x="160" y="436" text-anchor="middle" font-size="15" fill="#4a5a6a">sends its request to</text>
+  <text x="160" y="458" text-anchor="middle" font-size="15" font-family="Consolas, monospace" fill="#4a5a6a">127.0.0.1:4000</text>
+
+  <line x1="282" y1="405" x2="356" y2="405" stroke="#4a5a6a" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="319" y="388" text-anchor="middle" font-size="14" fill="#4a5a6a">raw</text>
+
+  <!-- Proxy container -->
+  <rect x="360" y="120" width="800" height="560" rx="18" fill="#f6fbfa" stroke="#3fc9b0" stroke-width="3"/>
+  <text x="392" y="158" font-size="22" font-weight="700" fill="#1f8f7b">Local proxy: five optimization stages, in this order</text>
+
+  <!-- Stage 0 -->
+  <rect x="384" y="180" width="752" height="88" rx="12" fill="#ffffff" stroke="#cfe9e4" stroke-width="2"/>
+  <circle cx="424" cy="224" r="20" fill="#3fc9b0"/><text x="424" y="231" text-anchor="middle" font-size="20" font-weight="700" fill="#ffffff">0</text>
+  <text x="462" y="213" font-size="20" font-weight="700" fill="#1e2a35">Default model</text>
+  <text x="462" y="238" font-size="16" fill="#4a5a6a">First request after the proxy starts: Opus becomes Sonnet.</text>
+  <text x="462" y="258" font-size="16" fill="#4a5a6a">Once per start; a model chosen with /model is respected.</text>
+  <text x="1120" y="213" text-anchor="end" font-size="16" font-weight="600" fill="#5d6b78">a default, not a limit</text>
+
+  <!-- Stage 1 -->
+  <rect x="384" y="278" width="752" height="88" rx="12" fill="#ffffff" stroke="#cfe9e4" stroke-width="2"/>
+  <circle cx="424" cy="322" r="20" fill="#3fc9b0"/><text x="424" y="329" text-anchor="middle" font-size="20" font-weight="700" fill="#ffffff">1</text>
+  <text x="462" y="311" font-size="20" font-weight="700" fill="#1e2a35">Clean-up</text>
+  <text x="462" y="336" font-size="16" fill="#4a5a6a">Strips extra whitespace and filler from the text.</text>
+  <text x="462" y="356" font-size="16" fill="#4a5a6a">The meaning is unchanged.</text>
+  <text x="1120" y="311" text-anchor="end" font-size="16" font-weight="600" fill="#5d6b78">removes 0.06 % of tokens</text>
+
+  <!-- Stage 2 (main saving) -->
+  <rect x="384" y="376" width="752" height="88" rx="12" fill="#fff7e6" stroke="#f2b84b" stroke-width="3"/>
+  <circle cx="424" cy="420" r="20" fill="#f2b84b"/><text x="424" y="427" text-anchor="middle" font-size="20" font-weight="700" fill="#1e1e1e">2</text>
+  <text x="462" y="409" font-size="20" font-weight="700" fill="#1e2a35">Haiku summary</text>
+  <text x="462" y="434" font-size="16" fill="#4a5a6a">Long history and a cold cache: the older messages become a short</text>
+  <text x="462" y="454" font-size="16" fill="#4a5a6a">summary written by Haiku, stored and reused. Only when it pays for itself.</text>
+  <text x="1120" y="409" text-anchor="end" font-size="17" font-weight="700" fill="#b87a00">main saving: 29 % of tokens</text>
+
+  <!-- Stage 3 -->
+  <rect x="384" y="474" width="752" height="88" rx="12" fill="#ffffff" stroke="#cfe9e4" stroke-width="2"/>
+  <circle cx="424" cy="518" r="20" fill="#3fc9b0"/><text x="424" y="525" text-anchor="middle" font-size="20" font-weight="700" fill="#ffffff">3</text>
+  <text x="462" y="507" font-size="20" font-weight="700" fill="#1e2a35">Model routing</text>
+  <text x="462" y="532" font-size="16" fill="#4a5a6a">Short, mechanical turns go to Haiku. Deliberately conservative:</text>
+  <text x="462" y="552" font-size="16" fill="#4a5a6a">a wrong downgrade costs more than it saves.</text>
+  <text x="1120" y="507" text-anchor="end" font-size="16" font-weight="600" fill="#5d6b78">model changed on 0.4 % of requests</text>
+
+  <!-- Stage 4 -->
+  <rect x="384" y="572" width="752" height="88" rx="12" fill="#ffffff" stroke="#cfe9e4" stroke-width="2"/>
+  <circle cx="424" cy="616" r="20" fill="#3fc9b0"/><text x="424" y="623" text-anchor="middle" font-size="20" font-weight="700" fill="#ffffff">4</text>
+  <text x="462" y="605" font-size="20" font-weight="700" fill="#1e2a35">Cache anchor</text>
+  <text x="462" y="630" font-size="16" fill="#4a5a6a">One cache breakpoint at the very end of the last message: each turn writes</text>
+  <text x="462" y="650" font-size="16" fill="#4a5a6a">its new tail once, and the next turn reads it back at a tenth of the price.</text>
+  <text x="1120" y="605" text-anchor="end" font-size="16" font-weight="600" fill="#5d6b78">96 % of cached tokens are reads</text>
+
+  <!-- Proxy -> Anthropic -->
+  <line x1="1162" y1="405" x2="1276" y2="405" stroke="#4a5a6a" stroke-width="3" marker-end="url(#arrow)"/>
+  <text x="1219" y="388" text-anchor="middle" font-size="14" fill="#4a5a6a">optimized</text>
+
+  <!-- Anthropic -->
+  <rect x="1280" y="330" width="280" height="150" rx="16" fill="#eef3f7" stroke="#8a9bad" stroke-width="2"/>
+  <text x="1420" y="378" text-anchor="middle" font-size="24" font-weight="700" fill="#1e2a35">Anthropic API</text>
+  <text x="1420" y="410" text-anchor="middle" font-size="16" fill="#4a5a6a">api.anthropic.com</text>
+  <text x="1420" y="436" text-anchor="middle" font-size="15" fill="#4a5a6a">answers and bills</text>
+  <text x="1420" y="458" text-anchor="middle" font-size="15" fill="#4a5a6a">the optimized request</text>
+
+  <!-- Keep-alive -->
+  <rect x="1280" y="520" width="280" height="140" rx="14" fill="#ffffff" stroke="#8a9bad" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="1420" y="552" text-anchor="middle" font-size="18" font-weight="700" fill="#1e2a35">Keep-alive</text>
+  <text x="1420" y="580" text-anchor="middle" font-size="15" fill="#4a5a6a">While you are idle, a tiny ping</text>
+  <text x="1420" y="601" text-anchor="middle" font-size="15" fill="#4a5a6a">every ~4.5 min keeps the cache</text>
+  <text x="1420" y="622" text-anchor="middle" font-size="15" fill="#4a5a6a">from expiring (up to 30 min).</text>
+  <line x1="1160" y1="590" x2="1278" y2="590" stroke="#8a9bad" stroke-width="2" stroke-dasharray="6 5"/>
+
+  <!-- Return path: read right to left, starting under Anthropic -->
+  <text x="1560" y="722" text-anchor="end" font-size="20" font-weight="700" fill="#1e2a35">And on the way back</text>
+
+  <rect x="1240" y="740" width="320" height="110" rx="14" fill="#eef3f7" stroke="#8a9bad" stroke-width="2"/>
+  <text x="1400" y="772" text-anchor="middle" font-size="18" font-weight="700" fill="#1e2a35">Response, streamed</text>
+  <text x="1400" y="800" text-anchor="middle" font-size="15" fill="#4a5a6a">goes back to Claude Code</text>
+  <text x="1400" y="821" text-anchor="middle" font-size="15" fill="#4a5a6a">byte for byte, untouched</text>
+
+  <line x1="1238" y1="795" x2="1164" y2="795" stroke="#4a5a6a" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="740" y="740" width="420" height="110" rx="14" fill="#f6fbfa" stroke="#3fc9b0" stroke-width="2"/>
+  <text x="950" y="772" text-anchor="middle" font-size="18" font-weight="700" fill="#1f8f7b">The proxy reads the real usage</text>
+  <text x="950" y="800" text-anchor="middle" font-size="15" fill="#4a5a6a">input · cache read · cache write · output,</text>
+  <text x="950" y="821" text-anchor="middle" font-size="15" fill="#4a5a6a">as Anthropic reports them</text>
+
+  <line x1="738" y1="795" x2="664" y2="795" stroke="#4a5a6a" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="340" y="740" width="320" height="110" rx="14" fill="#ffffff" stroke="#8a9bad" stroke-width="2"/>
+  <text x="500" y="772" text-anchor="middle" font-size="18" font-weight="700" fill="#1e2a35">Ledger, one row per request</text>
+  <text x="500" y="800" text-anchor="middle" font-size="15" fill="#4a5a6a">raw size, what was sent, billed units,</text>
+  <text x="500" y="821" text-anchor="middle" font-size="15" fill="#4a5a6a">and the cost without the proxy</text>
+
+  <line x1="338" y1="795" x2="264" y2="795" stroke="#4a5a6a" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="740" width="220" height="110" rx="14" fill="#ffffff" stroke="#3fc9b0" stroke-width="2"/>
+  <text x="150" y="772" text-anchor="middle" font-size="18" font-weight="700" fill="#1f8f7b">Dashboard</text>
+  <text x="150" y="800" text-anchor="middle" font-size="15" fill="#4a5a6a">and status bar,</text>
+  <text x="150" y="821" text-anchor="middle" font-size="15" fill="#4a5a6a">live (see the demo)</text>
+
+  <text x="800" y="885" text-anchor="middle" font-size="13" fill="#7a8794">Percentages: ledger, 1–28 Oct 2026, 8,949 requests, one user. Savings are measured against what the same requests would have billed without the proxy.</text>
+</svg>

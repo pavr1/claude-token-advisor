@@ -1,0 +1,385 @@
+{
+  "name": "claude-budget-advisor",
+  "displayName": "Claude Budget Advisor & Token Improver",
+  "description": "Tracks Claude Code project token pacing and monthly budget health, and runs a local optimizing proxy that prunes outgoing Anthropic Messages API traffic.",
+  "version": "0.2.124",
+  "publisher": "pablo-villalobos",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeBudgetAdvisor.showMenu",
+        "title": "Claude: Show Dashboard"
+      },
+      {
+        "command": "claudeBudgetAdvisor.showSummary",
+        "title": "Claude: Show Dashboard (Budget tab)"
+      },
+      {
+        "command": "claudeBudgetAdvisor.refresh",
+        "title": "Claude Budget Advisor: Refresh"
+      },
+      {
+        "command": "claudeTokenImprover.showAnalytics",
+        "title": "Claude: Show Dashboard (Token Improver tab)"
+      },
+      {
+        "command": "claudeTokenImprover.startProxy",
+        "title": "Claude Token Improver: Start Proxy"
+      },
+      {
+        "command": "claudeTokenImprover.stopProxy",
+        "title": "Claude Token Improver: Stop Proxy"
+      },
+      {
+        "command": "claudeTokenImprover.copyBaseUrl",
+        "title": "Claude Token Improver: Copy Proxy Base URL"
+      },
+      {
+        "command": "claudeTokenImprover.openLedger",
+        "title": "Claude Token Improver: Open Telemetry Ledger"
+      }
+    ],
+    "configuration": [
+      {
+        "title": "Claude Budget Advisor",
+        "properties": {
+          "claudeBudgetAdvisor.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Show budget pacing in the status bar and dashboard."
+          },
+          "claudeBudgetAdvisor.scope": {
+            "type": "string",
+            "enum": [
+              "all",
+              "project"
+            ],
+            "default": "all",
+            "description": "Count usage from all Claude projects, or only the project of the open workspace."
+          },
+          "claudeBudgetAdvisor.budget": {
+            "type": "number",
+            "default": 0,
+            "description": "Monthly token budget. 0 infers it from your usage history."
+          },
+          "claudeBudgetAdvisor.projectName": {
+            "type": "string",
+            "default": "",
+            "description": "Optional. Only used when scope is 'project'. Leave empty to detect it from the workspace folder."
+          },
+          "claudeBudgetAdvisor.baseDir": {
+            "type": "string",
+            "default": "",
+            "description": "Folder where Claude Code stores its sessions (read for monthly usage). Empty detects it from CLAUDE_CONFIG_DIR, your home folder or the claude CLI."
+          },
+          "claudeBudgetAdvisor.spendSource": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "mock",
+              "file",
+              "api",
+              "none"
+            ],
+            "default": "auto",
+            "description": "Where spend figures come from. 'auto' calls the Admin API when ANTHROPIC_ADMIN_KEY is set, otherwise uses the local estimate. 'mock' previews the layout with sample data."
+          },
+          "claudeBudgetAdvisor.spendLimitFile": {
+            "type": "string",
+            "default": "",
+            "description": "Optional path to a JSON payload from the spend limits endpoint. When set, its totals replace the local estimate."
+          },
+          "claudeBudgetAdvisor.refreshIntervalMinutes": {
+            "type": "number",
+            "default": 15,
+            "minimum": 0,
+            "description": "Minutes between automatic refreshes of the budget and dashboard. 0 disables them. It also refreshes after each completed turn, at most once a minute."
+          }
+        }
+      },
+      {
+        "title": "Claude Token Improver",
+        "properties": {
+          "claudeTokenImprover.autoStart": {
+            "type": "boolean",
+            "default": true,
+            "description": "Start the proxy when the extension activates."
+          },
+          "claudeTokenImprover.autoConfigureTerminals": {
+            "type": "boolean",
+            "default": true,
+            "description": "Set ANTHROPIC_BASE_URL in new VS Code terminals so Claude Code goes through the proxy. Terminals already open must be reopened."
+          },
+          "claudeTokenImprover.port": {
+            "type": "number",
+            "default": 4000,
+            "description": "Local port the proxy listens on (127.0.0.1 only)."
+          },
+          "claudeTokenImprover.upstreamBaseUrl": {
+            "type": "string",
+            "default": "https://api.anthropic.com",
+            "description": "Server the proxy forwards requests to. Change only for a gateway or test server."
+          },
+          "claudeTokenImprover.stage1Normalization": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 1. Trim whitespace and normalize line endings so cache prefixes match byte for byte."
+          },
+          "claudeTokenImprover.stage2Compaction": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 2. Remove greeting filler and, past the sliding threshold, replace the oldest history with a summary the proxy builds itself from the conversation (what was asked and answered, files touched, commands run). No model is called and it costs no tokens."
+          },
+          "claudeTokenImprover.stage3ModelRouting": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 3. Send short, mechanical turns to Haiku instead of the requested model."
+          },
+          "claudeTokenImprover.stage4CacheAnchor": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 4. Keep a single cache anchor on the last assistant turn; system and tools breakpoints are untouched."
+          },
+          "claudeTokenImprover.cacheTtl": {
+            "type": "string",
+            "enum": [
+              "5m",
+              "1h"
+            ],
+            "default": "5m",
+            "enumDescriptions": [
+              "Writes cost 1.25x. A keep-alive ping every ~4.5 minutes renews the cache for up to 30 minutes after your last request (setting keepAliveMaxMinutes), so it does not expire during normal pauses.",
+              "Writes cost 2x; the cache lasts 1 hour."
+            ],
+            "description": "Cache lifetime the proxy sets on every request. 1 h costs more per write but survives longer pauses."
+          },
+          "claudeTokenImprover.startupSonnetDefault": {
+            "type": "boolean",
+            "default": true,
+            "description": "Stage 0. If the first request after the proxy starts is Opus, send it to Sonnet. Later requests and models chosen with /model are not changed."
+          },
+          "claudeTokenImprover.slidingThresholdTokens": {
+            "type": "number",
+            "default": 15000,
+            "description": "History size, in tokens, that triggers a summary."
+          },
+          "claudeTokenImprover.warmCacheCompactionTokens": {
+            "type": "number",
+            "default": 300000,
+            "minimum": 0,
+            "description": "History size, in tokens, from which a summary is made even while the cache is warm (for example kept warm by the keep-alive), if the estimate says it pays for the cache rewrite. 0 turns it off."
+          },
+          "claudeTokenImprover.compactionFraction": {
+            "type": "number",
+            "default": 0.75,
+            "minimum": 0.1,
+            "maximum": 0.95,
+            "description": "The newest (1 - value) x threshold tokens of history stay verbatim; everything older is summarized. At 0.75 with a 15,000 threshold, the newest ~3,750 tokens are kept."
+          },
+          "claudeTokenImprover.expectedRequestsAfterCompaction": {
+            "type": "number",
+            "default": 10,
+            "minimum": 1,
+            "description": "Requests expected after a summary, used to decide if it pays for itself. A summary is skipped when its expected saving is below the cache rewrite."
+          },
+          "claudeTokenImprover.agentSummary": {
+            "type": "boolean",
+            "default": true,
+            "description": "Write the summary of old history with a short `claude -p` run (Haiku, from a neutral folder, in chunks under 100K tokens). It uses a little of your Claude Code quota; if it fails the proxy builds a local summary instead. Off: always local."
+          },
+          "claudeTokenImprover.exactTokenCounting": {
+            "type": "boolean",
+            "default": false,
+            "description": "Measure the size before optimization with Anthropic's count_tokens instead of a local estimate. More exact, but adds one call per turn."
+          },
+          "claudeTokenImprover.keepAliveMaxMinutes": {
+            "type": "number",
+            "default": 30,
+            "minimum": 0,
+            "maximum": 120,
+            "description": "Keep the prompt cache warm with a one-token ping every ~4.5 min, until this many minutes after your last request (30 by default, 0 = off). Each ping costs one cache read of the prefix; it pays off for pauses under ~30 min. Measured on the October ledger: best around 30. On a subscription plan every ping counts against your usage limit."
+          },
+          "claudeTokenImprover.pricingUrl": {
+            "type": "string",
+            "default": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+            "description": "Model price feed (LiteLLM JSON). Change only to use a mirror."
+          }
+        }
+      }
+    ],
+    "icons": {
+      "claude-budget-gauge": {
+        "description": "Budget gauge shown in the status bar",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E001"
+        }
+      },
+      "claude-budget-gauge-1": {
+        "description": "Budget gauge animation frame 1 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E002"
+        }
+      },
+      "claude-budget-gauge-2": {
+        "description": "Budget gauge animation frame 2 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E003"
+        }
+      },
+      "claude-budget-gauge-3": {
+        "description": "Budget gauge animation frame 3 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E004"
+        }
+      },
+      "claude-budget-gauge-4": {
+        "description": "Budget gauge animation frame 4 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E005"
+        }
+      },
+      "claude-budget-gauge-5": {
+        "description": "Budget gauge animation frame 5 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E006"
+        }
+      },
+      "claude-budget-gauge-6": {
+        "description": "Budget gauge animation frame 6 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E007"
+        }
+      },
+      "claude-budget-gauge-7": {
+        "description": "Budget gauge animation frame 7 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E008"
+        }
+      },
+      "claude-budget-gauge-8": {
+        "description": "Budget gauge animation frame 8 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E009"
+        }
+      },
+      "claude-budget-gauge-9": {
+        "description": "Budget gauge animation frame 9 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00A"
+        }
+      },
+      "claude-budget-gauge-10": {
+        "description": "Budget gauge animation frame 10 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00B"
+        }
+      },
+      "claude-budget-gauge-11": {
+        "description": "Budget gauge animation frame 11 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00C"
+        }
+      },
+      "claude-budget-gauge-12": {
+        "description": "Budget gauge animation frame 12 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00D"
+        }
+      },
+      "claude-budget-gauge-13": {
+        "description": "Budget gauge animation frame 13 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00E"
+        }
+      },
+      "claude-budget-gauge-14": {
+        "description": "Budget gauge animation frame 14 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E00F"
+        }
+      },
+      "claude-budget-gauge-15": {
+        "description": "Budget gauge animation frame 15 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E010"
+        }
+      },
+      "claude-budget-gauge-16": {
+        "description": "Budget gauge animation frame 16 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E011"
+        }
+      },
+      "claude-budget-gauge-17": {
+        "description": "Budget gauge animation frame 17 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E012"
+        }
+      },
+      "claude-budget-gauge-18": {
+        "description": "Budget gauge animation frame 18 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E013"
+        }
+      },
+      "claude-budget-gauge-19": {
+        "description": "Budget gauge animation frame 19 (needle sweeping right to left)",
+        "default": {
+          "fontPath": "./media/budget-icons.woff",
+          "fontCharacter": "\\E014"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run test:all",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test \"out/tests/*.test.js\"",
+    "test:py": "python -m pytest -q tests",
+    "test:coverage": "npm run compile && node --test --experimental-test-coverage --test-coverage-include=\"out/**/*.js\" --test-coverage-exclude=\"out/tests/**\" --test-coverage-lines=96 --test-coverage-branches=90 --test-coverage-functions=88 \"out/tests/*.test.js\"",
+    "test:all": "npm run test:coverage && npm run test:py",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/node": "^22.7.5",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.6.0",
+    "jsdom": "^24.1.3",
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "undici": "7.29.1"
+  }
+}

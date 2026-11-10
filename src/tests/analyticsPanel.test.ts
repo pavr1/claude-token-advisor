@@ -1,0 +1,297 @@
+/** The Token Improver tab: filters, totals, the Cached tooltips and their arithmetic. */
+
+import './helpers/fakeVscode';
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { AnalyticsTracker, computeTurnCost, LedgerEntry } from '../analytics/tracker';
+import { HAIKU_MODEL_ID, OptimizationTelemetry } from '../proxy/optimizer';
+import { ALL, AnalyticsFilters, buildAnalyticsSectionHtml } from '../ui/analyticsPanel';
+import { fake } from './helpers/fakeVscode';
+
+function telemetry(overrides: Partial<OptimizationTelemetry> = {}): OptimizationTelemetry {
+  return {
+    rawTokens: 100_000,
+    optimizedTokens: 60_000,
+    prunedByNormalization: 10_000,
+    prunedByCompaction: 30_000,
+    compactionTriggered: false,
+    originalModel: 'claude-sonnet-5',
+    effectiveModel: 'claude-sonnet-5',
+    modelDowngraded: false,
+    routingReason: 'test',
+    startupModelDefaulted: false,
+    cacheAnchorPlaced: true,
+    cacheAnchorBelowMinimum: false,
+    strippedCacheControlBlocks: 0,
+    isNewUserTurn: true,
+    baselineCachedTokens: 80_000,
+    floorCachedTokens: 90_000,
+    ...overrides,
+  };
+}
+
+interface Usage {
+  input?: number;
+  read?: number;
+  write?: number;
+  output?: number;
+  write1h?: number;
+}
+
+/** A ledger row priced the way the extension prices it, stamped `minutesAgo` before now. */
+function row(
+  usage: Usage,
+  over: { project?: string; minutesAgo?: number; tel?: Partial<OptimizationTelemetry>; status?: number } = {}
+): LedgerEntry {
+  const t = telemetry(over.tel);
+  const cost = computeTurnCost(t, {
+    input_tokens: usage.input ?? 0,
+    cache_read_input_tokens: usage.read ?? 0,
+    cache_creation_input_tokens: usage.write ?? 0,
+    cache_creation: usage.write1h ? { ephemeral_1h_input_tokens: usage.write1h } : undefined,
+    output_tokens: usage.output ?? 0,
+  });
+  return {
+    timestamp: new Date(Date.now() - (over.minutesAgo ?? 1) * 60_000).toISOString(),
+    project: over.project ?? 'repo-a',
+    requestedModel: t.originalModel,
+    servedModel: t.effectiveModel,
+    modelSwapped: t.modelDowngraded,
+    rawTokens: t.rawTokens,
+    optimizedTokens: t.optimizedTokens,
+    prunedByNormalization: t.prunedByNormalization,
+    prunedByCompaction: t.prunedByCompaction,
+    compactionTriggered: t.compactionTriggered,
+    cacheAnchorPlaced: true,
+    newUserTurn: true,
+    status: over.status ?? 200,
+    ...cost,
+  } as unknown as LedgerEntry;
+}
+
+const tracker = (entries: LedgerEntry[]): AnalyticsTracker => ({ getEntries: () => entries }) as unknown as AnalyticsTracker;
+const TODAY: AnalyticsFilters = { project: ALL, range: 'today' };
+const render = (entries: LedgerEntry[], filters: AnalyticsFilters = TODAY): string =>
+  buildAnalyticsSectionHtml(tracker(entries), filters);
+
+test('with no recorded requests the panel explains how to start the proxy', () => {
+  const html = render([]);
+  assert.match(html, /No optimized requests recorded yet/);
+  assert.match(html, /ANTHROPIC_BASE_URL/);
+});
+
+test('a recorded turn renders the table, the history charts and the saving headline', () => {
+  const html = render([row({ read: 80_000, write: 5_000, input: 100, output: 400 })]);
+  assert.match(html, /Claude Token Improver/);
+  assert.match(html, /1 optimized requests/);
+  assert.match(html, /History/);
+  assert.match(html, /<svg /);
+  // The rows carry the typical baseline, so that is the headline; the floor stays as the second line.
+  assert.match(html, /Saving, typical case/);
+  assert.match(html, /at least [\d.,]+% vs\. the best possible client cache/);
+});
+
+test('rows without a floor baseline fall back to the estimated saving and say so', () => {
+  const old = row({ read: 1_000, write: 100, output: 10 });
+  delete (old as Partial<LedgerEntry>).floorBaselineUnitCost;
+  const html = render([old]);
+  assert.match(html, /Estimated saving/);
+  assert.doesNotMatch(html, /Saving, typical case/);
+});
+
+test('the cache cells say their share of Received in t, and the Billed tooltip adds up the units', () => {
+  const html = render([row({ read: 80_000, write: 5_000, input: 100, output: 400 })]);
+  assert.match(html, /title="CR: 80\.00K t"/);
+  assert.doesNotMatch(html, /of Received/);
+  assert.match(html, /title="CR [\d.]+K? \+ CW [\d.]+K? \+ RI [\d.]+K? \+ output [\d.]+K? = [\d.]+K? u"/);
+});
+
+test('tooltip multipliers are the effective rate of the hit, not constants', () => {
+  const sonnet = render([row({ read: 10_000, write: 2_000 })]);
+  assert.match(sonnet, /CR = 10\.00K t × 1 × 0\.1 = 1\D000 u/);
+  assert.match(sonnet, /CW = 2\.00K t × 1 × 1\.25 = 2\.50K u/);
+
+  // Haiku weighs a third of Sonnet, so the same tokens bill at a third of the rate.
+  const haiku = render([
+    row({ read: 10_000, write: 2_000 }, { tel: { effectiveModel: HAIKU_MODEL_ID, modelDowngraded: true } }),
+  ]);
+  // The model weight is its own factor and the cache multiplier stays 0.1 (read) / 1.25 (write) for every model.
+  assert.doesNotMatch(haiku, /CR = 10\.00K t × 1 × /);
+  assert.match(haiku, /CR = 10\.00K t × 0\.\d+ × 0\.1 =/);
+  assert.match(haiku, /CW = 2\.00K t × 0\.\d+ × 1\.25 =/);
+
+  // A 1h write bills above 1.25x, and the tooltip shows the blended rate.
+  const oneHour = render([row({ read: 0, write: 2_000, write1h: 2_000 })]);
+  assert.match(oneHour, /CW = 2\.00K t × 1 × 2 = 4\.00K u/);
+});
+
+test('the Cached cell is tinted green when reads outweigh writes and red when writes do', () => {
+  const healthy = render([row({ read: 90_000, write: 1_000 })]);
+  assert.match(healthy, /rgba\(63,185,80,0\.16\)/);
+  assert.doesNotMatch(healthy, /(Reads|Writes) (>|&gt;) (writes|reads)/);
+
+  const cold = render([row({ read: 1_000, write: 90_000 })]);
+  assert.match(cold, /rgba\(229,83,75,0\.16\)/);
+  assert.doesNotMatch(cold, /(Reads|Writes) (>|&gt;) (writes|reads)/);
+});
+
+test('the units row is judged by what the cache did: green when reads saved more than writes cost over full price', () => {
+  // 30K read vs 20K written: writes outweigh reads in raw units, yet reading saves 0.9x per token and writing costs 0.25x extra.
+  const html = render([row({ read: 30_000, write: 20_000 })]);
+  // Each cell names only its own share, never both.
+  const cr = Number(/CR = [^"]*\. CR: (\d+)%/.exec(html)![1]);
+  const cw = Number(/CW = [^"]*\. CW: (\d+)%/.exec(html)![1]);
+  assert.equal(cr + cw, 100);
+  assert.deepEqual([cr, cw], [60, 40], 'share of the cached tokens that were read and written');
+  assert.doesNotMatch(html, /CR: \d+% CW: \d+%/);
+  assert.ok(/<div class="cache-val" style="background:rgba\(63,185,80,0\.16\)" title="CR = [^"]*CR: \d+%/.test(html));
+
+  // Only a cold write: the cache cost more than not using it, so the units row is red.
+  const cold = render([row({ write: 90_000 })]);
+  assert.match(cold, /CW = [^"]*\. CW: 100%/);
+  assert.doesNotMatch(cold, /CR: \d+% CW: \d+%/);
+  assert.match(cold, /<div class="cache-val" style="background:rgba\(229,83,75,0\.16\)" title="CW = [^"]*CW: 100%/);
+});
+
+test('the project filter narrows the table, and an unknown project falls back to all repos', () => {
+  const entries = [row({ read: 1_000 }, { project: 'repo-a' }), row({ read: 1_000 }, { project: 'repo-b' })];
+  assert.match(render(entries, { project: 'repo-a', range: 'today' }), /1 optimized requests/);
+  assert.match(render(entries, { project: ALL, range: 'today' }), /2 optimized requests/);
+  assert.match(render(entries, { project: 'ghost', range: 'today' }), /2 optimized requests/);
+});
+
+test('the date filter drops entries outside the range', () => {
+  const entries = [row({ read: 1_000 }, { minutesAgo: 1 }), row({ read: 1_000 }, { minutesAgo: 3 * 24 * 60 })];
+  assert.match(render(entries, TODAY), /1 optimized requests/);
+  assert.match(render(entries, { project: ALL, range: '7d' }), /2 optimized requests/);
+  const d = new Date(Date.now() - 3 * 24 * 3_600_000);
+  const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  assert.match(render(entries, { project: ALL, range: 'custom', from: day, to: day }), /1 optimized requests/);
+});
+
+test('a range with no requests still renders, with an empty trend chart', () => {
+  const html = render([row({ read: 1_000 }, { minutesAgo: 5 * 24 * 60 })], { project: ALL, range: 'yesterday' });
+  assert.match(html, /0 optimized requests/);
+  assert.match(html, /No requests yet/);
+});
+
+test('a summary a model wrote (a row up to 1 Nov 2026) is listed in the Billed tooltip, and a local one adds nothing', () => {
+  const old = row({ read: 0, write: 20_000 }, { tel: { compactionTriggered: true } });
+  old.summarizerUnitCost = 4_000;
+  assert.match(render([old]), /summary written by a model [\d.]+K?\./);
+  const local = row({ read: 0, write: 20_000 }, { tel: { compactionTriggered: true, summaryKind: 'local' } });
+  assert.doesNotMatch(render([local]), /summary written by a model/);
+});
+
+test('settings are read through the vscode configuration', () => {
+  fake.reset();
+  fake.settings['slidingThresholdTokens'] = 50_000;
+  assert.doesNotThrow(() => render([row({ read: 1_000 })]));
+});
+
+test('the header shows the filtered saving and the monthly saving as two small trend charts', (t) => {
+  // Mid-month, so "2 days ago" is always still this month whatever day the suite runs on.
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 9, 20, 12, 0, 0) });
+  const entries = [row({ read: 80_000, write: 5_000 }, { minutesAgo: 1 }), row({ read: 1_000, write: 40_000 }, { minutesAgo: 2 * 24 * 60 })];
+  const html = render(entries, TODAY);
+  const head = html.slice(html.indexOf('<div class="head">'), html.indexOf('<h2>Turns'));
+  assert.match(head, /Claude Token Improver/);
+  assert.match(head, /Today · all repos/);
+  assert.match(head, /This month · all repos/);
+  assert.equal((head.match(/class="trend-svg"/g) ?? []).length, 2);
+  assert.doesNotMatch(head, /donut-mini/);
+  assert.equal((html.match(/This month · all repos/g) ?? []).length, 1);
+  // Today on the left, the month on the right.
+  assert.ok(head.indexOf('Today · all repos') < head.indexOf('This month · all repos'));
+  // The two figures differ: today's turn is healthy, the month includes a cold one.
+  const percents = [...head.matchAll(/class="trend-figure"[^>]*>([^<]+)</g)].map((m) => m[1]);
+  assert.equal(percents.length, 2);
+  assert.notEqual(percents[0], percents[1]);
+});
+
+test('the table help texts do not quote fixed cache multipliers', () => {
+  const html = render([row({ read: 1_000 })]);
+  assert.doesNotMatch(html, /0\.10x|1\.25x|× 0\.10|× 1\.25 *\)/);
+});
+
+test('a range that cost more than its baseline gets a warning, and a saving range does not', () => {
+  const losing = row({ read: 0, write: 90_000, input: 100, output: 400 });
+  losing.floorBaselineUnitCost = 1_000;
+  losing.centralBaselineUnitCost = 1_000;
+  losing.actualUnitCost = 5_000;
+  assert.match(render([losing]), /The proxy cost [\d.]+K? <abbr[^>]*>u<\/abbr> more than the baseline/);
+  const saving = row({ read: 0, write: 900, input: 100, output: 400 });
+  saving.floorBaselineUnitCost = 5_000;
+  saving.centralBaselineUnitCost = 5_000;
+  saving.actualUnitCost = 1_000;
+  assert.doesNotMatch(render([saving]), /more than the baseline/);
+});
+
+test('the stats grid has four cards: saving, cache, pruning and downgrades', () => {
+  const html = render([row({ read: 80_000, write: 5_000, input: 100, output: 400 })]);
+  for (const label of ['Saving, typical case', 'Cache', 'Pruning &amp; compaction', 'Model downgrades']) {
+    assert.ok(html.includes(`<div class="stat-label">${label}</div>`), label);
+  }
+  assert.doesNotMatch(html, /Typical saving|Baseline vs actual|Tokens pruned/);
+});
+
+test('the trend charts draw one line, label the time along the bottom, and tooltip only time and percentage', async () => {
+  const { savingTrendSvg } = await import('../ui/historyChart');
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const entries = [row({ read: 80_000, write: 5_000 }, { minutesAgo: 1 })];
+  const svg = savingTrendSvg(entries, start, now.getTime() + 1, 'hour', 'test');
+  assert.equal((svg.match(/<path /g) ?? []).length, 1);
+  const tips = [...svg.matchAll(/<title>([^<]*)<\/title>/g)].map((m) => m[1]);
+  assert.ok(tips.length >= 1);
+  for (const tip of tips) {
+    assert.match(tip, /^\d\d:00 · -?\d+\.\d%$/);
+  }
+  assert.match(svg, /class="trend-axis"[^>]*>\d\d:00</);
+});
+
+test('a row with one model shows that model and the plain "× rate" tooltip', () => {
+  const html = render([row({ input: 4, output: 100 })]);
+  const turnsHead = /<table class="turns-table">[\s\S]*?<\/thead>/.exec(html)![0];
+  assert.doesNotMatch(turnsHead, /Model/);
+  assert.match(html, /↳ hit 1<div class="turn-sub">Sonnet 5<\/div>/);
+  assert.match(html, /RI: 4 t × 1 = 4 u/);
+  assert.doesNotMatch(html, /mixed models/);
+});
+
+test('the Out column shows output tokens and units', () => {
+  const html = render([row({ output: 1_000 })]);
+  assert.match(html, /<th class="cache-col">Out</);
+  assert.match(html, /title="OUT: 1\.00K t"/);
+  assert.match(html, /OUT: 1\.00K t × 5 = 5\.00K u/);
+});
+
+test('a turn that mixed models shows both, drops the blended multiplier and lists each model', () => {
+  const haiku = row({ input: 4 }, { tel: { effectiveModel: HAIKU_MODEL_ID, modelDowngraded: true } });
+  const sonnet = row({ input: 4 });
+  const html = render([haiku, sonnet]);
+  // Each hit shows its own model under its label; the turn row has no Model column.
+  assert.match(html, /↳ hit \d+<div class="turn-sub">Haiku 5\.5<\/div>/);
+  assert.match(html, /↳ hit \d+<div class="turn-sub">Sonnet 5<\/div>/);
+  assert.match(html, /RI: 8 t → [\d.,]+ u \(mixed models\)/);
+  assert.doesNotMatch(html, /RI: 8 t ×/);
+  assert.match(html, /Haiku 5\.5: 4 t × 0\.\d+ = [\d.,]+ u/);
+  assert.match(html, /Sonnet 5: 4 t × 1 = 4 u/);
+});
+
+test('Estimate keeps the proxy estimate while the saving still uses what Anthropic received', () => {
+  const kept = { ...row({ input: 4, read: 50_000 }), optimizedTokens: 50_004, estimatedTokens: 77_000 };
+  const html = render([kept]);
+  // The Estimate cell (its tooltip starts "Sent = …") shows the estimate, not the rebased figure.
+  assert.match(html, /title="Sent = [^"]*77\D000 t[^"]*">77\.00K</);
+  assert.doesNotMatch(html, /title="Sent = [^"]*">50\.00K</);
+  // Received is still the real figure.
+  assert.match(html, /<td class="num" title="Received = [^"]*">50\.00K<\/td>/);
+});
+
+test('a row written before estimatedTokens existed shows its stored figure in Estimate', () => {
+  const old = { ...row({ input: 4, read: 50_000 }), optimizedTokens: 50_004 };
+  delete (old as { estimatedTokens?: number }).estimatedTokens;
+  assert.match(render([old]), /title="Sent = [^"]*">50\.00K</);
+});
