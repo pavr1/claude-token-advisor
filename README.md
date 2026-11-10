@@ -259,3 +259,7 @@ docs/                        notes (token-saving best practices)
 
 - Budget scope is per project and self-service; the data source is the local Claude session JSONL files, not a shared organization dashboard.
 - Time is stored in UTC and shown in local time; day and month groupings are local.
+
+## Author
+
+Pablo Villalobos Rodríguez — [pvillalobos@growthaccelerationpartners.com](mailto:pvillalobos@growthaccelerationpartners.com)
